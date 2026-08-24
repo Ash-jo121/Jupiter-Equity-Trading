@@ -16,8 +16,13 @@ def quote(price: float, bid=None, ask=None) -> Quote:
     )
 
 
+def paper_broker(**kwargs) -> PaperBroker:
+    kwargs.setdefault("fee_schedule", FeeSchedule(brokerage_bps=0))
+    return PaperBroker(**kwargs)
+
+
 def test_market_buy_uses_ask_and_adverse_slippage() -> None:
-    broker = PaperBroker(initial_cash=100_000, slippage_bps=10)
+    broker = paper_broker(initial_cash=100_000, slippage_bps=10)
     broker.on_quote(quote(100, bid=99.9, ask=100.1))
 
     order = broker.submit(Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.MARKET))
@@ -29,7 +34,7 @@ def test_market_buy_uses_ask_and_adverse_slippage() -> None:
 
 
 def test_limit_order_waits_then_fills() -> None:
-    broker = PaperBroker(initial_cash=100_000, slippage_bps=0)
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
     order = broker.submit(
         Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.LIMIT, limit_price=99)
     )
@@ -42,8 +47,36 @@ def test_limit_order_waits_then_fills() -> None:
     assert order.status == OrderStatus.FILLED
 
 
+def test_closed_market_updates_quote_without_filling_order() -> None:
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
+    broker.update_market_status({"NSE_EQ": "NORMAL_CLOSE"})
+    order = broker.submit(Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.MARKET))
+
+    fills = broker.on_quote(quote(100))
+
+    assert fills == []
+    assert order.status == OrderStatus.OPEN
+    assert broker.quotes["NSE_EQ|TEST"].last_price == 100
+    assert broker.cash == 100_000
+
+
+def test_queued_order_fills_on_next_quote_after_market_opens() -> None:
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
+    broker.update_market_status({"NSE_EQ": "NORMAL_CLOSE"})
+    order = broker.submit(Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.MARKET))
+    broker.on_quote(quote(100))
+
+    broker.update_market_status({"NSE_EQ": "NORMAL_OPEN"})
+    fills = broker.on_quote(quote(101))
+
+    assert len(fills) == 1
+    assert fills[0].price == 101
+    assert order.status == OrderStatus.FILLED
+    assert broker.cash == 98_990
+
+
 def test_realized_and_unrealized_pnl() -> None:
-    broker = PaperBroker(initial_cash=100_000, slippage_bps=0)
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
     broker.on_quote(quote(100))
     broker.submit(Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.MARKET))
     broker.on_quote(quote(110))
@@ -71,7 +104,7 @@ def test_fees_reduce_equity() -> None:
 
 
 def test_short_order_is_rejected_by_default() -> None:
-    broker = PaperBroker(initial_cash=100_000, slippage_bps=0)
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
     broker.on_quote(quote(100))
 
     order = broker.submit(Order("NSE_EQ|TEST", Side.SELL, 1, OrderType.MARKET))
@@ -81,7 +114,7 @@ def test_short_order_is_rejected_by_default() -> None:
 
 
 def test_order_notional_limit_rejects_fill() -> None:
-    broker = PaperBroker(
+    broker = paper_broker(
         initial_cash=100_000,
         slippage_bps=0,
         risk_limits=RiskLimits(max_order_notional=500),
@@ -92,4 +125,3 @@ def test_order_notional_limit_rejects_fill() -> None:
 
     assert order.status == OrderStatus.REJECTED
     assert order.rejection_reason == "max order notional exceeded"
-

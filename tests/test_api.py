@@ -11,7 +11,7 @@ def test_order_tick_and_portfolio_flow(tmp_path) -> None:
         slippage_bps=0,
         database_path=str(tmp_path / "paper.db"),
         upstox_access_token="",
-        fee_schedule=FeeSchedule(),
+        fee_schedule=FeeSchedule(brokerage_bps=0),
         risk_limits=RiskLimits(),
     )
 

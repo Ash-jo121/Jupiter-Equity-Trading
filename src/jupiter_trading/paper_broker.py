@@ -1,24 +1,102 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from threading import RLock
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
-from .domain import Fill, Order, OrderStatus, OrderType, Position, Quote, Side
+from .domain import (
+    ACTIVE_ORDER_STATUSES,
+    ChargeBreakdown,
+    Fill,
+    Order,
+    OrderStatus,
+    OrderType,
+    PaperAccount,
+    Position,
+    Product,
+    Quote,
+    Side,
+    Validity,
+    utc_now,
+)
 from .repository import InMemoryRepository, TradingRepository
+
+EXECUTABLE_MARKET_STATUSES = frozenset({"NORMAL_OPEN"})
 
 
 @dataclass(frozen=True)
 class FeeSchedule:
-    """Configurable all-in fee components, expressed in basis points."""
+    """Indian NSE cash-equity costs, configurable as rates change.
 
-    brokerage_bps: float = 0.0
-    transaction_bps: float = 0.0
-    tax_bps: float = 0.0
+    Basis points are 1/100th of one percent. Brokerage and DP charges model
+    Upstox's published standard pricing; statutory and exchange charges model
+    NSE equity delivery (CNC) and intraday (MIS).
+    """
 
-    def calculate(self, notional: float) -> float:
-        total_bps = self.brokerage_bps + self.transaction_bps + self.tax_bps
-        return round(notional * total_bps / 10_000, 2)
+    delivery_brokerage_flat: float = 20.0
+    intraday_brokerage_bps: float = 10.0
+    intraday_brokerage_cap: float = 20.0
+    transaction_bps: float = 0.307
+    sebi_bps: float = 0.01
+    delivery_stt_bps: float = 10.0
+    intraday_sell_stt_bps: float = 2.5
+    delivery_buy_stamp_bps: float = 1.5
+    intraday_buy_stamp_bps: float = 0.3
+    gst_percent: float = 18.0
+    delivery_sell_dp_flat: float = 20.0
+    brokerage_bps: Optional[float] = None
+    tax_bps: Optional[float] = None
+
+    def calculate(
+        self,
+        notional: float,
+        side: Side = Side.BUY,
+        product: Product = Product.DELIVERY,
+        brokerage_already_charged: bool = False,
+        dp_already_charged: bool = False,
+    ) -> ChargeBreakdown:
+        if self.brokerage_bps is not None:
+            brokerage = 0.0 if brokerage_already_charged else notional * self.brokerage_bps / 10_000
+            legacy_tax = notional * (self.tax_bps or 0.0) / 10_000
+            return ChargeBreakdown(brokerage=round(brokerage, 2), stt=round(legacy_tax, 2))
+
+        if brokerage_already_charged:
+            brokerage = 0.0
+        elif product == Product.DELIVERY:
+            brokerage = self.delivery_brokerage_flat
+        else:
+            brokerage = min(self.intraday_brokerage_cap, notional * self.intraday_brokerage_bps / 10_000)
+
+        stt_bps = self.delivery_stt_bps if product == Product.DELIVERY else (
+            self.intraday_sell_stt_bps if side == Side.SELL else 0.0
+        )
+        stamp_bps = 0.0
+        if side == Side.BUY:
+            stamp_bps = (
+                self.delivery_buy_stamp_bps
+                if product == Product.DELIVERY
+                else self.intraday_buy_stamp_bps
+            )
+        exchange = notional * self.transaction_bps / 10_000
+        sebi = notional * self.sebi_bps / 10_000
+        stt = notional * stt_bps / 10_000
+        stamp = notional * stamp_bps / 10_000
+        dp = (
+            self.delivery_sell_dp_flat
+            if product == Product.DELIVERY and side == Side.SELL and not dp_already_charged
+            else 0.0
+        )
+        gst = (brokerage + exchange + dp) * self.gst_percent / 100
+        return ChargeBreakdown(
+            brokerage=round(brokerage, 2),
+            stt=round(stt, 2),
+            exchange_transaction=round(exchange, 2),
+            sebi=round(sebi, 2),
+            stamp_duty=round(stamp, 2),
+            gst=round(gst, 2),
+            dp=round(dp, 2),
+        )
 
 
 @dataclass(frozen=True)
@@ -30,7 +108,7 @@ class RiskLimits:
 
 
 class PaperBroker:
-    """Deterministic simulated broker driven by externally supplied quotes."""
+    """Persistent simulated account driven by externally supplied quotes."""
 
     def __init__(
         self,
@@ -39,63 +117,137 @@ class PaperBroker:
         fee_schedule: Optional[FeeSchedule] = None,
         risk_limits: Optional[RiskLimits] = None,
         repository: Optional[TradingRepository] = None,
+        account_id: str = "default",
+        account_name: str = "Default paper account",
     ) -> None:
         if initial_cash <= 0:
             raise ValueError("initial_cash must be positive")
         if slippage_bps < 0:
             raise ValueError("slippage_bps cannot be negative")
-        self.initial_cash = initial_cash
-        self.cash = initial_cash
+        self.repository = repository or InMemoryRepository()
+        proposed = PaperAccount(account_id, account_name, initial_cash)
+        self.account = self.repository.ensure_account(proposed)
+        self.initial_cash = self.account.initial_cash
+        self.cash = self.initial_cash
         self.slippage_bps = slippage_bps
         self.fee_schedule = fee_schedule or FeeSchedule()
         self.risk_limits = risk_limits or RiskLimits()
-        self.repository = repository or InMemoryRepository()
         self.orders: Dict[str, Order] = {}
         self.fills: List[Fill] = []
         self.positions: Dict[str, Position] = {}
         self.quotes: Dict[str, Quote] = {}
+        self.market_statuses: Dict[str, str] = {}
         self.kill_switch = False
+        self._books: Dict[str, Tuple[List[List[float]], List[List[float]]]] = {}
+        self._dp_charged: set = set()
         self._lock = RLock()
+        self._hydrate()
+
+    def _hydrate(self) -> None:
+        for order in self.repository.load_orders(self.account.id):
+            self.orders[order.id] = order
+        for fill in self.repository.load_fills(self.account.id):
+            self.fills.append(fill)
+            cash_delta = fill.gross_value if fill.side == Side.SELL else -fill.gross_value
+            self.cash += cash_delta - fill.fees
+            self.positions.setdefault(fill.instrument_key, Position(fill.instrument_key)).apply(fill)
+            if fill.product == Product.DELIVERY and fill.side == Side.SELL and fill.charges.dp:
+                self._dp_charged.add((fill.instrument_key, fill.timestamp.date()))
 
     def submit(self, order: Order) -> Order:
         with self._lock:
+            if order.account_id != self.account.id:
+                raise ValueError("order account does not match broker account")
             if self.kill_switch:
                 return self._reject(order, "kill switch is active")
             self.orders[order.id] = order
             self.repository.save_order(order)
             quote = self.quotes.get(order.instrument_key)
-            if quote:
+            if quote and self._is_execution_allowed(order.instrument_key):
+                self._try_fill(order, quote)
+            return order
+
+    def modify(
+        self,
+        order_id: str,
+        quantity: Optional[int] = None,
+        limit_price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        validity: Optional[Validity] = None,
+    ) -> Order:
+        with self._lock:
+            order = self.orders[order_id]
+            if order.status not in ACTIVE_ORDER_STATUSES:
+                raise ValueError("only active orders can be modified")
+            if quantity is not None:
+                if quantity <= 0 or quantity < order.filled_quantity:
+                    raise ValueError("quantity cannot be below the already filled quantity")
+                order.quantity = quantity
+            if limit_price is not None:
+                if order.order_type != OrderType.LIMIT or limit_price <= 0:
+                    raise ValueError("limit_price applies only to LIMIT orders")
+                order.limit_price = limit_price
+            if trigger_price is not None:
+                if order.order_type != OrderType.STOP_MARKET or trigger_price <= 0:
+                    raise ValueError("trigger_price applies only to STOP_MARKET orders")
+                order.trigger_price = trigger_price
+            if validity is not None:
+                order.validity = validity
+            order.updated_at = utc_now()
+            if order.remaining_quantity == 0:
+                order.status = OrderStatus.FILLED
+                order.filled_at = order.updated_at
+            self.repository.save_order(order)
+            quote = self.quotes.get(order.instrument_key)
+            if (
+                order.status in ACTIVE_ORDER_STATUSES
+                and quote
+                and self._is_execution_allowed(order.instrument_key)
+            ):
                 self._try_fill(order, quote)
             return order
 
     def cancel(self, order_id: str) -> Order:
         with self._lock:
             order = self.orders[order_id]
-            if order.status != OrderStatus.OPEN:
-                raise ValueError("only open orders can be cancelled")
+            if order.status not in ACTIVE_ORDER_STATUSES:
+                raise ValueError("only active orders can be cancelled")
             order.status = OrderStatus.CANCELLED
+            order.cancelled_at = utc_now()
+            order.updated_at = order.cancelled_at
             self.repository.save_order(order)
             return order
 
     def on_quote(self, quote: Quote) -> List[Fill]:
         with self._lock:
             self.quotes[quote.instrument_key] = quote
-            created = []
+            self._books[quote.instrument_key] = self._book_from_quote(quote)
+            if not self._is_execution_allowed(quote.instrument_key):
+                return []
+            created: List[Fill] = []
             for order in list(self.orders.values()):
-                if order.status != OrderStatus.OPEN or order.instrument_key != quote.instrument_key:
+                if order.status not in ACTIVE_ORDER_STATUSES or order.instrument_key != quote.instrument_key:
                     continue
-                fill = self._try_fill(order, quote)
-                if fill:
-                    created.append(fill)
+                created.extend(self._try_fill(order, quote))
             return created
+
+    def update_market_status(self, statuses: Mapping[str, str]) -> None:
+        with self._lock:
+            previous = dict(self.market_statuses)
+            self.market_statuses.update(statuses)
+            for segment, status in statuses.items():
+                if previous.get(segment) in EXECUTABLE_MARKET_STATUSES and status not in EXECUTABLE_MARKET_STATUSES:
+                    self._expire_day_orders(segment)
 
     def set_kill_switch(self, active: bool) -> None:
         with self._lock:
             self.kill_switch = active
             if active:
                 for order in self.orders.values():
-                    if order.status == OrderStatus.OPEN:
+                    if order.status in ACTIVE_ORDER_STATUSES:
                         order.status = OrderStatus.CANCELLED
+                        order.cancelled_at = utc_now()
+                        order.updated_at = order.cancelled_at
                         self.repository.save_order(order)
 
     def snapshot(self) -> dict:
@@ -124,6 +276,7 @@ class PaperBroker:
                     }
                 )
             return {
+                "account": self.account.to_dict(),
                 "initial_cash": self.initial_cash,
                 "cash": round(self.cash, 2),
                 "market_value": round(market_value, 2),
@@ -131,92 +284,204 @@ class PaperBroker:
                 "realized_pnl": round(realized, 2),
                 "unrealized_pnl": round(unrealized, 2),
                 "fees_paid": round(sum(fill.fees for fill in self.fills), 2),
+                "charges_paid": self._aggregate_charges(),
                 "kill_switch": self.kill_switch,
+                "market_statuses": dict(sorted(self.market_statuses.items())),
                 "positions": positions,
             }
 
-    def _try_fill(self, order: Order, quote: Quote) -> Optional[Fill]:
-        base_price: Optional[float] = None
-        if order.order_type == OrderType.MARKET:
-            base_price = self._market_price(order.side, quote)
-        elif order.order_type == OrderType.LIMIT:
-            touch = quote.ask if order.side == Side.BUY else quote.bid
-            touch = touch or quote.last_price
-            if order.side == Side.BUY and touch <= float(order.limit_price):
-                base_price = min(touch, float(order.limit_price))
-            elif order.side == Side.SELL and touch >= float(order.limit_price):
-                base_price = max(touch, float(order.limit_price))
-        elif order.order_type == OrderType.STOP_MARKET:
+    def _book_from_quote(self, quote: Quote) -> Tuple[List[List[float]], List[List[float]]]:
+        bids = [[level.price, float(level.quantity)] for level in quote.bids]
+        asks = [[level.price, float(level.quantity)] for level in quote.asks]
+        bids.sort(key=lambda level: level[0], reverse=True)
+        asks.sort(key=lambda level: level[0])
+        return bids, asks
+
+    def _is_execution_allowed(self, instrument_key: str) -> bool:
+        segment = instrument_key.partition("|")[0]
+        status = self.market_statuses.get(segment)
+        return status is None or status in EXECUTABLE_MARKET_STATUSES
+
+    def _try_fill(self, order: Order, quote: Quote) -> List[Fill]:
+        if order.order_type == OrderType.STOP_MARKET and order.triggered_at is None:
             triggered = (
                 order.side == Side.BUY and quote.last_price >= float(order.trigger_price)
             ) or (order.side == Side.SELL and quote.last_price <= float(order.trigger_price))
-            if triggered:
-                base_price = self._market_price(order.side, quote)
+            if not triggered:
+                return []
+            order.triggered_at = quote.timestamp
+            order.updated_at = quote.timestamp
+            order.status = OrderStatus.OPEN
+            self.repository.save_order(order)
 
-        if base_price is None:
-            return None
-        price = self._apply_slippage(base_price, order.side)
-        reason = self._risk_rejection(order, price)
+        prices = self._executable_levels(order, quote)
+        if not prices:
+            if order.validity == Validity.IOC:
+                self._expire(order, quote)
+            return []
+
+        first_price = self._apply_slippage(prices[0][0], order.side, order.limit_price)
+        reason = self._risk_rejection(order, first_price, order.remaining_quantity)
         if reason:
-            self._reject(order, reason)
-            return None
-        return self._execute(order, price, quote)
+            if order.filled_quantity:
+                order.status = OrderStatus.CANCELLED
+                order.rejection_reason = reason
+                order.cancelled_at = quote.timestamp
+                order.updated_at = quote.timestamp
+                self.repository.save_order(order)
+            else:
+                self._reject(order, reason)
+            return []
 
-    def _market_price(self, side: Side, quote: Quote) -> float:
-        return (quote.ask or quote.last_price) if side == Side.BUY else (quote.bid or quote.last_price)
+        created = []
+        remaining = order.remaining_quantity
+        for level in prices:
+            if remaining <= 0:
+                break
+            available = int(level[1]) if level[1] != float("inf") else remaining
+            if available <= 0:
+                continue
+            quantity = min(remaining, available)
+            price = self._apply_slippage(level[0], order.side, order.limit_price)
+            incremental_reason = self._risk_rejection(order, price, quantity, incremental=True)
+            if incremental_reason:
+                break
+            created.append(self._execute(order, quantity, price, quote))
+            remaining -= quantity
+            if level[1] != float("inf"):
+                level[1] -= quantity
 
-    def _apply_slippage(self, price: float, side: Side) -> float:
+        if order.remaining_quantity and order.validity == Validity.IOC:
+            self._expire(order, quote)
+        return created
+
+    def _executable_levels(self, order: Order, quote: Quote) -> List[List[float]]:
+        bids, asks = self._books.get(quote.instrument_key, ([], []))
+        levels = asks if order.side == Side.BUY else bids
+        if not levels:
+            fallback = (quote.ask or quote.last_price) if order.side == Side.BUY else (
+                quote.bid or quote.last_price
+            )
+            levels = [[fallback, float("inf")]]
+        if order.order_type == OrderType.LIMIT:
+            limit = float(order.limit_price)
+            if order.side == Side.BUY:
+                return [level for level in levels if level[0] <= limit and level[1] > 0]
+            return [level for level in levels if level[0] >= limit and level[1] > 0]
+        return [level for level in levels if level[1] > 0]
+
+    def _apply_slippage(
+        self, price: float, side: Side, limit_price: Optional[float] = None
+    ) -> float:
         direction = 1 if side == Side.BUY else -1
-        return round(price * (1 + direction * self.slippage_bps / 10_000), 4)
+        result = round(price * (1 + direction * self.slippage_bps / 10_000), 4)
+        if limit_price is not None:
+            result = min(result, limit_price) if side == Side.BUY else max(result, limit_price)
+        return result
 
-    def _risk_rejection(self, order: Order, price: float) -> Optional[str]:
-        notional = order.quantity * price
-        if notional > self.risk_limits.max_order_notional:
+    def _risk_rejection(
+        self,
+        order: Order,
+        price: float,
+        quantity: int,
+        incremental: bool = False,
+    ) -> Optional[str]:
+        if not incremental and order.quantity * price > self.risk_limits.max_order_notional:
             return "max order notional exceeded"
         position = self.positions.get(order.instrument_key, Position(order.instrument_key))
-        delta = order.quantity if order.side == Side.BUY else -order.quantity
+        delta = quantity if order.side == Side.BUY else -quantity
         projected_quantity = position.quantity + delta
         if not self.risk_limits.allow_short and projected_quantity < 0:
             return "short selling is disabled"
         if abs(projected_quantity * price) > self.risk_limits.max_position_notional:
             return "max position notional exceeded"
-        projected_fees = self.fee_schedule.calculate(notional)
-        if order.side == Side.BUY and notional + projected_fees > self.cash:
+        estimated = self.fee_schedule.calculate(
+            quantity * price,
+            order.side,
+            order.product,
+            brokerage_already_charged=any(fill.order_id == order.id for fill in self.fills),
+            dp_already_charged=self._has_dp_charge(order.instrument_key, utc_now().date()),
+        )
+        if order.side == Side.BUY and quantity * price + estimated.total > self.cash:
             return "insufficient virtual cash"
         if self.snapshot()["equity"] <= self.initial_cash - self.risk_limits.max_daily_loss:
             self.kill_switch = True
             return "max daily loss reached"
         return None
 
-    def _execute(self, order: Order, price: float, quote: Quote) -> Fill:
-        fees = self.fee_schedule.calculate(order.quantity * price)
+    def _execute(self, order: Order, quantity: int, price: float, quote: Quote) -> Fill:
+        notional = quantity * price
+        brokerage_charged = any(fill.order_id == order.id for fill in self.fills)
+        dp_key = (order.instrument_key, quote.timestamp.date())
+        charges = self.fee_schedule.calculate(
+            notional,
+            order.side,
+            order.product,
+            brokerage_already_charged=brokerage_charged,
+            dp_already_charged=dp_key in self._dp_charged,
+        )
         fill = Fill(
             order_id=order.id,
             instrument_key=order.instrument_key,
             side=order.side,
-            quantity=order.quantity,
+            quantity=quantity,
             price=price,
-            fees=fees,
+            fees=charges.total,
+            product=order.product,
+            charges=charges,
             timestamp=quote.timestamp,
         )
         cash_delta = fill.gross_value if fill.side == Side.SELL else -fill.gross_value
-        self.cash += cash_delta - fees
-        position = self.positions.setdefault(
-            fill.instrument_key, Position(instrument_key=fill.instrument_key)
-        )
-        position.apply(fill)
-        order.status = OrderStatus.FILLED
-        order.filled_at = fill.timestamp
-        order.filled_price = fill.price
+        self.cash += cash_delta - fill.fees
+        self.positions.setdefault(fill.instrument_key, Position(fill.instrument_key)).apply(fill)
+        previous_value = (order.average_filled_price or 0.0) * order.filled_quantity
+        order.filled_quantity += quantity
+        order.average_filled_price = (previous_value + fill.gross_value) / order.filled_quantity
+        order.filled_price = order.average_filled_price
+        order.updated_at = fill.timestamp
+        if order.remaining_quantity == 0:
+            order.status = OrderStatus.FILLED
+            order.filled_at = fill.timestamp
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
         self.fills.append(fill)
+        if charges.dp:
+            self._dp_charged.add(dp_key)
         self.repository.save_order(order)
-        self.repository.save_fill(fill)
+        self.repository.save_fill(self.account.id, fill)
         return fill
 
     def _reject(self, order: Order, reason: str) -> Order:
         order.status = OrderStatus.REJECTED
         order.rejection_reason = reason
+        order.updated_at = utc_now()
         self.orders[order.id] = order
         self.repository.save_order(order)
         return order
 
+    def _expire(self, order: Order, quote: Optional[Quote] = None) -> None:
+        order.status = OrderStatus.EXPIRED
+        order.expired_at = quote.timestamp if quote else utc_now()
+        order.updated_at = order.expired_at
+        self.repository.save_order(order)
+
+    def _expire_day_orders(self, segment: str) -> None:
+        for order in self.orders.values():
+            if (
+                order.status in ACTIVE_ORDER_STATUSES
+                and order.validity == Validity.DAY
+                and order.instrument_key.partition("|")[0] == segment
+            ):
+                self._expire(order)
+
+    def _has_dp_charge(self, instrument_key: str, day: date) -> bool:
+        return (instrument_key, day) in self._dp_charged
+
+    def _aggregate_charges(self) -> dict:
+        keys = ("brokerage", "stt", "exchange_transaction", "sebi", "stamp_duty", "gst", "dp")
+        result = {
+            key: round(sum(getattr(fill.charges, key) for fill in self.fills), 2)
+            for key in keys
+        }
+        result["total"] = round(sum(fill.fees for fill in self.fills), 2)
+        return result

@@ -1,24 +1,29 @@
 # Jupiter Equity Trading
 
-A private, paper-only research service for experimenting with Indian equity strategies. The
-application consumes read-only market data and executes orders only inside a deterministic
-simulator. There is deliberately no code path that sends live orders to a broker.
+A private, paper-only Indian-equity research service. Jupiter consumes read-only Upstox market
+data and performs every order, fill, cash movement, position update, and risk check inside its
+own local simulator. It never sends an order to a real broker.
 
-## Current slice
+## Implemented
 
-- Paper market, limit, and stop-market orders
-- Bid/ask-aware fills with configurable adverse slippage
-- Virtual cash, long positions, realized/unrealized P&L, and configurable fees
-- Order, position, cash, and daily-loss risk checks with a kill switch
-- SQLite audit records for orders and fills
-- Read-only Upstox V3 LTP and historical-candle integration
-- Strategy protocol and a small moving-average crossover example
-- FastAPI endpoints for manual testing and future dashboard integration
+- Named SQLite-backed paper accounts that survive application restarts
+- Explicit, confirmed account resets; capital never resets automatically
+- Market, limit, and stop-market orders with DAY and IOC validity
+- Full lifecycle states: `OPEN`, `TRIGGER_PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`,
+  `REJECTED`, and `EXPIRED`
+- Order modification, cancellation, and persisted lifecycle-event history
+- Five-level Upstox depth consumption and partial fills at each available price
+- Bid/ask-aware execution and configurable adverse slippage
+- Indian CNC/MIS charge breakdowns: brokerage, STT, NSE transaction charge, SEBI fee, stamp
+  duty, GST, and delivery-sell DP charge
+- Read-only Upstox V3 quotes, candles, market-status gating, live streaming, and instrument
+  search
+- Cash, position, order-notional, daily-loss, and kill-switch controls
 
-This is an execution simulator, not a prediction system, and its results are not investment
-advice. A fill model can only approximate actual exchange execution.
+This is an execution simulator, not a prediction system. Market depth is only a snapshot, so
+paper fills can approximate but cannot guarantee the queue position or latency of a real order.
 
-## Set up
+## Set up and run
 
 Python 3.9 or newer is required.
 
@@ -27,61 +32,122 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 cp .env.example .env
+jupiter-api
 ```
 
-Copy the local configuration and add your read-only Upstox Analytics Token:
-
-```bash
-cp .env.example .env
-```
+Add your read-only token to `.env`:
 
 ```dotenv
 UPSTOX_ACCESS_TOKEN=your-read-only-analytics-token
 PAPER_INITIAL_CASH=1000000
 ```
 
-The service loads `.env` automatically. The file is excluded by `.gitignore`; never commit or
-share the real token.
+The local `.env` is ignored by Git. Open
+[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive API.
 
-Create a free, read-only Analytics Token in the Upstox developer portal. The token is only
-needed for `/market/*`; the simulator endpoints work without broker credentials.
+`PAPER_INITIAL_CASH` initializes the default account only when it is first created. Restarting
+the API restores cash, orders, fills, and positions from `PAPER_DB_PATH`.
 
-## Run
+## Find BEL and place a paper order
+
+Use the search result's `instrument_key`; do not guess an exchange token or ISIN.
 
 ```bash
-jupiter-api
+curl --get http://127.0.0.1:8000/instruments/search \
+  --data-urlencode 'q=BEL' \
+  --data-urlencode 'exchange=NSE' \
+  --data-urlencode 'segment=EQ'
 ```
 
-Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive API.
-
-Place a simulated order and then send a tick that fills it:
+Then submit an order using the returned key:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{
-    "instrument_key": "NSE_EQ|INE848E01016",
+    "instrument_key": "NSE_EQ|INE263A01024",
     "side": "BUY",
-    "quantity": 5,
-    "order_type": "MARKET"
+    "quantity": 100,
+    "order_type": "MARKET",
+    "product": "CNC",
+    "validity": "DAY"
   }'
+```
 
+Start the full feed so the order uses market depth and only fills during `NORMAL_OPEN`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/market/stream/start \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instrument_keys": ["NSE_EQ|INE263A01024"],
+    "mode": "full"
+  }'
+```
+
+Inspect the result:
+
+```bash
+curl http://127.0.0.1:8000/orders
+curl http://127.0.0.1:8000/fills
+curl http://127.0.0.1:8000/portfolio
+```
+
+Use `GET /orders/{order_id}/events` to inspect every persisted state transition for one order.
+
+## Paper accounts and capital reset
+
+Create an isolated account for a strategy:
+
+```bash
+curl -X POST http://127.0.0.1:8000/paper/accounts \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"bel-test","name":"BEL strategy","initial_cash":500000}'
+```
+
+Set `"account_id":"bel-test"` when placing orders and use `?account_id=bel-test` on portfolio,
+order, fill, modification, cancellation, and kill-switch endpoints.
+
+Capital and trading history are erased only by an explicit confirmed reset:
+
+```bash
+curl -X POST http://127.0.0.1:8000/paper/accounts/bel-test/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":true,"initial_cash":500000}'
+```
+
+## Manual depth test
+
+`/paper/ticks` is useful for deterministic tests and historical replay. This example exposes
+only eight shares across two ask levels, so a ten-share market buy remains partially filled.
+
+```bash
 curl -X POST http://127.0.0.1:8000/paper/ticks \
   -H 'Content-Type: application/json' \
   -d '{
-    "instrument_key": "NSE_EQ|INE848E01016",
-    "last_price": 1500,
-    "bid": 1499.9,
-    "ask": 1500.1
+    "instrument_key":"NSE_EQ|INE263A01024",
+    "last_price":409,
+    "asks":[
+      {"price":409,"quantity":5},
+      {"price":412,"quantity":3}
+    ],
+    "bids":[{"price":408.9,"quantity":20}]
   }'
 ```
 
-Query Upstox without placing any broker order:
+Each price level creates a separate fill. A later quote can fill the remaining quantity.
 
-```bash
-curl --get http://127.0.0.1:8000/market/ltp \
-  --data-urlencode 'instrument_key=NSE_EQ|INE848E01016'
-```
+## Cost assumptions
+
+Defaults were checked on 25 August 2026 against Upstox's published equity schedule and the NSE
+cash-market revision effective 1 March 2026. Rates remain configurable in `.env` because broker,
+exchange, and government charges can change. BSE transaction charges vary by scrip group and
+are not modeled by the current NSE-focused defaults.
+
+The model currently uses ₹20 delivery brokerage per executed order, capped intraday brokerage,
+0.1% delivery STT on both sides, 0.025% intraday STT on sells, 0.00307% NSE cash transaction
+charges, ₹10/crore SEBI fees, buy-side stamp duty, 18% GST on applicable service charges, and one
+₹20 DP charge per delivery scrip per sell day.
 
 ## Test
 
@@ -90,20 +156,9 @@ pytest
 ruff check .
 ```
 
-## Design boundaries
+## Boundaries and next work
 
-`UpstoxMarketData` owns external, read-only market-data calls. `PaperBroker` owns simulated
-orders, fills, cash, risk, and positions. Strategies depend on normalized `Quote` objects and
-the paper broker, so a future WebSocket feed, CSV replay source, or different Indian broker can
-be added without changing strategy code.
-
-Fees default to zero because broker and regulatory schedules change. Configure and validate
-the fee basis points for the product being researched before interpreting results.
-
-## Next milestones
-
-1. Add Upstox V3 WebSocket streaming and reconnect/recovery handling.
-2. Persist and restore the complete portfolio state across restarts.
-3. Add a historical replay/backtest runner and performance reports.
-4. Model partial fills, liquidity, circuits, trading sessions, and corporate actions.
-5. Add a small web dashboard for strategies, orders, positions, and equity curves.
+The simulator deliberately remains separate from real broker order APIs. Upstox is used only
+for market data and instrument discovery. High-value next steps are a local web dashboard,
+historical replay/backtesting reports, exchange circuit limits, corporate actions, and a more
+advanced queue/latency model.

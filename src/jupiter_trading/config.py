@@ -19,6 +19,10 @@ def _bool(name: str, default: bool) -> bool:
     return default if raw is None else raw.lower() in {"1", "true", "yes", "on"}
 
 
+def _csv(name: str) -> tuple:
+    return tuple(value.strip() for value in os.getenv(name, "").split(",") if value.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     initial_cash: float = field(default_factory=lambda: _float("PAPER_INITIAL_CASH", 1_000_000))
@@ -28,6 +32,15 @@ class Settings:
     )
     upstox_access_token: str = field(
         default_factory=lambda: os.getenv("UPSTOX_ACCESS_TOKEN", "")
+    )
+    upstox_stream_auto_start: bool = field(
+        default_factory=lambda: _bool("UPSTOX_STREAM_AUTO_START", False)
+    )
+    upstox_stream_instruments: tuple = field(
+        default_factory=lambda: _csv("UPSTOX_STREAM_INSTRUMENTS")
+    )
+    upstox_stream_mode: str = field(
+        default_factory=lambda: os.getenv("UPSTOX_STREAM_MODE", "full")
     )
     risk_limits: RiskLimits = field(
         default_factory=lambda: RiskLimits(
@@ -39,8 +52,16 @@ class Settings:
     )
     fee_schedule: FeeSchedule = field(
         default_factory=lambda: FeeSchedule(
-            brokerage_bps=_float("PAPER_BROKERAGE_BPS", 0),
-            transaction_bps=_float("PAPER_TRANSACTION_BPS", 0),
-            tax_bps=_float("PAPER_TAX_BPS", 0),
+            delivery_brokerage_flat=_float("PAPER_DELIVERY_BROKERAGE_FLAT", 20),
+            intraday_brokerage_bps=_float("PAPER_INTRADAY_BROKERAGE_BPS", 10),
+            intraday_brokerage_cap=_float("PAPER_INTRADAY_BROKERAGE_CAP", 20),
+            transaction_bps=_float("PAPER_NSE_TRANSACTION_BPS", 0.307),
+            sebi_bps=_float("PAPER_SEBI_BPS", 0.01),
+            delivery_stt_bps=_float("PAPER_DELIVERY_STT_BPS", 10),
+            intraday_sell_stt_bps=_float("PAPER_INTRADAY_SELL_STT_BPS", 2.5),
+            delivery_buy_stamp_bps=_float("PAPER_DELIVERY_BUY_STAMP_BPS", 1.5),
+            intraday_buy_stamp_bps=_float("PAPER_INTRADAY_BUY_STAMP_BPS", 0.3),
+            gst_percent=_float("PAPER_GST_PERCENT", 18),
+            delivery_sell_dp_flat=_float("PAPER_DELIVERY_SELL_DP_FLAT", 20),
         )
     )
