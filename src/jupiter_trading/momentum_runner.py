@@ -16,6 +16,8 @@ from .research_store import ResearchStore
 from .strategy_engine import MarketCoordinator
 from .survey import MarketSurvey, SurveyInstrument
 
+NIFTY50_INDEX_KEY = "NSE_INDEX|Nifty 50"
+
 
 @dataclass(frozen=True)
 class MomentumRunnerConfig:
@@ -27,6 +29,7 @@ class MomentumRunnerConfig:
     allocation_per_position: float = 25_000.0
     candidate_limit: int = 10
     minimum_score: float = 0.15
+    minimum_relative_volume: float = 1.2
     entry_momentum_pct: float = 0.10
     reversal_pct: float = 0.10
     hard_stop_pct: float = 0.35
@@ -42,7 +45,10 @@ class MomentumRunnerConfig:
             raise ValueError("position and candidate limits must be positive")
         if self.allocation_per_position <= 0:
             raise ValueError("allocation_per_position must be positive")
+        if self.minimum_relative_volume < 1:
+            raise ValueError("minimum_relative_volume must be at least 1x")
         if min(
+            self.minimum_relative_volume,
             self.entry_momentum_pct,
             self.reversal_pct,
             self.hard_stop_pct,
@@ -81,6 +87,12 @@ class MomentumReversalRunner:
         self._poll_count = 0
         self._candidates: Dict[str, dict] = {}
         self._history: Dict[str, deque[float]] = {}
+        self._market_history: deque[float] = deque(maxlen=13)
+        self._market_bases: dict[str, Optional[float]] = {
+            "session_open": None,
+            "recent_15m": None,
+        }
+        self._monitoring: list[dict] = []
         self._open: Dict[str, dict] = {}
         self._completed: set[str] = set()
         self._events: list[dict] = []
@@ -156,6 +168,7 @@ class MomentumReversalRunner:
                 "open_positions": list(self._open.values()),
                 "completed_instruments": sorted(self._completed),
                 "events": list(self._events),
+                "monitoring": list(self._monitoring),
                 "errors": list(self._errors),
                 "fills": fills,
                 "metrics": {
@@ -191,14 +204,33 @@ class MomentumReversalRunner:
 
     def _scan(self) -> None:
         try:
-            result = MarketSurvey(self.market_data).run(self.instruments)
+            result = MarketSurvey(
+                self.market_data, self.config.minimum_relative_volume
+            ).run(self.instruments)
             candidates = [
                 row
                 for row in result["results"]
                 if row["eligible"]
+                and row["volume_confirmed"]
                 and row["momentum_score"] >= self.config.minimum_score
                 and row["recent_15m_change_pct"] > 0
             ][: self.config.candidate_limit]
+            market_context_error = None
+            try:
+                nifty_candles = self.market_data.intraday_candles(
+                    NIFTY50_INDEX_KEY, "minutes", 5
+                )
+                if nifty_candles:
+                    self._market_bases = {
+                        "session_open": nifty_candles[0].open,
+                        "recent_15m": (
+                            nifty_candles[-4].close
+                            if len(nifty_candles) >= 4
+                            else nifty_candles[0].close
+                        ),
+                    }
+            except Exception as error:  # noqa: BLE001 - context must not stop trading
+                market_context_error = str(error)[:200]
             with self._lock:
                 self._scan_count += 1
                 self._candidates = {row["instrument_key"]: row for row in candidates}
@@ -208,6 +240,17 @@ class MomentumReversalRunner:
                         "analyzed": result["analyzed"],
                         "failures": result["failures"],
                         "candidates": [row["symbol"] for row in candidates],
+                        "low_volume_rejections": [
+                            {
+                                "symbol": row["symbol"],
+                                "relative_volume": row["relative_volume"],
+                            }
+                            for row in result["results"]
+                            if row["momentum_score"] >= self.config.minimum_score
+                            and row["recent_15m_change_pct"] > 0
+                            and not row["volume_confirmed"]
+                        ][:10],
+                        "market_context_error": market_context_error,
                     },
                 )
             self._persist()
@@ -216,7 +259,8 @@ class MomentumReversalRunner:
 
     def _poll(self) -> None:
         with self._lock:
-            keys = list(dict.fromkeys([*self._candidates, *self._open]))
+            stock_keys = list(dict.fromkeys([*self._candidates, *self._open]))
+            keys = [*stock_keys, NIFTY50_INDEX_KEY]
         if not keys:
             return
         try:
@@ -226,19 +270,88 @@ class MomentumReversalRunner:
             return
         with self._lock:
             self._poll_count += 1
-        for quote in quotes.values():
+        market_quote = quotes.get(NIFTY50_INDEX_KEY)
+        market_context = self._market_context(market_quote)
+        observations = {}
+        for key in stock_keys:
+            quote = quotes.get(key)
+            if not quote:
+                continue
             self.coordinator.on_quote(quote)
             history = self._history.setdefault(quote.instrument_key, deque(maxlen=13))
             previous = history[-1] if history else None
             history.append(quote.last_price)
-            self._consider_exit(quote, previous)
-        self._consider_entries(quotes)
+            candidate = self._candidates.get(key, {})
+            observation = {
+                "timestamp": quote.timestamp.isoformat(),
+                "symbol": self._symbols.get(key, key),
+                "instrument_key": key,
+                "price": round(quote.last_price, 4),
+                "previous_price": round(previous, 4) if previous else None,
+                "sample_change_pct": round(_percent_change(quote.last_price, previous), 4),
+                "window_start_price": round(history[0], 4),
+                "window_change_pct": round(
+                    _percent_change(quote.last_price, history[0]), 4
+                ),
+                "session_change_pct": candidate.get("session_change_pct"),
+                "recent_15m_change_pct": candidate.get("recent_15m_change_pct"),
+                "momentum_score": candidate.get("momentum_score"),
+                "recent_volume": candidate.get("recent_volume"),
+                "baseline_volume": candidate.get("baseline_volume"),
+                "relative_volume": candidate.get("relative_volume"),
+                "volume_signal": candidate.get("volume_signal"),
+                **market_context,
+                "decision": "WATCHING",
+            }
+            exit_reason = self._consider_exit(quote, previous)
+            if exit_reason:
+                observation["decision"] = f"EXIT_{exit_reason}"
+            observations[key] = observation
+            self._monitoring.append(observation)
+        self._consider_entries(quotes, observations)
         self._persist()
 
-    def _consider_exit(self, quote: Quote, previous: Optional[float]) -> None:
+    def _market_context(self, quote: Optional[Quote]) -> dict:
+        if not quote:
+            return {
+                "nifty_price": None,
+                "nifty_sample_change_pct": None,
+                "nifty_window_change_pct": None,
+                "nifty_session_change_pct": None,
+                "nifty_recent_15m_change_pct": None,
+            }
+        previous = self._market_history[-1] if self._market_history else None
+        self._market_history.append(quote.last_price)
+        return {
+            "nifty_price": round(quote.last_price, 4),
+            "nifty_sample_change_pct": round(
+                _percent_change(quote.last_price, previous), 4
+            ),
+            "nifty_window_change_pct": round(
+                _percent_change(quote.last_price, self._market_history[0]), 4
+            ),
+            "nifty_session_change_pct": (
+                round(
+                    _percent_change(quote.last_price, self._market_bases["session_open"]),
+                    4,
+                )
+                if self._market_bases["session_open"]
+                else None
+            ),
+            "nifty_recent_15m_change_pct": (
+                round(
+                    _percent_change(quote.last_price, self._market_bases["recent_15m"]),
+                    4,
+                )
+                if self._market_bases["recent_15m"]
+                else None
+            ),
+        }
+
+    def _consider_exit(self, quote: Quote, previous: Optional[float]) -> Optional[str]:
         state = self._open.get(quote.instrument_key)
         if not state:
-            return
+            return None
         state["last_price"] = quote.last_price
         state["peak_price"] = max(state["peak_price"], quote.last_price)
         entry_price = state["entry_price"]
@@ -256,32 +369,95 @@ class MomentumReversalRunner:
             reason = "MOMENTUM_REVERSAL"
         if reason:
             self._exit(quote, state, reason)
+        return reason
 
-    def _consider_entries(self, quotes: Dict[str, Quote]) -> None:
+    def _consider_entries(self, quotes: Dict[str, Quote], observations: dict) -> None:
         broker = self.accounts.get(self.config.account_id)
         open_count = sum(1 for position in broker.positions.values() if position.quantity > 0)
         slots = self.config.max_positions - open_count
-        if slots <= 0:
-            return
         candidates = sorted(
             self._candidates.values(), key=lambda row: row["momentum_score"], reverse=True
         )
         for candidate in candidates:
-            if slots <= 0:
-                break
             key = candidate["instrument_key"]
-            if key in self._open or key in self._completed:
+            observation = observations.get(key)
+            if key in self._open:
+                if observation:
+                    observation["decision"] = "HOLDING_POSITION"
+                continue
+            if key in self._completed:
+                if observation:
+                    observation["decision"] = "ALREADY_TRADED"
+                continue
+            if slots <= 0:
+                if observation:
+                    observation["decision"] = "MAX_POSITIONS_REACHED"
                 continue
             history = self._history.get(key)
             quote = quotes.get(key)
             if not history or len(history) < 3 or not quote:
+                if observation:
+                    observation["decision"] = "BUILDING_PRICE_HISTORY"
+                continue
+            if not candidate.get("volume_confirmed") or (
+                candidate.get("relative_volume") is None
+                or candidate["relative_volume"] < self.config.minimum_relative_volume
+            ):
+                if observation:
+                    observation["decision"] = "RELATIVE_VOLUME_TOO_LOW"
+                continue
+            if not observation or (
+                observation.get("nifty_window_change_pct") is None
+                or observation["nifty_window_change_pct"] <= 0
+                or observation.get("nifty_recent_15m_change_pct") is None
+                or observation["nifty_recent_15m_change_pct"] <= 0
+            ):
+                if observation:
+                    observation["decision"] = "NIFTY_SHORT_TERM_NOT_POSITIVE"
                 continue
             window_change = (history[-1] / history[0] - 1) * 100
-            if window_change < self.config.entry_momentum_pct or history[-1] <= history[-2]:
+            if window_change < self.config.entry_momentum_pct:
+                if observation:
+                    observation["decision"] = "BELOW_ENTRY_THRESHOLD"
+                continue
+            if history[-1] <= history[-2]:
+                if observation:
+                    observation["decision"] = "LATEST_SAMPLE_NOT_RISING"
                 continue
             quantity = floor(self.config.allocation_per_position / quote.last_price)
             if quantity <= 0:
+                if observation:
+                    observation["decision"] = "ALLOCATION_TOO_SMALL"
                 continue
+            entry_signal = {
+                "reason": "UPWARD_MOVEMENT_CONFIRMED",
+                "window_start_price": round(history[0], 4),
+                "observed_price": round(quote.last_price, 4),
+                "window_change_pct": round(window_change, 4),
+                "entry_threshold_pct": self.config.entry_momentum_pct,
+                "previous_price": round(history[-2], 4),
+                "sample_change_pct": round(
+                    _percent_change(history[-1], history[-2]), 4
+                ),
+                "session_change_pct": candidate["session_change_pct"],
+                "recent_15m_change_pct": candidate["recent_15m_change_pct"],
+                "momentum_score": candidate["momentum_score"],
+                "recent_volume": candidate["recent_volume"],
+                "baseline_volume": candidate["baseline_volume"],
+                "relative_volume": candidate["relative_volume"],
+                "minimum_relative_volume": self.config.minimum_relative_volume,
+                "volume_signal": candidate["volume_signal"],
+                "nifty_price": observation.get("nifty_price") if observation else None,
+                "nifty_session_change_pct": (
+                    observation.get("nifty_session_change_pct") if observation else None
+                ),
+                "nifty_recent_15m_change_pct": (
+                    observation.get("nifty_recent_15m_change_pct")
+                    if observation
+                    else None
+                ),
+                "market_alignment": _market_alignment(observation),
+            }
             order = self._submit(key, Side.BUY, quantity, quote)
             position = broker.positions.get(key)
             if order.filled_quantity <= 0 or not position or position.quantity <= 0:
@@ -289,6 +465,8 @@ class MomentumReversalRunner:
                     "ENTRY_REJECTED",
                     {"symbol": candidate["symbol"], "order": order.to_dict()},
                 )
+                if observation:
+                    observation["decision"] = "ENTRY_REJECTED"
                 self._completed.add(key)
                 continue
             self._open[key] = {
@@ -305,9 +483,13 @@ class MomentumReversalRunner:
                 {
                     "symbol": candidate["symbol"],
                     "observed_price": quote.last_price,
+                    "entry_signal": entry_signal,
                     "order": order.to_dict(),
                 },
             )
+            if observation:
+                observation["decision"] = "ENTRY_FILLED"
+                observation["entry_signal"] = entry_signal
             slots -= 1
 
     def _exit(self, quote: Quote, state: dict, reason: str) -> None:
@@ -380,6 +562,20 @@ class MomentumReversalRunner:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+
+def _percent_change(current: float, base: Optional[float]) -> float:
+    return (current / base - 1) * 100 if base else 0.0
+
+
+def _market_alignment(observation: Optional[dict]) -> str:
+    if not observation or observation.get("nifty_recent_15m_change_pct") is None:
+        return "MARKET_CONTEXT_UNAVAILABLE"
+    return (
+        "WITH_BROAD_MARKET"
+        if observation["nifty_recent_15m_change_pct"] >= 0
+        else "AGAINST_BROAD_MARKET"
+    )
 
 
 class MomentumRunnerService:

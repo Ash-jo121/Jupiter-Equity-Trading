@@ -121,6 +121,7 @@ class MomentumRunRequest(BaseModel):
     allocation_per_position: float = Field(default=25_000, gt=0)
     candidate_limit: int = Field(default=10, ge=1, le=50)
     minimum_score: float = Field(default=0.15, ge=0)
+    minimum_relative_volume: float = Field(default=1.2, ge=1)
     entry_momentum_pct: float = Field(default=0.10, gt=0)
     reversal_pct: float = Field(default=0.10, gt=0)
     hard_stop_pct: float = Field(default=0.35, gt=0)
@@ -414,6 +415,7 @@ def create_app(
                     allocation_per_position=request.allocation_per_position,
                     candidate_limit=request.candidate_limit,
                     minimum_score=request.minimum_score,
+                    minimum_relative_volume=request.minimum_relative_volume,
                     entry_momentum_pct=request.entry_momentum_pct,
                     reversal_pct=request.reversal_pct,
                     hard_stop_pct=request.hard_stop_pct,

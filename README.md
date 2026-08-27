@@ -103,6 +103,16 @@ hard stop. It limits concurrent positions, trades each instrument at most once p
 liquidates remaining positions when the configured duration expires. Every order uses the paper
 broker with MIS costs and slippage; no order is sent to Upstox.
 
+An entry is allowed only when the stock's rolling movement and latest sample are positive, both
+the NIFTY 50 rolling movement and trailing 15-minute movement are positive, and the stock's last
+three completed 5-minute candles average at least 1.20x the median volume of up to twelve earlier
+completed intraday candles. These NIFTY and relative-volume confirmations are mandatory.
+
+Each poll persists a symbol-first monitoring trace: price, change from the previous sample,
+rolling-window change, stock session and 15-minute momentum, NIFTY 50 session and 15-minute
+context, and the resulting decision. Filled entries also persist an explicit reason and whether
+the stock's strength was aligned with or against the broader NIFTY move.
+
 Start the default five-minute experiment on the dedicated `momentum` research account:
 
 ```bash
