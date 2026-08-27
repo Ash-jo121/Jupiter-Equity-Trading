@@ -19,6 +19,10 @@ own local simulator. It never sends an order to a real broker.
 - Read-only Upstox V3 quotes, candles, market-status gating, live streaming, and instrument
   search
 - Cash, position, order-notional, daily-loss, and kill-switch controls
+- Persistent profit-target strategies with entry ceilings, percentage or absolute targets,
+  stop losses, and start/pause/stop controls
+- Historical candle-close replay with net P&L, Indian costs, drawdown, fills, and equity curves
+- Local dashboard for surveys, accounts, strategies, positions, orders, and reports
 
 This is an execution simulator, not a prediction system. Market depth is only a snapshot, so
 paper fills can approximate but cannot guarantee the queue position or latency of a real order.
@@ -47,6 +51,81 @@ The local `.env` is ignored by Git. Open
 
 `PAPER_INITIAL_CASH` initializes the default account only when it is first created. Restarting
 the API restores cash, orders, fills, and positions from `PAPER_DB_PATH`.
+
+Run the dashboard in a second terminal:
+
+```bash
+cd dashboard
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The account selector switches every
+portfolio panel between persistent paper accounts. The dashboard remains local because it
+contains private strategy and account data.
+
+## Survey and profit-target strategy
+
+`GET /universes/nifty50` downloads and caches the current official NSE constituent file.
+`POST /market/survey` ranks that universe using session and trailing 15-minute momentum. The
+dashboard scans all 50 stocks but displays the top 15. It describes current price action; it is
+not a prediction or recommendation.
+
+```bash
+curl -X POST http://127.0.0.1:8000/strategies \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":"BIOCON paper target",
+    "account_id":"default",
+    "legs":[{
+      "symbol":"BIOCON",
+      "instrument_key":"NSE_EQ|INE376G01013",
+      "quantity":25,
+      "entry_price":417.25,
+      "profit_target_pct":1.0,
+      "stop_loss_pct":0.5,
+      "absolute_profit_target":4.2
+    }]
+  }'
+```
+
+Strategies start as `DRAFT`. Review the response, then call
+`POST /strategies/{strategy_id}/start`. A configured entry becomes a paper limit order. An exit
+uses the first profit or stop threshold reached. `pause` prevents new decisions; `stop` is
+permanent and does not implicitly liquidate an existing position.
+
+## Looped momentum/reversal paper sessions
+
+`POST /momentum-runners` starts a bounded background session over the current NIFTY 50.
+The runner rescans the universe, polls live prices between scans, buys only candidates with
+positive intraday and observed short-window momentum, and sells after a trailing reversal or
+hard stop. It limits concurrent positions, trades each instrument at most once per session, and
+liquidates remaining positions when the configured duration expires. Every order uses the paper
+broker with MIS costs and slippage; no order is sent to Upstox.
+
+Start the default five-minute experiment on the dedicated `momentum` research account:
+
+```bash
+curl -X POST http://127.0.0.1:8000/momentum-runners \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_seconds":300}'
+```
+
+Inspect the returned runner ID with `GET /momentum-runners/{runner_id}` or stop it early with
+`POST /momentum-runners/{runner_id}/stop`. An early stop also liquidates open positions. Run
+snapshots persist in SQLite, while profit or loss accumulates in the account's total equity.
+The dashboard Home tab shows that balance and starts new runs; the Runs tab lists every momentum
+run and opens symbol-first execution, fees, exit reasons, and P&L details.
+
+## Backtesting and reports
+
+`POST /backtests` downloads read-only Upstox historical candles and replays the same target and
+stop rule using candle closes. Reports persist at `GET /reports/backtests` and include gross and
+net P&L, charges, return, drawdown, fills, exit reason, and an equity curve.
+
+The first backtester intentionally supports one entry and one exit per run. Candle-close replay
+does not know intrabar sequencing or exchange queue position, so use it to compare hypotheses,
+not to claim exact live performance.
 
 ## Find BEL and place a paper order
 
@@ -159,6 +238,6 @@ ruff check .
 ## Boundaries and next work
 
 The simulator deliberately remains separate from real broker order APIs. Upstox is used only
-for market data and instrument discovery. High-value next steps are a local web dashboard,
-historical replay/backtesting reports, exchange circuit limits, corporate actions, and a more
-advanced queue/latency model.
+for market data and instrument discovery. High-value next steps are repeated-trade and
+walk-forward backtests, exchange circuit limits, corporate actions, benchmark comparisons, and
+a more advanced queue/latency model.

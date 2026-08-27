@@ -96,6 +96,36 @@ class UpstoxMarketData:
             )
         return sorted(candles, key=lambda candle: candle.timestamp)
 
+    def intraday_candles(
+        self, instrument_key: str, unit: str = "minutes", interval: int = 5
+    ) -> List[Candle]:
+        if unit not in {"minutes", "hours", "days"}:
+            raise ValueError("unsupported intraday candle unit")
+        path = "/v3/historical-candle/intraday/{}/{}/{}".format(
+            quote(instrument_key, safe=""), unit, interval
+        )
+        payload = self._get(path)
+        return self._candles(payload)
+
+    def market_status(self, exchange: str = "NSE") -> dict:
+        return self._get("/v2/market/status/" + quote(exchange, safe=""))["data"]
+
+    def _candles(self, payload: dict) -> List[Candle]:
+        candles = []
+        for row in payload.get("data", {}).get("candles", []):
+            candles.append(
+                Candle(
+                    timestamp=datetime.fromisoformat(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=int(row[5]),
+                    open_interest=int(row[6]),
+                )
+            )
+        return sorted(candles, key=lambda candle: candle.timestamp)
+
     def _get(self, path: str) -> dict:
         request = Request(
             self.base_url + path,
