@@ -9,7 +9,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .accounts import PaperAccountManager
-from .backtest import BacktestEngine
+from .backtest import BacktestEngine, ExitReplayEngine, ReplayGates
 from .config import Settings
 from .domain import DepthLevel, Order, OrderType, Product, Quote, Side, Validity
 from .instrument_search import InstrumentSearchError, UpstoxInstrumentSearch
@@ -30,6 +30,7 @@ from .strategy_engine import (
     StrategyStatus,
 )
 from .survey import MarketSurvey, SurveyInstrument
+from .trade_rules import EntryPolicy, ExitPolicy, cost_model
 from .universe import Nifty50Universe, Nifty100Universe, UniverseError
 
 
@@ -125,6 +126,76 @@ class MomentumRunRequest(BaseModel):
     entry_momentum_pct: float = Field(default=0.10, gt=0)
     reversal_pct: float = Field(default=0.10, gt=0)
     hard_stop_pct: float = Field(default=0.35, gt=0)
+    entry_mode: Literal["THREE_BAR", "ROLLING_WINDOW"] = "THREE_BAR"
+    exit_mode: Literal["RATCHET", "REVERSAL"] = "RATCHET"
+    entry_bars: int = Field(default=3, ge=2, le=12)
+    require_nifty_confirmation: bool = False
+    entry_cost_multiple: float = Field(default=1.0, ge=0)
+    entry_noise_multiple: float = Field(default=2.0, ge=0)
+    entry_timeframe_seconds: float = Field(default=0.0, ge=0, le=900)
+    survive_stop_multiple: float = Field(default=2.0, gt=0)
+    lock_multiple: float = Field(default=1.5, gt=0)
+    ride_multiple: float = Field(default=3.0, gt=0)
+    min_gap_multiple: float = Field(default=1.5, gt=0)
+    trail_window: int = Field(default=24, ge=2, le=360)
+    fast_trail_window: int = Field(default=6, ge=2, le=360)
+    volume_decay_ratio: float = Field(default=1.0, gt=0)
+    confirmation_samples: int = Field(default=2, ge=1, le=20)
+    time_stop_seconds: float = Field(default=240.0, gt=0)
+
+
+class MomentumVariantRequest(BaseModel):
+    """One arm of a batch: a label plus any fields that differ from the base."""
+
+    label: Optional[str] = Field(default=None, max_length=40)
+    account_id: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9_-]{1,40}$")
+    overrides: dict = Field(default_factory=dict)
+
+
+class MomentumBatchRequest(BaseModel):
+    """Several runs launched together, sharing a base config and differing per arm."""
+
+    base: MomentumRunRequest = Field(default_factory=MomentumRunRequest)
+    variants: List[MomentumVariantRequest] = Field(min_length=1, max_length=8)
+    account_prefix: str = Field(default="momentum", pattern=r"^[a-zA-Z0-9_-]{1,24}$")
+
+    def merged(self, variant: MomentumVariantRequest, index: int) -> MomentumRunRequest:
+        """Base config with this arm's overrides applied, on its own account."""
+
+        fields = self.base.model_dump()
+        unknown = set(variant.overrides) - set(fields)
+        if unknown:
+            raise ValueError(f"unknown override fields: {', '.join(sorted(unknown))}")
+        fields.update(variant.overrides)
+        slug = variant.label or f"v{index + 1}"
+        safe = "".join(char if char.isalnum() else "-" for char in slug.lower())[:20]
+        fields["account_id"] = variant.account_id or f"{self.account_prefix}-{safe}"
+        return MomentumRunRequest(**fields)
+
+
+class ExitReplayRequest(BaseModel):
+    """Re-score a recorded run's monitoring trace under a different rule."""
+
+    run_id: str
+    mode: Literal["EXITS_ONLY", "FULL"] = "EXITS_ONLY"
+    slippage_bps: float = Field(default=2.0, ge=0)
+    entry_bars: Optional[int] = Field(default=None, ge=2, le=12)
+    minimum_rise_pct: Optional[float] = Field(default=None, ge=0)
+    entry_cost_multiple: float = Field(default=1.0, ge=0)
+    entry_noise_multiple: float = Field(default=2.0, ge=0)
+    survive_stop_multiple: float = Field(default=2.0, gt=0)
+    lock_multiple: float = Field(default=1.5, gt=0)
+    ride_multiple: float = Field(default=3.0, gt=0)
+    min_gap_multiple: float = Field(default=1.5, gt=0)
+    trail_window: int = Field(default=24, ge=2, le=360)
+    fast_trail_window: int = Field(default=6, ge=2, le=360)
+    volume_decay_ratio: float = Field(default=1.0, gt=0)
+    confirmation_samples: int = Field(default=2, ge=1, le=20)
+    time_stop_seconds: float = Field(default=240.0, gt=0)
+    max_positions: Optional[int] = Field(default=None, ge=1, le=10)
+    allocation_per_position: Optional[float] = Field(default=None, gt=0)
+    minimum_relative_volume: Optional[float] = Field(default=None, ge=0)
+    require_positive_nifty: bool = False
 
 
 class BacktestRequest(BaseModel):
@@ -170,6 +241,7 @@ def create_app(
     )
     search_client = instrument_search or UpstoxInstrumentSearch(settings.upstox_access_token)
     backtests = BacktestEngine(research_store, settings.fee_schedule)
+    exit_replays = ExitReplayEngine(research_store, settings.fee_schedule)
     nifty50 = Nifty50Universe()
     nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
@@ -216,6 +288,7 @@ def create_app(
     app.state.strategies = strategies
     app.state.research_store = research_store
     app.state.backtests = backtests
+    app.state.exit_replays = exit_replays
     app.state.momentum_runners = momentum_runners
 
     @app.get("/health")
@@ -395,6 +468,19 @@ def create_app(
         except UniverseError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
+    @app.get("/cost-model")
+    def position_cost_model(
+        notional: float = Query(gt=0), product: Literal["INTRADAY", "DELIVERY"] = "INTRADAY"
+    ) -> dict:
+        """What a round trip costs at a given size, so sizing can be chosen honestly."""
+
+        return cost_model(
+            notional,
+            settings.fee_schedule,
+            settings.slippage_bps,
+            Product.INTRADAY if product == "INTRADAY" else Product.DELIVERY,
+        )
+
     @app.get("/market/status")
     def exchange_status(exchange: str = "NSE") -> dict:
         try:
@@ -405,58 +491,105 @@ def create_app(
         except MarketDataError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
-    @app.post("/momentum-runners", status_code=202)
-    def start_momentum_runner(request: MomentumRunRequest) -> dict:
+    def _launch_runner(request: MomentumRunRequest, label: Optional[str] = None) -> dict:
+        """Provision the account if needed and start one configured run."""
+
         account_id = request.account_id
         try:
             accounts.get(account_id)
         except KeyError:
-            accounts.create(account_id, "Momentum reversal paper session", request.initial_cash)
+            accounts.create(
+                account_id, label or "Momentum reversal paper session", request.initial_cash
+            )
         if momentum_runners.has_active(account_id):
-            raise HTTPException(
-                status_code=409,
-                detail="a momentum run is already active for this paper account",
+            raise ValueError(
+                f"a momentum run is already active for paper account '{account_id}'"
             )
+        constituents = nifty100.constituents()
+        runner = MomentumReversalRunner(
+            config=MomentumRunnerConfig(
+                account_id=account_id,
+                duration_seconds=request.duration_seconds,
+                poll_interval_seconds=request.poll_interval_seconds,
+                rescan_interval_seconds=request.rescan_interval_seconds,
+                max_positions=request.max_positions,
+                allocation_per_position=request.allocation_per_position,
+                candidate_limit=request.candidate_limit,
+                minimum_score=request.minimum_score,
+                minimum_relative_volume=request.minimum_relative_volume,
+                entry_momentum_pct=request.entry_momentum_pct,
+                reversal_pct=request.reversal_pct,
+                hard_stop_pct=request.hard_stop_pct,
+                entry_mode=request.entry_mode,
+                exit_mode=request.exit_mode,
+                entry_bars=request.entry_bars,
+                require_nifty_confirmation=request.require_nifty_confirmation,
+                entry_cost_multiple=request.entry_cost_multiple,
+                entry_noise_multiple=request.entry_noise_multiple,
+                entry_timeframe_seconds=request.entry_timeframe_seconds,
+                survive_stop_multiple=request.survive_stop_multiple,
+                lock_multiple=request.lock_multiple,
+                ride_multiple=request.ride_multiple,
+                min_gap_multiple=request.min_gap_multiple,
+                trail_window=request.trail_window,
+                fast_trail_window=request.fast_trail_window,
+                volume_decay_ratio=request.volume_decay_ratio,
+                confirmation_samples=request.confirmation_samples,
+                time_stop_seconds=request.time_stop_seconds,
+                universe_name=Nifty100Universe.name,
+                universe_size=Nifty100Universe.expected_count,
+            ),
+            instruments=[
+                SurveyInstrument(item["symbol"], item["instrument_key"])
+                for item in constituents
+            ],
+            market_data=market_data(),
+            accounts=accounts,
+            coordinator=coordinator,
+            store=research_store,
+        )
+        return momentum_runners.add(runner)
+
+    @app.post("/momentum-runners", status_code=202)
+    def start_momentum_runner(request: MomentumRunRequest) -> dict:
         try:
-            constituents = nifty100.constituents()
-            runner = MomentumReversalRunner(
-                config=MomentumRunnerConfig(
-                    account_id=account_id,
-                    duration_seconds=request.duration_seconds,
-                    poll_interval_seconds=request.poll_interval_seconds,
-                    rescan_interval_seconds=request.rescan_interval_seconds,
-                    max_positions=request.max_positions,
-                    allocation_per_position=request.allocation_per_position,
-                    candidate_limit=request.candidate_limit,
-                    minimum_score=request.minimum_score,
-                    minimum_relative_volume=request.minimum_relative_volume,
-                    entry_momentum_pct=request.entry_momentum_pct,
-                    reversal_pct=request.reversal_pct,
-                    hard_stop_pct=request.hard_stop_pct,
-                    universe_name=Nifty100Universe.name,
-                    universe_size=Nifty100Universe.expected_count,
-                ),
-                instruments=[
-                    SurveyInstrument(item["symbol"], item["instrument_key"])
-                    for item in constituents
-                ],
-                market_data=market_data(),
-                accounts=accounts,
-                coordinator=coordinator,
-                store=research_store,
-            )
-            return momentum_runners.add(runner)
-        except (UniverseError, MarketDataError, ValueError) as error:
+            return _launch_runner(request)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (UniverseError, MarketDataError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/momentum-runners/batch", status_code=202)
+    def start_momentum_runner_batch(request: MomentumBatchRequest) -> dict:
+        """Start several differently configured runs side by side.
+
+        Each variant gets its own paper account, because concurrent runners
+        sharing one account would compete for the same cash and positions and
+        neither result would mean anything. Comparing configurations needs the
+        accounts kept apart.
+        """
+
+        started, failed = [], []
+        for index, variant in enumerate(request.variants):
+            merged = request.merged(variant, index)
+            try:
+                started.append(
+                    {"label": variant.label or merged.account_id, "run": _launch_runner(merged, variant.label)}
+                )
+            except (ValueError, UniverseError, MarketDataError) as error:
+                failed.append({"label": variant.label or merged.account_id, "error": str(error)})
+        if not started and failed:
+            raise HTTPException(status_code=409, detail=failed[0]["error"])
+        return {"started": started, "failed": failed}
 
     @app.get("/momentum-runners")
     def list_momentum_runners() -> list:
         return momentum_runners.list()
 
     @app.get("/momentum-runners/{runner_id}")
-    def get_momentum_runner(runner_id: str) -> dict:
+    def get_momentum_runner(runner_id: str, include_monitoring: bool = True) -> dict:
         try:
-            return momentum_runners.get(runner_id)
+            return momentum_runners.get(runner_id, include_monitoring=include_monitoring)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="momentum runner not found") from error
 
@@ -540,6 +673,79 @@ def create_app(
             )
         except (MarketDataError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.get("/observations/sessions")
+    def observation_sessions() -> list:
+        """Which trading days have recorded ticks, and how much of each."""
+
+        return research_store.observed_sessions()
+
+    @app.get("/observations")
+    def list_observations(
+        run_id: Optional[str] = None,
+        session_date: Optional[str] = None,
+        symbol: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        limit: int = Query(default=5_000, ge=1, le=200_000),
+    ) -> dict:
+        rows = research_store.observations(
+            run_id=run_id,
+            session_date=session_date,
+            symbol=symbol,
+            instrument_key=instrument_key,
+            limit=limit,
+        )
+        return {"count": len(rows), "limit": limit, "observations": rows}
+
+    @app.post("/backtests/exit-replay", status_code=201)
+    def replay_exits(request: ExitReplayRequest) -> dict:
+        try:
+            source = momentum_runners.get(request.run_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="momentum run not found") from error
+        config = source.get("config") or {}
+        try:
+            return exit_replays.run(
+                source,
+                exit_policy=ExitPolicy(
+                    survive_stop_multiple=request.survive_stop_multiple,
+                    lock_multiple=request.lock_multiple,
+                    ride_multiple=request.ride_multiple,
+                    min_gap_multiple=request.min_gap_multiple,
+                    trail_window=request.trail_window,
+                    fast_trail_window=request.fast_trail_window,
+                    volume_decay_ratio=request.volume_decay_ratio,
+                    confirmation_samples=request.confirmation_samples,
+                    time_stop_seconds=request.time_stop_seconds,
+                ),
+                entry_policy=EntryPolicy(
+                    bars=request.entry_bars or config.get("entry_bars", 3),
+                    minimum_rise_pct=(
+                        request.minimum_rise_pct
+                        if request.minimum_rise_pct is not None
+                        else config.get("entry_momentum_pct", 0.10)
+                    ),
+                    cost_floor_multiple=request.entry_cost_multiple,
+                    noise_multiple=request.entry_noise_multiple,
+                ),
+                mode=request.mode,
+                gates=ReplayGates(
+                    minimum_relative_volume=(
+                        request.minimum_relative_volume
+                        if request.minimum_relative_volume is not None
+                        else config.get("minimum_relative_volume", 1.2)
+                    ),
+                    require_positive_nifty=request.require_positive_nifty,
+                    max_positions=request.max_positions or config.get("max_positions", 2),
+                    allocation_per_position=(
+                        request.allocation_per_position
+                        or config.get("allocation_per_position", 25_000.0)
+                    ),
+                ),
+                slippage_bps=request.slippage_bps,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/reports/backtests")
     def backtest_reports() -> list:

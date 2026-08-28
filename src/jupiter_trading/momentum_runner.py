@@ -15,8 +15,20 @@ from .market_data import UpstoxMarketData
 from .research_store import ResearchStore
 from .strategy_engine import MarketCoordinator
 from .survey import MarketSurvey, SurveyInstrument
+from .trade_rules import (
+    BarAggregator,
+    EntryPolicy,
+    ExitPolicy,
+    RatchetExit,
+    breakeven_pct,
+    cost_model,
+    evaluate_entry,
+)
 
 NIFTY50_INDEX_KEY = "NSE_INDEX|Nifty 50"
+ENTRY_MODES = frozenset({"THREE_BAR", "ROLLING_WINDOW"})
+ACTIVE_RUN_STATUSES = frozenset({"RUNNING", "STOPPING"})
+EXIT_MODES = frozenset({"RATCHET", "REVERSAL"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,23 @@ class MomentumRunnerConfig:
     hard_stop_pct: float = 0.35
     universe_name: str = "NIFTY 100"
     universe_size: int = 100
+    entry_mode: str = "THREE_BAR"
+    exit_mode: str = "RATCHET"
+    entry_bars: int = 3
+    require_nifty_confirmation: bool = False
+    minimum_cost_floor_pct: float = 0.01
+    entry_cost_multiple: float = 1.0
+    entry_noise_multiple: float = 2.0
+    entry_timeframe_seconds: float = 0.0
+    survive_stop_multiple: float = 2.0
+    lock_multiple: float = 1.5
+    ride_multiple: float = 3.0
+    min_gap_multiple: float = 1.5
+    trail_window: int = 24
+    fast_trail_window: int = 6
+    volume_decay_ratio: float = 1.0
+    confirmation_samples: int = 2
+    time_stop_seconds: float = 240.0
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -58,6 +87,37 @@ class MomentumRunnerConfig:
             self.hard_stop_pct,
         ) <= 0:
             raise ValueError("momentum and exit thresholds must be positive")
+        if self.minimum_cost_floor_pct <= 0:
+            raise ValueError("minimum_cost_floor_pct must be positive")
+        if self.entry_timeframe_seconds < 0:
+            raise ValueError("entry_timeframe_seconds cannot be negative")
+        if self.entry_mode not in ENTRY_MODES:
+            raise ValueError(f"entry_mode must be one of {sorted(ENTRY_MODES)}")
+        if self.exit_mode not in EXIT_MODES:
+            raise ValueError(f"exit_mode must be one of {sorted(EXIT_MODES)}")
+        self.entry_policy()
+        self.exit_policy()
+
+    def entry_policy(self) -> EntryPolicy:
+        return EntryPolicy(
+            bars=self.entry_bars,
+            minimum_rise_pct=self.entry_momentum_pct,
+            cost_floor_multiple=self.entry_cost_multiple,
+            noise_multiple=self.entry_noise_multiple,
+        )
+
+    def exit_policy(self) -> ExitPolicy:
+        return ExitPolicy(
+            survive_stop_multiple=self.survive_stop_multiple,
+            lock_multiple=self.lock_multiple,
+            ride_multiple=self.ride_multiple,
+            min_gap_multiple=self.min_gap_multiple,
+            trail_window=self.trail_window,
+            fast_trail_window=self.fast_trail_window,
+            volume_decay_ratio=self.volume_decay_ratio,
+            confirmation_samples=self.confirmation_samples,
+            time_stop_seconds=self.time_stop_seconds,
+        )
 
 
 class MomentumReversalRunner:
@@ -91,6 +151,7 @@ class MomentumReversalRunner:
         self._poll_count = 0
         self._candidates: Dict[str, dict] = {}
         self._history: Dict[str, deque[float]] = {}
+        self._bar_aggregators: Dict[str, BarAggregator] = {}
         self._market_history: deque[float] = deque(maxlen=13)
         self._market_bases: dict[str, Optional[float]] = {
             "session_open": None,
@@ -98,10 +159,23 @@ class MomentumReversalRunner:
         }
         self._monitoring: list[dict] = []
         self._open: Dict[str, dict] = {}
+        self._exits: Dict[str, RatchetExit] = {}
+        self._volume_state: Dict[str, dict] = {}
         self._completed: set[str] = set()
         self._events: list[dict] = []
         self._errors: list[str] = []
-        self._initial_equity = accounts.get(config.account_id).snapshot()["equity"]
+        self._dirty = False
+        self._flushed_observations = 0
+        self._history_size = max(13, config.entry_bars)
+        self._bar_capacity = max(20, config.entry_bars + 5)
+        broker = accounts.get(config.account_id)
+        self._initial_equity = broker.snapshot()["equity"]
+        self._cost_model = cost_model(
+            config.allocation_per_position,
+            broker.fee_schedule,
+            broker.slippage_bps,
+            Product.INTRADAY,
+        )
 
     def start(self) -> dict:
         with self._lock:
@@ -165,6 +239,8 @@ class MomentumReversalRunner:
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
                 "config": asdict(self.config),
+                "cost_model": self._cost_model,
+                "decision_counts": _decision_counts(self._monitoring),
                 "initial_equity": self._initial_equity,
                 "scan_count": self._scan_count,
                 "poll_count": self._poll_count,
@@ -238,6 +314,24 @@ class MomentumReversalRunner:
             with self._lock:
                 self._scan_count += 1
                 self._candidates = {row["instrument_key"]: row for row in candidates}
+                # Held positions drop out of the candidate list, but the trailing
+                # stop still wants their latest participation reading.
+                self._volume_state = {
+                    row["instrument_key"]: {
+                        key: row[key]
+                        for key in (
+                            "relative_volume",
+                            "recent_volume",
+                            "baseline_volume",
+                            "volume_signal",
+                            "momentum_score",
+                            "session_change_pct",
+                            "recent_15m_change_pct",
+                            "range_position_pct",
+                        )
+                    }
+                    for row in result["results"]
+                }
                 self._record(
                     "SCAN",
                     {
@@ -282,10 +376,23 @@ class MomentumReversalRunner:
             if not quote:
                 continue
             self.coordinator.on_quote(quote)
-            history = self._history.setdefault(quote.instrument_key, deque(maxlen=13))
+            history = self._history.setdefault(
+                quote.instrument_key, deque(maxlen=self._history_size)
+            )
             previous = history[-1] if history else None
             history.append(quote.last_price)
-            candidate = self._candidates.get(key, {})
+            if self.config.entry_timeframe_seconds > 0:
+                self._bar_aggregators.setdefault(
+                    key, BarAggregator(self.config.entry_timeframe_seconds, self._bar_capacity)
+                ).add(quote.last_price, quote.timestamp)
+            stats = {**self._volume_state.get(key, {}), **self._candidates.get(key, {})}
+            entry_closes, entry_lows = self._entry_series(key)
+            entry_check = evaluate_entry(
+                entry_closes,
+                self.config.entry_policy(),
+                self._expected_cost_floor_pct(),
+                lows=entry_lows,
+            )
             observation = {
                 "timestamp": quote.timestamp.isoformat(),
                 "symbol": self._symbols.get(key, key),
@@ -297,23 +404,53 @@ class MomentumReversalRunner:
                 "window_change_pct": round(
                     _percent_change(quote.last_price, history[0]), 4
                 ),
-                "session_change_pct": candidate.get("session_change_pct"),
-                "recent_15m_change_pct": candidate.get("recent_15m_change_pct"),
-                "momentum_score": candidate.get("momentum_score"),
-                "recent_volume": candidate.get("recent_volume"),
-                "baseline_volume": candidate.get("baseline_volume"),
-                "relative_volume": candidate.get("relative_volume"),
-                "volume_signal": candidate.get("volume_signal"),
+                "session_change_pct": stats.get("session_change_pct"),
+                "recent_15m_change_pct": stats.get("recent_15m_change_pct"),
+                "momentum_score": stats.get("momentum_score"),
+                "range_position_pct": stats.get("range_position_pct"),
+                "recent_volume": stats.get("recent_volume"),
+                "baseline_volume": stats.get("baseline_volume"),
+                "relative_volume": stats.get("relative_volume"),
+                "volume_signal": stats.get("volume_signal"),
+                "entry_check": entry_check.to_dict(),
+                "held": key in self._open,
+                "exit": None,
                 **market_context,
                 "decision": "WATCHING",
             }
-            exit_reason = self._consider_exit(quote, previous)
-            if exit_reason:
-                observation["decision"] = f"EXIT_{exit_reason}"
+            exit_result = self._consider_exit(quote, previous, stats.get("relative_volume"))
+            if exit_result:
+                observation["exit"] = exit_result["state"]
+                if exit_result["reason"]:
+                    observation["decision"] = f"EXIT_{exit_result['reason']}"
             observations[key] = observation
             self._monitoring.append(observation)
         self._consider_entries(quotes, observations)
-        self._persist()
+        self._persist(force=False)
+
+    def _entry_series(self, key: str) -> tuple:
+        """Closes and lows for the entry window, in the configured timeframe.
+
+        With `entry_timeframe_seconds` at its default of zero, this is the raw
+        five-second tick stream and closes double as their own lows - identical
+        to the behaviour before bar aggregation existed. Set it above zero to
+        run the three-bar check on resampled OHLC bars instead, with the stop
+        seeded from each bar's real intrabar low rather than its close.
+        """
+
+        if self.config.entry_timeframe_seconds > 0:
+            bars = self._bar_aggregators.get(key)
+            completed = bars.completed_bars if bars else []
+            return [bar.close for bar in completed], [bar.low for bar in completed]
+        prices = list(self._history.get(key) or ())
+        return prices, prices
+
+    def _expected_cost_floor_pct(self) -> float:
+        """Cost of a round trip at the configured size, before a fill is known."""
+
+        return max(
+            self._cost_model["breakeven_pct"], self.config.minimum_cost_floor_pct
+        )
 
     def _market_context(self, quote: Optional[Quote]) -> dict:
         if not quote:
@@ -352,12 +489,42 @@ class MomentumReversalRunner:
             ),
         }
 
-    def _consider_exit(self, quote: Quote, previous: Optional[float]) -> Optional[str]:
+    def _consider_exit(
+        self,
+        quote: Quote,
+        previous: Optional[float],
+        relative_volume: Optional[float] = None,
+    ) -> Optional[dict]:
         state = self._open.get(quote.instrument_key)
         if not state:
             return None
         state["last_price"] = quote.last_price
         state["peak_price"] = max(state["peak_price"], quote.last_price)
+        result = (
+            self._ratchet_exit(quote, state, relative_volume)
+            if self.config.exit_mode == "RATCHET"
+            else self._reversal_exit(quote, state, previous)
+        )
+        state.update(
+            {
+                key: result["state"].get(key)
+                for key in ("phase", "stop_price", "stop_source", "unrealized_pct")
+            }
+        )
+        if result["reason"]:
+            self._exit(quote, state, result["reason"], result["state"])
+        return result
+
+    def _ratchet_exit(
+        self, quote: Quote, state: dict, relative_volume: Optional[float]
+    ) -> dict:
+        rule = self._exits.get(quote.instrument_key)
+        if not rule:
+            return self._reversal_exit(quote, state, None)
+        diagnostics = rule.update(quote.last_price, quote.timestamp, relative_volume)
+        return {"reason": diagnostics["reason"], "state": diagnostics}
+
+    def _reversal_exit(self, quote: Quote, state: dict, previous: Optional[float]) -> dict:
         entry_price = state["entry_price"]
         drawdown = (state["peak_price"] / quote.last_price - 1) * 100
         pnl_pct = (quote.last_price / entry_price - 1) * 100
@@ -371,9 +538,25 @@ class MomentumReversalRunner:
             and drawdown >= self.config.reversal_pct
         ):
             reason = "MOMENTUM_REVERSAL"
-        if reason:
-            self._exit(quote, state, reason)
-        return reason
+        cost_floor = state.get("cost_floor_pct") or 0.0
+        return {
+            "reason": reason,
+            "state": {
+                "phase": "REVERSAL",
+                "reason": reason,
+                "entry_price": round(entry_price, 4),
+                "last_price": round(quote.last_price, 4),
+                "peak_price": round(state["peak_price"], 4),
+                "stop_price": round(entry_price * (1 - self.config.hard_stop_pct / 100), 4),
+                "stop_source": "FIXED_HARD_STOP",
+                "unrealized_pct": round(pnl_pct, 4),
+                "net_of_cost_pct": round(pnl_pct - cost_floor, 4),
+                "cost_floor_pct": round(cost_floor, 4),
+                "drawdown_from_peak_pct": round(drawdown, 4),
+                "reversal_pct": self.config.reversal_pct,
+                "hard_stop_pct": self.config.hard_stop_pct,
+            },
+        }
 
     def _consider_entries(self, quotes: Dict[str, Quote], observations: dict) -> None:
         broker = self.accounts.get(self.config.account_id)
@@ -399,7 +582,11 @@ class MomentumReversalRunner:
                 continue
             history = self._history.get(key)
             quote = quotes.get(key)
-            if not history or len(history) < 3 or not quote:
+            entry_closes, entry_lows = self._entry_series(key)
+            ready_length = (
+                len(entry_closes) if self.config.entry_mode == "THREE_BAR" else len(history or [])
+            )
+            if not history or ready_length < self.config.entry_bars or not quote:
                 if observation:
                     observation["decision"] = "BUILDING_PRICE_HISTORY"
                 continue
@@ -410,8 +597,13 @@ class MomentumReversalRunner:
                 if observation:
                     observation["decision"] = "RELATIVE_VOLUME_TOO_LOW"
                 continue
-            if not observation or (
-                observation.get("nifty_window_change_pct") is None
+            # The index moves an order of magnitude less than a single stock, so a
+            # small negative NIFTY print is noise rather than a reason to stand
+            # aside. It is recorded on every observation either way; set
+            # require_nifty_confirmation to make it a gate again.
+            if self.config.require_nifty_confirmation and (
+                not observation
+                or observation.get("nifty_window_change_pct") is None
                 or observation["nifty_window_change_pct"] <= 0
                 or observation.get("nifty_recent_15m_change_pct") is None
                 or observation["nifty_recent_15m_change_pct"] <= 0
@@ -419,26 +611,47 @@ class MomentumReversalRunner:
                 if observation:
                     observation["decision"] = "NIFTY_SHORT_TERM_NOT_POSITIVE"
                 continue
-            window_change = (history[-1] / history[0] - 1) * 100
-            if window_change < self.config.entry_momentum_pct:
-                if observation:
-                    observation["decision"] = "BELOW_ENTRY_THRESHOLD"
-                continue
-            if history[-1] <= history[-2]:
-                if observation:
-                    observation["decision"] = "LATEST_SAMPLE_NOT_RISING"
-                continue
+            evaluation = evaluate_entry(
+                entry_closes,
+                self.config.entry_policy(),
+                self._expected_cost_floor_pct(),
+                lows=entry_lows,
+            )
+            if self.config.entry_mode == "THREE_BAR":
+                if not evaluation.triggered:
+                    if observation:
+                        observation["decision"] = evaluation.reason
+                    continue
+                window_change = evaluation.rise_pct
+                structural_stop = evaluation.trigger_price
+            else:
+                window_change = (history[-1] / history[0] - 1) * 100
+                if window_change < self.config.entry_momentum_pct:
+                    if observation:
+                        observation["decision"] = "BELOW_ENTRY_THRESHOLD"
+                    continue
+                if history[-1] <= history[-2]:
+                    if observation:
+                        observation["decision"] = "LATEST_SAMPLE_NOT_RISING"
+                    continue
+                structural_stop = min(history)
             quantity = floor(self.config.allocation_per_position / quote.last_price)
             if quantity <= 0:
                 if observation:
                     observation["decision"] = "ALLOCATION_TOO_SMALL"
                 continue
             entry_signal = {
-                "reason": "UPWARD_MOVEMENT_CONFIRMED",
+                "reason": evaluation.reason if self.config.entry_mode == "THREE_BAR"
+                else "UPWARD_MOVEMENT_CONFIRMED",
+                "entry_mode": self.config.entry_mode,
+                "entry_check": evaluation.to_dict(),
+                "structural_stop": round(structural_stop, 4),
                 "window_start_price": round(history[0], 4),
                 "observed_price": round(quote.last_price, 4),
                 "window_change_pct": round(window_change, 4),
-                "entry_threshold_pct": self.config.entry_momentum_pct,
+                "entry_threshold_pct": evaluation.threshold_pct,
+                "entry_threshold_source": evaluation.threshold_source,
+                "stock_noise_pct": evaluation.noise_pct,
                 "previous_price": round(history[-2], 4),
                 "sample_change_pct": round(
                     _percent_change(history[-1], history[-2]), 4
@@ -473,6 +686,21 @@ class MomentumReversalRunner:
                     observation["decision"] = "ENTRY_REJECTED"
                 self._completed.add(key)
                 continue
+            notional = position.quantity * position.average_price
+            cost_floor_pct = max(
+                breakeven_pct(
+                    notional, broker.fee_schedule, broker.slippage_bps, Product.INTRADAY
+                ),
+                self.config.minimum_cost_floor_pct,
+            )
+            rule = RatchetExit(
+                position.average_price,
+                cost_floor_pct,
+                quote.timestamp,
+                self.config.exit_policy(),
+                structural_stop,
+            )
+            self._exits[key] = rule
             self._open[key] = {
                 "instrument_key": key,
                 "symbol": candidate["symbol"],
@@ -481,7 +709,27 @@ class MomentumReversalRunner:
                 "peak_price": quote.last_price,
                 "last_price": quote.last_price,
                 "entry_momentum_pct": round(window_change, 4),
+                "notional": round(notional, 2),
+                "cost_floor_pct": round(cost_floor_pct, 4),
+                "structural_stop": round(structural_stop, 4),
+                "stop_price": round(rule.stop_price, 4),
+                "stop_source": rule.stop_source,
+                "phase": rule.phase.value,
+                "unrealized_pct": 0.0,
             }
+            entry_signal.update(
+                {
+                    "notional": round(notional, 2),
+                    "cost_floor_pct": round(cost_floor_pct, 4),
+                    "initial_stop": round(rule.stop_price, 4),
+                    "initial_stop_source": rule.stop_source,
+                    "risk_pct": round(
+                        (position.average_price / rule.stop_price - 1) * 100, 4
+                    ),
+                    "lock_at_pct": round(cost_floor_pct * self.config.lock_multiple, 4),
+                    "ride_at_pct": round(cost_floor_pct * self.config.ride_multiple, 4),
+                }
+            )
             self._record(
                 "ENTRY_FILLED",
                 {
@@ -496,11 +744,18 @@ class MomentumReversalRunner:
                 observation["entry_signal"] = entry_signal
             slots -= 1
 
-    def _exit(self, quote: Quote, state: dict, reason: str) -> None:
+    def _exit(
+        self,
+        quote: Quote,
+        state: dict,
+        reason: str,
+        diagnostics: Optional[dict] = None,
+    ) -> None:
         broker = self.accounts.get(self.config.account_id)
         position = broker.positions.get(quote.instrument_key)
         if not position or position.quantity <= 0:
             self._open.pop(quote.instrument_key, None)
+            self._exits.pop(quote.instrument_key, None)
             return
         order = self._submit(quote.instrument_key, Side.SELL, position.quantity, quote)
         self._record(
@@ -509,11 +764,14 @@ class MomentumReversalRunner:
                 "symbol": state["symbol"],
                 "reason": reason,
                 "observed_price": quote.last_price,
+                "entry_price": state["entry_price"],
+                "exit_state": diagnostics,
                 "order": order.to_dict(),
             },
         )
         if order.filled_quantity:
             self._open.pop(quote.instrument_key, None)
+            self._exits.pop(quote.instrument_key, None)
             self._completed.add(quote.instrument_key)
 
     def _liquidate(self) -> None:
@@ -532,7 +790,8 @@ class MomentumReversalRunner:
                 continue
             quote = quotes.get(key) or Quote(key, state["last_price"])
             self.coordinator.on_quote(quote)
-            self._exit(quote, state, "SESSION_END")
+            rule = self._exits.get(key)
+            self._exit(quote, state, "SESSION_END", rule.to_dict() if rule else None)
 
     def _submit(self, key: str, side: Side, quantity: int, quote: Quote) -> Order:
         broker = self.accounts.get(self.config.account_id)
@@ -552,6 +811,7 @@ class MomentumReversalRunner:
 
     def _record(self, event_type: str, payload: dict) -> None:
         self._events.append({"timestamp": self._now(), "type": event_type, **payload})
+        self._dirty = True
 
     def _error(self, error: Exception) -> None:
         with self._lock:
@@ -559,9 +819,44 @@ class MomentumReversalRunner:
             self._errors.append(message)
             self._record("ERROR", {"message": message})
 
-    def _persist(self) -> None:
-        if self.store:
-            self.store.save_momentum_run(self.snapshot())
+    def _flush_observations(self) -> None:
+        """Append any monitoring rows not yet written, oldest first."""
+
+        if not self.store:
+            return
+        with self._lock:
+            pending = self._monitoring[self._flushed_observations :]
+            if not pending:
+                return
+            batch = list(pending)
+            self._flushed_observations += len(batch)
+        self.store.add_observations(self.id, batch)
+
+    def _persist(self, force: bool = True) -> None:
+        """Persist the run summary, and stream observations into their own table.
+
+        The trace is the raw material for later backtests, so every row is
+        written as its own record rather than re-serialised inside the run
+        payload - a growing blob rewritten each poll is quadratic, and a blob
+        cannot be queried by symbol or by day.
+        """
+
+        if not self.store:
+            return
+        if not force and not self._dirty and self._poll_count % 12:
+            return
+        self._dirty = False
+        self._flush_observations()
+        self.store.save_momentum_run(self._persistable_snapshot())
+
+    def _persistable_snapshot(self) -> dict:
+        """The run summary without the trace, which now lives in its own table."""
+
+        payload = self.snapshot()
+        payload["monitoring_count"] = len(payload.get("monitoring") or [])
+        payload["monitoring"] = []
+        payload["monitoring_stored"] = True
+        return payload
 
     @staticmethod
     def _now() -> str:
@@ -570,6 +865,33 @@ class MomentumReversalRunner:
 
 def _percent_change(current: float, base: Optional[float]) -> float:
     return (current / base - 1) * 100 if base else 0.0
+
+
+def _without_trace(snapshot: dict) -> dict:
+    monitoring = snapshot.get("monitoring") or []
+    return {
+        **snapshot,
+        "monitoring": [],
+        "monitoring_count": snapshot.get("monitoring_count", len(monitoring)),
+    }
+
+
+def _decision_counts(monitoring: list[dict]) -> list[dict]:
+    """Which gate each observation stopped at, so a run explains its own inaction."""
+
+    counts: Dict[str, int] = {}
+    for observation in monitoring:
+        decision = observation.get("decision", "UNKNOWN")
+        counts[decision] = counts.get(decision, 0) + 1
+    total = sum(counts.values())
+    return [
+        {
+            "decision": decision,
+            "count": count,
+            "share_pct": round(count / total * 100, 2) if total else 0.0,
+        }
+        for decision, count in sorted(counts.items(), key=lambda item: -item[1])
+    ]
 
 
 def _market_alignment(observation: Optional[dict]) -> str:
@@ -594,31 +916,57 @@ class MomentumRunnerService:
         return runner.start()
 
     def list(self) -> list[dict]:
+        """Run summaries only. A trace can run to thousands of rows, so callers
+        that want one ask for that run by id."""
+
         with self._lock:
-            live = {runner.id: runner.snapshot() for runner in self._runners.values()}
+            live = {
+                runner.id: _without_trace(runner.snapshot())
+                for runner in self._runners.values()
+            }
         persisted = self._store.momentum_runs() if self._store else []
-        combined = list(live.values()) + [item for item in persisted if item["id"] not in live]
+        combined = list(live.values()) + [
+            _without_trace(item) for item in persisted if item["id"] not in live
+        ]
         return sorted(combined, key=lambda item: item.get("started_at") or "", reverse=True)
 
-    def get(self, runner_id: str) -> dict:
+    def get(self, runner_id: str, include_monitoring: bool = True) -> dict:
         with self._lock:
             runner = self._runners.get(runner_id)
-        if runner:
-            return runner.snapshot()
-        persisted = self._store.momentum_run(runner_id) if self._store else None
-        if persisted:
-            return persisted
-        raise KeyError(runner_id)
+        snapshot = runner.snapshot() if runner else None
+        if snapshot is None:
+            snapshot = self._store.momentum_run(runner_id) if self._store else None
+        if snapshot is None:
+            raise KeyError(runner_id)
+        if not include_monitoring:
+            return _without_trace(snapshot)
+        if not snapshot.get("monitoring") and self._store:
+            # Runs recorded since observations moved into their own table keep an
+            # empty list in the payload; older runs still carry theirs inline.
+            snapshot["monitoring"] = self._store.observations(run_id=runner_id)
+        snapshot["monitoring_count"] = len(snapshot.get("monitoring") or [])
+        return snapshot
+
+    def active(self) -> list[dict]:
+        with self._lock:
+            return [
+                _without_trace(runner.snapshot())
+                for runner in self._runners.values()
+                if runner.snapshot()["status"] in ACTIVE_RUN_STATUSES
+            ]
 
     def stop(self, runner_id: str) -> dict:
         with self._lock:
             return self._runners[runner_id].stop()
 
     def has_active(self, account_id: str) -> bool:
+        """One run per paper account: concurrent runners would share cash and
+        positions. Different accounts may run side by side."""
+
         with self._lock:
             return any(
                 runner.config.account_id == account_id
-                and runner.snapshot()["status"] in {"RUNNING", "STOPPING"}
+                and runner.snapshot()["status"] in ACTIVE_RUN_STATUSES
                 for runner in self._runners.values()
             )
 

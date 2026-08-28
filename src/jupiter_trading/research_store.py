@@ -2,9 +2,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import List, Optional
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _session_date(timestamp: str) -> str:
+    """The NSE trading day a UTC timestamp belongs to.
+
+    Quotes are stored in UTC but a session is an Indian calendar day, so the
+    date is taken in IST. Market hours (09:15-15:30 IST) never straddle a UTC
+    midnight, but converting explicitly keeps the grouping correct regardless.
+    """
+
+    try:
+        moment = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return timestamp[:10]
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(IST).date().isoformat()
 
 
 class ResearchStore:
@@ -44,10 +64,27 @@ class ResearchStore:
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS market_observations (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    decision TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_strategy_events
                     ON strategy_events(strategy_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_momentum_runs_account_updated
                     ON momentum_runs(account_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_observations_run
+                    ON market_observations(run_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_observations_instrument_time
+                    ON market_observations(instrument_key, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_observations_session
+                    ON market_observations(session_date, symbol, timestamp);
                 """
             )
 
@@ -116,6 +153,99 @@ class ResearchStore:
                 "SELECT payload FROM backtest_reports WHERE id = ?", (report_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def add_observations(self, run_id: str, observations: List[dict]) -> int:
+        """Append monitoring rows as queryable records rather than one growing blob.
+
+        A run's trace is the raw material for every later backtest, so it is
+        stored row per observation and indexed by instrument and session date.
+        Rows are immutable once written, which is what makes the append cheap.
+        """
+
+        if not observations:
+            return 0
+        rows = [
+            (
+                run_id,
+                _session_date(observation["timestamp"]),
+                observation["instrument_key"],
+                observation["symbol"],
+                observation["timestamp"],
+                observation["price"],
+                observation.get("decision", "UNKNOWN"),
+                json.dumps(observation),
+            )
+            for observation in observations
+        ]
+        with self._lock, self._connection:
+            self._connection.executemany(
+                """INSERT INTO market_observations
+                (run_id, session_date, instrument_key, symbol, timestamp, price,
+                 decision, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+        return len(rows)
+
+    def observations(
+        self,
+        run_id: Optional[str] = None,
+        session_date: Optional[str] = None,
+        symbol: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[dict]:
+        clauses, values = [], []
+        for column, value in (
+            ("run_id", run_id),
+            ("session_date", session_date),
+            ("symbol", symbol),
+            ("instrument_key", instrument_key),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        query = "SELECT payload FROM market_observations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY sequence"
+        if limit:
+            query += " LIMIT ?"
+            values.append(limit)
+        with self._lock:
+            rows = self._connection.execute(query, values).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def observation_count(self, run_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM market_observations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def observed_sessions(self) -> List[dict]:
+        """Which days have recorded ticks, and how much of each - the backtest menu."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT session_date, COUNT(*) AS observations,
+                          COUNT(DISTINCT symbol) AS symbols,
+                          COUNT(DISTINCT run_id) AS runs,
+                          MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen
+                   FROM market_observations
+                   GROUP BY session_date ORDER BY session_date DESC"""
+            ).fetchall()
+        return [
+            {
+                "session_date": row[0],
+                "observations": row[1],
+                "symbols": row[2],
+                "runs": row[3],
+                "first_seen": row[4],
+                "last_seen": row[5],
+            }
+            for row in rows
+        ]
 
     def save_momentum_run(self, payload: dict) -> None:
         with self._lock, self._connection:
