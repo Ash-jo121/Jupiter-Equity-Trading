@@ -12,10 +12,12 @@ class UniverseError(RuntimeError):
     pass
 
 
-class Nifty50Universe:
-    """Current NIFTY 50 constituents from NSE's official index CSV."""
+class NiftyUniverse:
+    """Current NSE index constituents loaded from an official index CSV."""
 
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+    name = "NIFTY"
+    expected_count = 0
+    url = ""
 
     def __init__(self, cache_hours: int = 6, timeout: float = 15.0) -> None:
         self.cache_hours = cache_hours
@@ -48,11 +50,14 @@ class Nifty50Universe:
                     f"NSE constituent file returned HTTP {error.code}"
                 ) from error
             except (URLError, TimeoutError) as error:
-                raise UniverseError(f"Unable to retrieve NIFTY 50 constituents: {error}") from error
-            constituents = self.parse(content)
-            if len(constituents) != 50:
                 raise UniverseError(
-                    f"Expected 50 NIFTY constituents but NSE returned {len(constituents)}"
+                    f"Unable to retrieve {self.name} constituents: {error}"
+                ) from error
+            constituents = self.parse(content)
+            if len(constituents) != self.expected_count:
+                raise UniverseError(
+                    f"Expected {self.expected_count} {self.name} constituents "
+                    f"but NSE returned {len(constituents)}"
                 )
             self._cached = constituents
             self._cached_at = now
@@ -77,3 +82,19 @@ class Nifty50Universe:
                 }
             )
         return rows
+
+
+class Nifty50Universe(NiftyUniverse):
+    """Current NIFTY 50 constituents."""
+
+    name = "NIFTY 50"
+    expected_count = 50
+    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+
+
+class Nifty100Universe(NiftyUniverse):
+    """Current NIFTY 100 constituents used by the momentum stock pool."""
+
+    name = "NIFTY 100"
+    expected_count = 100
+    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv"

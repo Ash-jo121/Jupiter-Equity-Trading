@@ -33,6 +33,8 @@ class MomentumRunnerConfig:
     entry_momentum_pct: float = 0.10
     reversal_pct: float = 0.10
     hard_stop_pct: float = 0.35
+    universe_name: str = "NIFTY 100"
+    universe_size: int = 100
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -45,6 +47,8 @@ class MomentumRunnerConfig:
             raise ValueError("position and candidate limits must be positive")
         if self.allocation_per_position <= 0:
             raise ValueError("allocation_per_position must be positive")
+        if not self.universe_name or self.universe_size <= 0:
+            raise ValueError("universe name and size are required")
         if self.minimum_relative_volume < 1:
             raise ValueError("minimum_relative_volume must be at least 1x")
         if min(

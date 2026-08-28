@@ -30,7 +30,7 @@ from .strategy_engine import (
     StrategyStatus,
 )
 from .survey import MarketSurvey, SurveyInstrument
-from .universe import Nifty50Universe, UniverseError
+from .universe import Nifty50Universe, Nifty100Universe, UniverseError
 
 
 class OrderRequest(BaseModel):
@@ -171,6 +171,7 @@ def create_app(
     search_client = instrument_search or UpstoxInstrumentSearch(settings.upstox_access_token)
     backtests = BacktestEngine(research_store, settings.fee_schedule)
     nifty50 = Nifty50Universe()
+    nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
 
     def market_data() -> UpstoxMarketData:
@@ -381,6 +382,19 @@ def create_app(
         except UniverseError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
+    @app.get("/universes/nifty100")
+    def nifty100_universe() -> dict:
+        try:
+            constituents = nifty100.constituents()
+            return {
+                "name": Nifty100Universe.name,
+                "source": Nifty100Universe.url,
+                "count": len(constituents),
+                "constituents": constituents,
+            }
+        except UniverseError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
     @app.get("/market/status")
     def exchange_status(exchange: str = "NSE") -> dict:
         try:
@@ -404,7 +418,7 @@ def create_app(
                 detail="a momentum run is already active for this paper account",
             )
         try:
-            constituents = nifty50.constituents()
+            constituents = nifty100.constituents()
             runner = MomentumReversalRunner(
                 config=MomentumRunnerConfig(
                     account_id=account_id,
@@ -419,6 +433,8 @@ def create_app(
                     entry_momentum_pct=request.entry_momentum_pct,
                     reversal_pct=request.reversal_pct,
                     hard_stop_pct=request.hard_stop_pct,
+                    universe_name=Nifty100Universe.name,
+                    universe_size=Nifty100Universe.expected_count,
                 ),
                 instruments=[
                     SurveyInstrument(item["symbol"], item["instrument_key"])

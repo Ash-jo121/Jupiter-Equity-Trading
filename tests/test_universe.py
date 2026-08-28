@@ -1,4 +1,4 @@
-from jupiter_trading.universe import Nifty50Universe
+from jupiter_trading.universe import Nifty50Universe, Nifty100Universe
 
 
 def test_parse_nifty_constituents_uses_isin_instrument_key() -> None:
@@ -27,3 +27,9 @@ Example Motors Ltd.,Automobile,EXMOTOR,EQ,INE000B01002
             "isin": "INE000B01002",
         },
     ]
+
+
+def test_nifty100_uses_official_nse_constituent_file() -> None:
+    assert Nifty100Universe.name == "NIFTY 100"
+    assert Nifty100Universe.expected_count == 100
+    assert Nifty100Universe.url.endswith("/ind_nifty100list.csv")

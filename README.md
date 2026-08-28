@@ -66,9 +66,10 @@ contains private strategy and account data.
 
 ## Survey and profit-target strategy
 
-`GET /universes/nifty50` downloads and caches the current official NSE constituent file.
+`GET /universes/nifty100` downloads and caches the current official NSE constituent file.
+`GET /universes/nifty50` remains available for comparison and compatibility.
 `POST /market/survey` ranks that universe using session and trailing 15-minute momentum. The
-dashboard scans all 50 stocks but displays the top 15. It describes current price action; it is
+momentum runner scans all 100 stocks and shortlists only those passing its entry filters. It describes current price action; it is
 not a prediction or recommendation.
 
 ```bash
@@ -96,7 +97,8 @@ permanent and does not implicitly liquidate an existing position.
 
 ## Looped momentum/reversal paper sessions
 
-`POST /momentum-runners` starts a bounded background session over the current NIFTY 50.
+`POST /momentum-runners` starts a bounded background session over the current NIFTY 100 stock
+universe.
 The runner rescans the universe, polls live prices between scans, buys only candidates with
 positive intraday and observed short-window momentum, and sells after a trailing reversal or
 hard stop. It limits concurrent positions, trades each instrument at most once per session, and
