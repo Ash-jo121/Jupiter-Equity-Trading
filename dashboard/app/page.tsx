@@ -33,9 +33,19 @@ type Summary = {
   orders:Order[]; fills:Fill[]; stream:{state:string;market_statuses:Record<string,string>;quotes_received:number;last_error?:string};
 };
 type BatchResult = {started:Array<{label:string;run:MomentumRun}>;failed:Array<{label:string;error:string}>};
+type ScheduleSlot = {index:number;start_ist:string;end_ist:string;account_id:string;label:string;duration_seconds:number;max_positions:number;entry_timeframe_seconds:number;status:string;runner_id?:string|null;detail?:string|null};
+type Coverage = {covered_pct:number;largest_gap_seconds:number;concurrent_peak:number;session_open_ist?:string;session_close_ist?:string};
+type SchedulePlan = {session_date:string;account_prefix:string;slots:ScheduleSlot[];coverage:Coverage};
+type ScheduleStatus = {enabled:boolean;running:boolean;session_date:string;is_trading_day:boolean;entry_timeframes:number[];max_positions:number;reentry_cooldown_seconds:number;plan:SchedulePlan|null;report_ready:boolean;last_actions:Array<Record<string,unknown>>};
+type ReportRun = {run_id:string;account_id:string;config_key:string;status:string;started_at?:string;finished_at?:string;duration_seconds?:number;max_positions?:number;entry_timeframe_seconds?:number;net_pnl:number;gross_pnl:number;fees:number;round_trips:number;wins:number;win_rate_pct:number;symbols_traded:string[];exit_reasons:Record<string,number>;monitoring_count:number;errors:string[]};
+type ConfigRollup = {key:string|number;runs:number;net_pnl:number;round_trips:number;wins:number;win_rate_pct:number};
+type DailyReport = {session_date:string;generated_at:string;runs:ReportRun[];totals:{runs:number;completed:number;runs_that_traded:number;net_pnl:number;fees:number;round_trips:number;wins:number;win_rate_pct:number;observations:number;symbols_observed:number};best_run:ReportRun|null;worst_run:ReportRun|null;by_duration:ConfigRollup[];by_positions:ConfigRollup[];by_timeframe:ConfigRollup[];decision_totals:Array<{decision:string;count:number;share_pct:number}>;coverage:Coverage|null;plan_slots:number};
 type Outcome = {symbol:string;quantity:number;buyPrice:number;sellPrice:number;grossPnl:number;fees:number;netPnl:number;exitReason:string};
 
-const apiBase = typeof window !== 'undefined' && window.location.port !== '8000' ? '/api' : '';
+// In production the dashboard and API live on different hosts (Vercel + Railway),
+// so the API origin is injected at build time. Locally it falls back to the dev proxy.
+const configuredApiBase = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_API_BASE) || '';
+const apiBase = configuredApiBase.replace(/\/$/, '') || (typeof window !== 'undefined' && window.location.port !== '8000' ? '/api' : '');
 const money = new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2});
 const number = new Intl.NumberFormat('en-IN',{maximumFractionDigits:2});
 const signedMoney = (value:number) => `${value >= 0 ? '+' : '−'}${money.format(Math.abs(value))}`;
@@ -66,7 +76,7 @@ function runOutcomes(run:MomentumRun):Outcome[] {
 
 export default function Home() {
   const [summary,setSummary]=useState<Summary|null>(null), [runs,setRuns]=useState<MomentumRun[]>([]);
-  const [tab,setTab]=useState<'home'|'runs'>('home'), [selectedRunId,setSelectedRunId]=useState<string|null>(null);
+  const [tab,setTab]=useState<'home'|'runs'|'reports'>('home'), [selectedRunId,setSelectedRunId]=useState<string|null>(null);
   const [detail,setDetail]=useState<MomentumRun|null>(null), [detailError,setDetailError]=useState('');
   const [busy,setBusy]=useState(''), [notice,setNotice]=useState('Connecting to the paper engine…');
   const [duration,setDuration]=useState(600), [allocation,setAllocation]=useState(100000), [maxPositions,setMaxPositions]=useState(2);
@@ -100,8 +110,8 @@ export default function Home() {
   const stopRun=async()=>{if(!activeRun)return;setBusy('stop');try{await request(`/momentum-runners/${activeRun.id}/stop`,{method:'POST'});setNotice('Stopping run and closing paper positions…');await refresh();}catch(error){setNotice(error instanceof Error?error.message:'Run could not be stopped');}finally{setBusy('');}};
   const openRun=(id:string)=>{setSelectedRunId(id);setTab('runs');window.scrollTo({top:0,behavior:'smooth'});};
   return <main>
-    <header className="topbar"><button className="brand" onClick={()=>{setTab('home');setSelectedRunId(null)}} aria-label="Jupiter home"><span className="brand-mark">J</span><span><strong>Jupiter</strong><small>Momentum paper lab</small></span></button><nav className="tabs" aria-label="Primary navigation"><button className={tab==='home'?'active':''} onClick={()=>{setTab('home');setSelectedRunId(null)}}>Home</button><button className={tab==='runs'?'active':''} onClick={()=>{setTab('runs');setSelectedRunId(null)}}>Runs <span>{runs.length}</span></button></nav><div className="market-pill" data-open={marketStatus==='NORMAL_OPEN'}><span/>NSE · {marketStatus.replaceAll('_',' ')}</div></header>
-    {tab==='home'?<HomeView summary={summary} runs={runs} latestRun={latestRun} activeRun={activeRun} activeRuns={activeRuns} initialCash={initialCash} totalPnl={totalPnl} duration={duration} setDuration={setDuration} allocation={allocation} setAllocation={setAllocation} maxPositions={maxPositions} setMaxPositions={setMaxPositions} exitMode={exitMode} setExitMode={setExitMode} trailWindow={trailWindow} setTrailWindow={setTrailWindow} requireNifty={requireNifty} setRequireNifty={setRequireNifty} entryTimeframe={entryTimeframe} setEntryTimeframe={setEntryTimeframe} cost={cost} busy={busy} startRun={startRun} stopRun={stopRun} openRun={openRun} onLaunched={refresh}/>:selectedRunId?(selectedRun?<RunDetail run={selectedRun} back={()=>setSelectedRunId(null)}/>:<section className="run-detail"><button className="back-button" onClick={()=>setSelectedRunId(null)}>← All runs</button><Empty text={detailError||'Loading the recorded trace…'}/></section>):<RunsView runs={runs} openRun={openRun}/>} 
+    <header className="topbar"><button className="brand" onClick={()=>{setTab('home');setSelectedRunId(null)}} aria-label="Jupiter home"><span className="brand-mark">J</span><span><strong>Jupiter</strong><small>Momentum paper lab</small></span></button><nav className="tabs" aria-label="Primary navigation"><button className={tab==='home'?'active':''} onClick={()=>{setTab('home');setSelectedRunId(null)}}>Home</button><button className={tab==='runs'?'active':''} onClick={()=>{setTab('runs');setSelectedRunId(null)}}>Runs <span>{runs.length}</span></button><button className={tab==='reports'?'active':''} onClick={()=>{setTab('reports');setSelectedRunId(null)}}>Reports</button></nav><div className="market-pill" data-open={marketStatus==='NORMAL_OPEN'}><span/>NSE · {marketStatus.replaceAll('_',' ')}</div></header>
+    {tab==='home'?<HomeView summary={summary} runs={runs} latestRun={latestRun} activeRun={activeRun} activeRuns={activeRuns} initialCash={initialCash} totalPnl={totalPnl} duration={duration} setDuration={setDuration} allocation={allocation} setAllocation={setAllocation} maxPositions={maxPositions} setMaxPositions={setMaxPositions} exitMode={exitMode} setExitMode={setExitMode} trailWindow={trailWindow} setTrailWindow={setTrailWindow} requireNifty={requireNifty} setRequireNifty={setRequireNifty} entryTimeframe={entryTimeframe} setEntryTimeframe={setEntryTimeframe} cost={cost} busy={busy} startRun={startRun} stopRun={stopRun} openRun={openRun} onLaunched={refresh}/>:selectedRunId?(selectedRun?<RunDetail run={selectedRun} back={()=>setSelectedRunId(null)}/>:<section className="run-detail"><button className="back-button" onClick={()=>setSelectedRunId(null)}>← All runs</button><Empty text={detailError||'Loading the recorded trace…'}/></section>):tab==='reports'?<ReportsView openRun={openRun}/>:<RunsView runs={runs} openRun={openRun}/>} 
     <footer><span>{notice}</span><span>Private local research · Paper execution only</span></footer>
   </main>;
 }
@@ -130,14 +140,14 @@ function EntryEvidence({run}:{run:MomentumRun}) {
 }
 
 const BATCH_ARMS=[
-  {label:'5s-ticks',      note:'Current rule, three 5-second prints',  overrides:{entry_timeframe_seconds:0}},
-  {label:'1m-bars',       note:'Three 1-minute bars',                  overrides:{entry_timeframe_seconds:60}},
-  {label:'3m-bars',       note:'Three 3-minute bars',                  overrides:{entry_timeframe_seconds:180}},
-  {label:'1m-tight-trail',note:'1-minute bars, 8-sample trail',        overrides:{entry_timeframe_seconds:60,trail_window:8,fast_trail_window:4}},
+  {label:'5s-ticks', note:'Three 5-second prints',  overrides:{entry_timeframe_seconds:0}},
+  {label:'1m-bars',  note:'Three 1-minute bars',    overrides:{entry_timeframe_seconds:60}},
+  {label:'3m-bars',  note:'Three 3-minute bars',    overrides:{entry_timeframe_seconds:180}},
+  {label:'5m-bars',  note:'Three 5-minute bars',    overrides:{entry_timeframe_seconds:300}},
 ];
 
 function BatchLauncher({duration,allocation,maxPositions,disabled,onLaunched}:{duration:number;allocation:number;maxPositions:number;disabled:boolean;onLaunched:()=>void}) {
-  const [picked,setPicked]=useState<string[]>(['5s-ticks','1m-bars']);
+  const [picked,setPicked]=useState<string[]>(['5s-ticks','1m-bars','3m-bars','5m-bars']);
   const [busy,setBusy]=useState(false), [result,setResult]=useState<BatchResult|null>(null), [error,setError]=useState('');
   const toggle=(label:string)=>setPicked(current=>current.includes(label)?current.filter(item=>item!==label):[...current,label]);
   const launch=async()=>{
@@ -374,6 +384,88 @@ function armLabel(run:MomentumRun):string {
 }
 function phaseRank(phase?:string):number {return phase==='RIDE'?2:phase==='LOCK'?1:0}
 function cleared(check?:EntryCheck):boolean {return !!check&&check.rise_pct!==undefined&&check.rise_pct!==null&&check.threshold_pct!==undefined&&check.threshold_pct!==null&&check.rise_pct>=check.threshold_pct}
+
+
+const TF_LABEL:Record<number,string>={0:'5s ticks',60:'1m bars',180:'3m bars',300:'5m bars'};
+function tfLabel(v?:number){return TF_LABEL[v??0]||`${v}s`}
+
+function ReportsView({openRun}:{openRun:(id:string)=>void}) {
+  const [status,setStatus]=useState<ScheduleStatus|null>(null);
+  const [dates,setDates]=useState<DailyReport[]>([]);
+  const [selected,setSelected]=useState<string>('');
+  const [report,setReport]=useState<DailyReport|null>(null);
+  const [busy,setBusy]=useState(''), [notice,setNotice]=useState('');
+  const refresh=useCallback(async()=>{
+    try{
+      const [st,list]=await Promise.all([request<ScheduleStatus>('/schedule/status'),request<DailyReport[]>('/reports/daily')]);
+      setStatus(st);setDates(list);
+      if(!selected&&(list.length||st.session_date))setSelected(list[0]?.session_date||st.session_date);
+    }catch(error){setNotice(error instanceof Error?error.message:'Could not load reports');}
+  },[selected]);
+  useEffect(()=>{const first=window.setTimeout(refresh,0),t=window.setInterval(refresh,15000);return()=>{window.clearTimeout(first);window.clearInterval(t);};},[refresh]);
+  useEffect(()=>{if(!selected)return;let live=true;
+    request<DailyReport>(`/reports/daily/${selected}`).then(r=>{if(live)setReport(r)}).catch(()=>{if(live)setReport(null)});
+    return()=>{live=false};
+  },[selected,dates]);
+  const buildReport=async()=>{if(!selected)return;setBusy('build');try{const r=await request<DailyReport>(`/reports/daily/${selected}/build`,{method:'POST'});setReport(r);setNotice(`Report built for ${selected}`);await refresh();}catch(error){setNotice(error instanceof Error?error.message:'Build failed');}finally{setBusy('');}};
+
+  return <section className="reports-page">
+    <div className="page-title"><div><p className="eyebrow">Automated research</p><h1>Every day.<br/><em>Every configuration.</em></h1><p>Scheduled runs cover the session; each evening rolls up into one report kept here.</p></div>
+      <div className="archive-count"><strong>{dates.length}</strong><span>daily reports</span></div></div>
+
+    <ScheduleStrip status={status}/>
+
+    <div className="report-toolbar"><label className="trace-select">Session<select value={selected} onChange={e=>setSelected(e.target.value)}>{[...new Set([status?.session_date,...dates.map(d=>d.session_date)].filter(Boolean) as string[])].map(d=><option key={d}>{d}</option>)}</select></label>
+      <button className="secondary" onClick={buildReport} disabled={!!busy||!selected}>{busy==='build'?'Building…':report?'Rebuild report':'Build report'}</button>
+      {notice&&<span className="report-notice">{notice}</span>}</div>
+
+    {report?<DailyReportView report={report} openRun={openRun}/>:<Empty text={`No report for ${selected||'this day'} yet. Runs must finish first, or build it now.`}/>}
+  </section>;
+}
+
+function ScheduleStrip({status}:{status:ScheduleStatus|null}) {
+  if(!status)return null;
+  const plan=status.plan;
+  const done=plan?plan.slots.filter(s=>s.status!=='PENDING').length:0;
+  return <section className="schedule-strip"><div className="sched-head"><div><span className={`live-dot ${status.enabled?'':'off'}`}/><div><p className="eyebrow">Scheduler</p><h2>{status.enabled?(status.running?'Running':'Enabled'):'Disabled'}</h2></div></div>
+    <div className="sched-stats"><span><small>Session</small><b>{status.session_date}</b></span><span><small>Trading day</small><b>{status.is_trading_day?'Yes':'No'}</b></span><span><small>Runs today</small><b>{done}/{plan?plan.slots.length:status.entry_timeframes.length}</b></span><span><small>Positions</small><b>{status.max_positions}</b></span><span><small>Cooldown</small><b>{Math.round(status.reentry_cooldown_seconds/60)}m</b></span><span><small>Report</small><b>{status.report_ready?'Ready':'Pending'}</b></span></div></div>
+    {!status.enabled&&<p className="sched-warn">Scheduler is off. Set <code>SCHEDULER_ENABLED=true</code> on the backend and provide a fresh Upstox token each morning for unattended runs.</p>}
+    {plan&&<div className="sched-timeline">{plan.slots.map(slot=><div key={slot.index} className={`sched-slot ${slot.status.toLowerCase()}`} title={`${slot.label} · ${slot.status}`}><span>{slot.start_ist.slice(11,16)}</span><b>{slot.label}</b><em>{slot.status.toLowerCase()}</em></div>)}</div>}
+  </section>;
+}
+
+function DailyReportView({report,openRun}:{report:DailyReport;openRun:(id:string)=>void}) {
+  const t=report.totals;
+  return <>
+    <section className="detail-kpis report-kpis"><Metric label="Net P&L" value={signedMoney(t.net_pnl)} tone={t.net_pnl>=0?'positive':'negative'}/><Metric label="Runs" value={`${t.runs_that_traded}/${t.runs} traded`}/><Metric label="Round trips" value={`${t.round_trips}`}/><Metric label="Win rate" value={`${t.win_rate_pct}%`}/><Metric label="Fees" value={money.format(t.fees)}/><Metric label="Observations" value={number.format(t.observations)}/></section>
+
+    <section className="report-grid">
+      <RollupCard title="By entry timeframe" rows={report.by_timeframe} render={k=>tfLabel(Number(k))}/>
+      <RollupCard title="By duration" rows={report.by_duration} render={k=>`${Number(k)/60}m`}/>
+      <RollupCard title="By max positions" rows={report.by_positions} render={k=>`${k} pos`}/>
+    </section>
+
+    {(report.best_run||report.worst_run)&&<section className="report-extremes">
+      {report.best_run&&<article className={`extreme good`}><p className="eyebrow">Best arm</p><h3>{report.best_run.config_key}</h3><strong>{signedMoney(report.best_run.net_pnl)}</strong><small>{report.best_run.round_trips} trades · {report.best_run.win_rate_pct}% win</small></article>}
+      {report.worst_run&&<article className={`extreme bad`}><p className="eyebrow">Worst arm</p><h3>{report.worst_run.config_key}</h3><strong>{signedMoney(report.worst_run.net_pnl)}</strong><small>{report.worst_run.round_trips} trades · {report.worst_run.win_rate_pct}% win</small></article>}
+    </section>}
+
+    <section className="panel"><div className="panel-head"><div><p className="eyebrow">Per run</p><h2>Every arm today</h2></div><span className="count">{report.runs.length} runs</span></div>
+      <div className="table-wrap"><table><thead><tr><th>Config</th><th>Started</th><th>Timeframe</th><th>Trades</th><th>Win%</th><th>Fees</th><th>Net P&L</th><th></th></tr></thead>
+      <tbody>{report.runs.map(r=><tr key={r.run_id}><td className="stock-name">{r.config_key}</td><td>{r.started_at?formatTime(r.started_at):'—'}</td><td>{tfLabel(r.entry_timeframe_seconds)}</td><td>{r.round_trips}</td><td>{r.win_rate_pct}%</td><td>{money.format(r.fees)}</td><td className={r.net_pnl>=0?'positive':'negative'}><strong>{signedMoney(r.net_pnl)}</strong></td><td><button className="text-button" onClick={()=>openRun(r.run_id)}>Open →</button></td></tr>)}</tbody></table></div>
+      {!report.runs.length&&<Empty text="No runs recorded for this session."/>}</section>
+
+    {report.decision_totals.length>0&&<section className="panel"><div className="panel-head"><div><p className="eyebrow">Across every run</p><h2>What the day did</h2></div><span className="count">{number.format(report.decision_totals.reduce((s,d)=>s+d.count,0))} checks</span></div>
+      <div className="funnel">{report.decision_totals.slice(0,10).map(d=><div className="funnel-row" key={d.decision}><span className={`decision ${decisionTone(d.decision)}`}>{d.decision.replaceAll('_',' ')}</span><div className="funnel-bar"><i className={decisionTone(d.decision)} style={{width:`${Math.max(d.share_pct,1.5)}%`}}/></div><b>{d.count}</b><small>{d.share_pct.toFixed(1)}%</small></div>)}</div></section>}
+  </>;
+}
+
+function RollupCard({title,rows,render}:{title:string;rows:ConfigRollup[];render:(key:string|number)=>string}) {
+  const peak=Math.max(1,...rows.map(r=>Math.abs(r.net_pnl)));
+  return <article className="panel rollup"><div className="panel-head"><div><p className="eyebrow">Comparison</p><h2>{title}</h2></div></div>
+    <div className="rollup-rows">{rows.map(r=><div className="rollup-row" key={String(r.key)}><span className="rollup-key">{render(r.key)}</span><div className="rollup-bar"><i className={r.net_pnl>=0?'pos':'neg'} style={{width:`${Math.abs(r.net_pnl)/peak*100}%`}}/></div><b className={r.net_pnl>=0?'positive':'negative'}>{signedMoney(r.net_pnl)}</b><small>{r.runs} run{r.runs===1?'':'s'} · {r.round_trips} trades</small></div>)}</div>
+    {!rows.length&&<Empty text="No runs yet."/>}</article>;
+}
 
 function Metric({label,value,tone}:{label:string;value:string;tone?:string}) {return <div className="metric"><span>{label}</span><strong className={tone||''}>{value}</strong></div>}
 function Empty({text}:{text:string}) {return <div className="empty">{text}</div>}

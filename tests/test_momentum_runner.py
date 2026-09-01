@@ -709,3 +709,92 @@ def test_one_account_allows_one_run_but_other_accounts_run_alongside(tmp_path) -
     assert service.has_active("variant-b") is True
     assert service.has_active("untouched") is False
     assert len(service.active()) == 2
+
+
+class ReenterMarket(RisingThenReversingMarket):
+    """Rise, exit on the fade, then rise again - a full-session re-entry setup.
+
+    Emits stepped 5-second timestamps so the wall clock actually advances between
+    polls; a tight test loop otherwise stamps every quote at the same instant and
+    no cooldown could ever elapse. The first tick is consumed by the opening scan.
+    """
+
+    def __init__(self):
+        base = datetime(2026, 8, 28, 4, 30, tzinfo=timezone.utc)
+        prices = [
+            100.0,                                              # consumed by _scan()
+            100.0, 100.0, 100.0, 100.4, 101.0, 101.3, 99.5,    # entry then exit
+            99.5, 99.5, 100.4, 101.2, 101.5,                   # second rise, later
+        ]
+        self._ticks = iter(
+            (price, base + timedelta(seconds=5 * i)) for i, price in enumerate(prices)
+        )
+
+    def ltp(self, keys):
+        price, timestamp = next(self._ticks)
+        return {key: Quote(key, price, timestamp=timestamp) for key in keys}
+
+
+def test_a_cooldown_lets_a_full_session_run_re_enter_a_stock(tmp_path) -> None:
+    accounts = PaperAccountManager(
+        repository=InMemoryRepository(),
+        initial_cash=100_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    strategies = StrategyService(accounts, ResearchStore(str(tmp_path / "r.db")))
+    runner = MomentumReversalRunner(
+        config=MomentumRunnerConfig(
+            account_id="default",
+            allocation_per_position=1_000,
+            entry_momentum_pct=0.02,
+            entry_cost_multiple=0,  # isolate cooldown from the entry-bar scaling
+            entry_noise_multiple=0,
+            confirmation_samples=1,
+            reentry_cooldown_seconds=10,  # exit near t=30s, re-entry near t=50s
+        ),
+        instruments=[SurveyInstrument("TEST", "NSE_EQ|TEST")],
+        market_data=ReenterMarket(),
+        accounts=accounts,
+        coordinator=MarketCoordinator(accounts, strategies),
+        runner_id="cooldown-test",
+    )
+    runner._scan()
+    for _ in range(12):
+        runner._poll()
+
+    entries = [e for e in runner.snapshot()["events"] if e["type"] == "ENTRY_FILLED"]
+    assert len(entries) >= 2, "the stock should be tradeable again after the cooldown"
+
+
+def test_without_a_cooldown_a_stock_is_traded_at_most_once(tmp_path) -> None:
+    accounts = PaperAccountManager(
+        repository=InMemoryRepository(),
+        initial_cash=100_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    strategies = StrategyService(accounts, ResearchStore(str(tmp_path / "r.db")))
+    runner = MomentumReversalRunner(
+        config=MomentumRunnerConfig(
+            account_id="default",
+            allocation_per_position=1_000,
+            entry_momentum_pct=0.02,
+            confirmation_samples=1,
+        ),
+        instruments=[SurveyInstrument("TEST", "NSE_EQ|TEST")],
+        market_data=ReenterMarket(),
+        accounts=accounts,
+        coordinator=MarketCoordinator(accounts, strategies),
+        runner_id="no-cooldown-test",
+    )
+    runner._scan()
+    for _ in range(12):
+        runner._poll()
+
+    entries = [e for e in runner.snapshot()["events"] if e["type"] == "ENTRY_FILLED"]
+    assert len(entries) == 1
+    decisions = {row["decision"] for row in runner.snapshot()["monitoring"]}
+    assert "ALREADY_TRADED" in decisions

@@ -33,6 +33,23 @@ class Settings:
     upstox_access_token: str = field(
         default_factory=lambda: os.getenv("UPSTOX_ACCESS_TOKEN", "")
     )
+    scheduler_enabled: bool = field(default_factory=lambda: _bool("SCHEDULER_ENABLED", False))
+    scheduler_max_positions: int = field(
+        default_factory=lambda: int(_float("SCHEDULER_MAX_POSITIONS", 5))
+    )
+    scheduler_allocation: float = field(
+        default_factory=lambda: _float("SCHEDULER_ALLOCATION", 100_000)
+    )
+    scheduler_initial_cash: float = field(
+        default_factory=lambda: _float("SCHEDULER_INITIAL_CASH", 600_000)
+    )
+    scheduler_cooldown_seconds: float = field(
+        default_factory=lambda: _float("SCHEDULER_COOLDOWN_SECONDS", 900)
+    )
+    scheduler_account_prefix: str = field(
+        default_factory=lambda: os.getenv("SCHEDULER_ACCOUNT_PREFIX", "auto")
+    )
+    cors_allow_origins: tuple = field(default_factory=lambda: _csv("CORS_ALLOW_ORIGINS"))
     upstox_stream_auto_start: bool = field(
         default_factory=lambda: _bool("UPSTOX_STREAM_AUTO_START", False)
     )

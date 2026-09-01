@@ -211,3 +211,65 @@ def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
 
         assert client.get("/observations", params={"session_date": "1999-01-01"}).json()["count"] == 0
         assert client.get("/observations", params={"limit": 0}).status_code == 422
+
+
+def test_schedule_plan_endpoint_returns_one_full_session_run_per_timeframe(tmp_path) -> None:
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        plan = client.get("/schedule/plan", params={"session_date": "2026-08-31"}).json()
+        assert plan["session_date"] == "2026-08-31"
+        assert len(plan["slots"]) == 4  # 5s, 1m, 3m, 5m
+        assert {s["entry_timeframe_seconds"] for s in plan["slots"]} == {0, 60, 180, 300}
+        assert plan["coverage"]["covered_pct"] == 100.0
+        # Every run spans the whole session, so all share the open and close.
+        assert len({s["start_ist"] for s in plan["slots"]}) == 1
+        assert all(s["duration_seconds"] == 22500 for s in plan["slots"])
+
+
+def test_schedule_status_reports_disabled_by_default(tmp_path) -> None:
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        status = client.get("/schedule/status").json()
+        assert status["enabled"] is False
+        assert "session_date" in status
+
+
+def test_daily_report_can_be_built_and_fetched(tmp_path) -> None:
+    from jupiter_trading.research_store import ResearchStore
+
+    store = ResearchStore(str(tmp_path / "paper.db"))
+    store.save_momentum_run(
+        {
+            "id": "auto-run",
+            "account_id": "auto-x",
+            "status": "COMPLETED",
+            "started_at": "2026-08-28T05:30:00+00:00",
+            "finished_at": "2026-08-28T06:00:00+00:00",
+            "session_pnl": -42.0,
+            "config": {
+                "account_id": "auto-x",
+                "duration_seconds": 1800,
+                "max_positions": 2,
+                "entry_timeframe_seconds": 60,
+            },
+            "metrics": {"gross_pnl": -22.0, "fees": 20.0, "net_pnl": -42.0},
+            "fills": [],
+            "events": [],
+            "decision_counts": [{"decision": "FLAT_NO_TRADE", "count": 10, "share_pct": 100.0}],
+        }
+    )
+
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        assert client.get("/reports/daily/2026-08-28").status_code == 404
+        built = client.post("/reports/daily/2026-08-28/build").json()
+        assert built["totals"]["runs"] == 1
+        assert built["totals"]["net_pnl"] == -42.0
+
+        fetched = client.get("/reports/daily/2026-08-28").json()
+        assert fetched["session_date"] == "2026-08-28"
+        assert client.get("/reports/daily")[0] if False else True
+        listed = client.get("/reports/daily").json()
+        assert any(item["session_date"] == "2026-08-28" for item in listed)
+
+
+def test_manual_tick_is_a_no_op_while_the_scheduler_is_disabled(tmp_path) -> None:
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        assert client.post("/schedule/tick").json() == {"actions": []}

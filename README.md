@@ -258,6 +258,64 @@ reasons, and P&L details. Its monitoring trace switches between **Table** and **
 plots price against the trailing stop for the selected stock, marks entries and exits, and reads
 out the price, stop, phase, and three-bar verdict against its threshold as the pointer moves.
 
+## Scheduled daily automation
+
+The point of the automation layer is to sweep configurations unattended while
+the market is open, so patterns can accumulate over days without anyone at the
+keyboard. `SCHEDULER_ENABLED=true` turns it on.
+
+At the open the scheduler launches **one full-session run per entry timeframe**:
+5s ticks, 1m, 3m, and 5m bars. Every run spans 09:15-15:30, holds the same
+`SCHEDULER_MAX_POSITIONS` (default 5), and is identical but for its entry
+timeframe - so the day's four P&L numbers are a clean, like-for-like comparison
+of that one axis, over the identical universe and session. Duration and position
+count are held fixed on purpose: duration is a sampling window, not a strategy
+knob, and fixing it at the whole session removes the end-of-session liquidation
+artifact and gives the most representative sample. Each run is on its own paper
+account, because concurrent runs sharing an account would fight over cash and
+positions - so each account is funded with `SCHEDULER_INITIAL_CASH`, which must
+cover `max_positions x allocation`.
+
+A full-session run would exhaust the universe by mid-morning under the old
+"trade each stock once per run" rule, so automated runs use a **re-entry
+cooldown** (`SCHEDULER_COOLDOWN_SECONDS`, default 15 min): after a stock is
+exited it can set up and be traded again once the cooldown passes, rather than
+being locked out for the day. With the cooldown at zero the permanent
+once-per-stock behaviour returns (the default for short manual runs).
+
+```bash
+curl 'http://127.0.0.1:8000/schedule/status'          # today's plan, filling in live
+curl 'http://127.0.0.1:8000/schedule/plan?session_date=2026-08-31'  # preview any day
+curl -X POST 'http://127.0.0.1:8000/schedule/tick'    # advance once (ops / missed tick)
+```
+
+The scheduling decision lives in a pure `tick(now)` that reads the persisted
+plan and launches any slot whose start has arrived - so it is unit tested
+without threads, and a restart mid-session resumes from the saved slot states
+rather than relaunching or skipping. A slot missed by more than a grace window
+is marked `SKIPPED`; a launch failure marks that one arm `FAILED` and the rest
+proceed.
+
+### The daily report
+
+About three minutes after the last run settles, the scheduler compiles a report
+for the day and stores it. It rolls the day's runs up by each config dimension
+(timeframe, duration, positions), names the best and worst arm, totals P&L,
+trades, fees and win rate, and aggregates every run's decision histogram so the
+day explains its own inaction. The dashboard's Reports tab shows the live
+schedule timeline and the stored reports; the same data is at:
+
+```bash
+curl 'http://127.0.0.1:8000/reports/daily'            # every stored report
+curl 'http://127.0.0.1:8000/reports/daily/2026-08-28' # one day
+curl -X POST 'http://127.0.0.1:8000/reports/daily/2026-08-28/build'  # (re)build
+```
+
+Runs, observations, plans and reports all persist in SQLite, so the record
+survives restarts as long as the database file does. Deployment (Railway
+backend, the frontend note, and the daily Upstox-token requirement that gates
+unattended runs) is documented in `DEPLOY.md`.
+
 ## Backtesting and reports
 
 `POST /backtests` downloads read-only Upstox historical candles and replays the same target and

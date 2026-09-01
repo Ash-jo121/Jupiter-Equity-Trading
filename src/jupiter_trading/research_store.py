@@ -75,6 +75,17 @@ class ResearchStore:
                     decision TEXT NOT NULL,
                     payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS schedule_plans (
+                    session_date TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    session_date TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS idx_strategy_events
                     ON strategy_events(strategy_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_momentum_runs_account_updated
@@ -287,3 +298,51 @@ class ResearchStore:
                 "SELECT payload FROM momentum_runs WHERE id = ?", (run_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def save_schedule_plan(self, session_date: str, payload: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO schedule_plans (session_date, payload) VALUES (?, ?)
+                ON CONFLICT(session_date) DO UPDATE SET
+                    payload = excluded.payload, updated_at = CURRENT_TIMESTAMP""",
+                (session_date, json.dumps(payload)),
+            )
+
+    def schedule_plan(self, session_date: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM schedule_plans WHERE session_date = ?", (session_date,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def schedule_plans(self, limit: int = 30) -> List[dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload FROM schedule_plans ORDER BY session_date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_daily_report(self, session_date: str, payload: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO daily_reports (session_date, payload) VALUES (?, ?)
+                ON CONFLICT(session_date) DO UPDATE SET
+                    payload = excluded.payload, updated_at = CURRENT_TIMESTAMP""",
+                (session_date, json.dumps(payload)),
+            )
+
+    def daily_report(self, session_date: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM daily_reports WHERE session_date = ?", (session_date,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def daily_reports(self, limit: int = 60) -> List[dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload FROM daily_reports ORDER BY session_date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]

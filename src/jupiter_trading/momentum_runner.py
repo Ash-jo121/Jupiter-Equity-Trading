@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import floor
 from threading import Event, RLock, Thread
 from time import monotonic
@@ -55,6 +55,7 @@ class MomentumRunnerConfig:
     entry_cost_multiple: float = 1.0
     entry_noise_multiple: float = 2.0
     entry_timeframe_seconds: float = 0.0
+    reentry_cooldown_seconds: float = 0.0
     survive_stop_multiple: float = 2.0
     lock_multiple: float = 1.5
     ride_multiple: float = 3.0
@@ -91,6 +92,8 @@ class MomentumRunnerConfig:
             raise ValueError("minimum_cost_floor_pct must be positive")
         if self.entry_timeframe_seconds < 0:
             raise ValueError("entry_timeframe_seconds cannot be negative")
+        if self.reentry_cooldown_seconds < 0:
+            raise ValueError("reentry_cooldown_seconds cannot be negative")
         if self.entry_mode not in ENTRY_MODES:
             raise ValueError(f"entry_mode must be one of {sorted(ENTRY_MODES)}")
         if self.exit_mode not in EXIT_MODES:
@@ -162,6 +165,7 @@ class MomentumReversalRunner:
         self._exits: Dict[str, RatchetExit] = {}
         self._volume_state: Dict[str, dict] = {}
         self._completed: set[str] = set()
+        self._cooldown_until: Dict[str, datetime] = {}
         self._events: list[dict] = []
         self._errors: list[str] = []
         self._dirty = False
@@ -558,6 +562,33 @@ class MomentumReversalRunner:
             },
         }
 
+    def _lock_out(self, key: str, quote: Optional[Quote]) -> None:
+        """Bar a stock from re-entry after an exit or a rejected fill.
+
+        With no cooldown configured this is permanent (the short-run default:
+        trade each stock once). With a cooldown, the stock reopens once that many
+        seconds have passed, so a full-session run keeps finding trades instead of
+        exhausting the universe by mid-morning.
+        """
+
+        self._completed.add(key)
+        if self.config.reentry_cooldown_seconds > 0 and quote is not None:
+            self._cooldown_until[key] = quote.timestamp + timedelta(
+                seconds=self.config.reentry_cooldown_seconds
+            )
+
+    def _cooldown_elapsed(self, key: str, quote: Optional[Quote]) -> bool:
+        """True once a cooled-down stock may trade again; releases it if so."""
+
+        if self.config.reentry_cooldown_seconds <= 0:
+            return False  # permanent lockout
+        ready_at = self._cooldown_until.get(key)
+        if ready_at is None or quote is None or quote.timestamp < ready_at:
+            return False
+        self._completed.discard(key)
+        self._cooldown_until.pop(key, None)
+        return True
+
     def _consider_entries(self, quotes: Dict[str, Quote], observations: dict) -> None:
         broker = self.accounts.get(self.config.account_id)
         open_count = sum(1 for position in broker.positions.values() if position.quantity > 0)
@@ -568,20 +599,24 @@ class MomentumReversalRunner:
         for candidate in candidates:
             key = candidate["instrument_key"]
             observation = observations.get(key)
+            quote = quotes.get(key)
             if key in self._open:
                 if observation:
                     observation["decision"] = "HOLDING_POSITION"
                 continue
-            if key in self._completed:
+            if key in self._completed and not self._cooldown_elapsed(key, quote):
                 if observation:
-                    observation["decision"] = "ALREADY_TRADED"
+                    observation["decision"] = (
+                        "IN_COOLDOWN"
+                        if self.config.reentry_cooldown_seconds > 0
+                        else "ALREADY_TRADED"
+                    )
                 continue
             if slots <= 0:
                 if observation:
                     observation["decision"] = "MAX_POSITIONS_REACHED"
                 continue
             history = self._history.get(key)
-            quote = quotes.get(key)
             entry_closes, entry_lows = self._entry_series(key)
             ready_length = (
                 len(entry_closes) if self.config.entry_mode == "THREE_BAR" else len(history or [])
@@ -684,7 +719,7 @@ class MomentumReversalRunner:
                 )
                 if observation:
                     observation["decision"] = "ENTRY_REJECTED"
-                self._completed.add(key)
+                self._lock_out(key, quote)
                 continue
             notional = position.quantity * position.average_price
             cost_floor_pct = max(
@@ -772,7 +807,7 @@ class MomentumReversalRunner:
         if order.filled_quantity:
             self._open.pop(quote.instrument_key, None)
             self._exits.pop(quote.instrument_key, None)
-            self._completed.add(quote.instrument_key)
+            self._lock_out(quote.instrument_key, quote)
 
     def _liquidate(self) -> None:
         with self._lock:

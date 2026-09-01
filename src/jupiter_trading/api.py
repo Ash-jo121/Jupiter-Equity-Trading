@@ -5,12 +5,15 @@ from datetime import date, datetime
 from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .accounts import PaperAccountManager
+from .automation import DailyScheduler, SchedulerConfig
 from .backtest import BacktestEngine, ExitReplayEngine, ReplayGates
 from .config import Settings
+from .daily_report import DailyReportBuilder
 from .domain import DepthLevel, Order, OrderType, Product, Quote, Side, Validity
 from .instrument_search import InstrumentSearchError, UpstoxInstrumentSearch
 from .market_data import MarketDataError, UpstoxMarketData
@@ -22,6 +25,8 @@ from .momentum_runner import (
 )
 from .repository import SQLiteRepository
 from .research_store import ResearchStore
+from .schedule import build_daily_plan
+from .schedule import now_ist as schedule_now_ist
 from .strategy_engine import (
     MarketCoordinator,
     ProfitTargetLeg,
@@ -115,7 +120,7 @@ class MomentumRunRequest(BaseModel):
         default="momentum", pattern=r"^[a-zA-Z0-9_-]{1,40}$"
     )
     initial_cash: float = Field(default=100_000, gt=0)
-    duration_seconds: int = Field(default=300, ge=30, le=3_600)
+    duration_seconds: int = Field(default=300, ge=30, le=25_200)
     poll_interval_seconds: float = Field(default=5, ge=1, le=60)
     rescan_interval_seconds: float = Field(default=60, ge=15, le=600)
     max_positions: int = Field(default=2, ge=1, le=10)
@@ -133,6 +138,7 @@ class MomentumRunRequest(BaseModel):
     entry_cost_multiple: float = Field(default=1.0, ge=0)
     entry_noise_multiple: float = Field(default=2.0, ge=0)
     entry_timeframe_seconds: float = Field(default=0.0, ge=0, le=900)
+    reentry_cooldown_seconds: float = Field(default=0.0, ge=0, le=7200)
     survive_stop_multiple: float = Field(default=2.0, gt=0)
     lock_multiple: float = Field(default=1.5, gt=0)
     ride_multiple: float = Field(default=3.0, gt=0)
@@ -245,9 +251,40 @@ def create_app(
     nifty50 = Nifty50Universe()
     nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
+    daily_reports_builder = DailyReportBuilder(research_store)
 
     def market_data() -> UpstoxMarketData:
         return market_data_client or _upstox_client(settings)
+
+    def _scheduler_launch(slot, sched_config) -> str:
+        # _launch_runner is defined further down; closures resolve at call time.
+        request = MomentumRunRequest(
+            account_id=slot.account_id,
+            initial_cash=sched_config.initial_cash,
+            duration_seconds=slot.duration_seconds,
+            max_positions=slot.max_positions,
+            entry_timeframe_seconds=slot.entry_timeframe_seconds,
+            reentry_cooldown_seconds=sched_config.reentry_cooldown_seconds,
+            allocation_per_position=sched_config.allocation_per_position,
+            entry_mode="THREE_BAR",
+            exit_mode="RATCHET",
+        )
+        return _launch_runner(request, label=slot.label)["id"]
+
+    scheduler = DailyScheduler(
+        research_store,
+        _scheduler_launch,
+        lambda session_date: daily_reports_builder.build(session_date),
+        SchedulerConfig(
+            enabled=settings.scheduler_enabled,
+            max_positions=settings.scheduler_max_positions,
+            reentry_cooldown_seconds=settings.scheduler_cooldown_seconds,
+            account_prefix=settings.scheduler_account_prefix,
+            allocation_per_position=settings.scheduler_allocation,
+            initial_cash=settings.scheduler_initial_cash,
+        ),
+        market_ready=lambda: bool(settings.upstox_access_token),
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -268,9 +305,11 @@ def create_app(
                 startup_keys,
                 "full" if strategy_keys else settings.upstox_stream_mode,
             )
+        scheduler.start()
         try:
             yield
         finally:
+            scheduler.stop()
             momentum_runners.stop_all()
             market_stream.stop()
 
@@ -280,6 +319,16 @@ def create_app(
         description="Private, paper-only Indian equity strategy research API.",
         lifespan=lifespan,
     )
+    if settings.cors_allow_origins:
+        # A split deploy (dashboard on one host, API on another) is cross-origin,
+        # so the browser needs the API to name the dashboard's origin explicitly.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allow_origins),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.state.settings = settings
     app.state.accounts = accounts
     app.state.broker = accounts.get()
@@ -290,6 +339,8 @@ def create_app(
     app.state.backtests = backtests
     app.state.exit_replays = exit_replays
     app.state.momentum_runners = momentum_runners
+    app.state.scheduler = scheduler
+    app.state.daily_reports = daily_reports_builder
 
     @app.get("/health")
     def health() -> dict:
@@ -527,6 +578,7 @@ def create_app(
                 entry_cost_multiple=request.entry_cost_multiple,
                 entry_noise_multiple=request.entry_noise_multiple,
                 entry_timeframe_seconds=request.entry_timeframe_seconds,
+                reentry_cooldown_seconds=request.reentry_cooldown_seconds,
                 survive_stop_multiple=request.survive_stop_multiple,
                 lock_multiple=request.lock_multiple,
                 ride_multiple=request.ride_multiple,
@@ -673,6 +725,51 @@ def create_app(
             )
         except (MarketDataError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.get("/schedule/status")
+    def schedule_status() -> dict:
+        return scheduler.status()
+
+    @app.get("/schedule/plan")
+    def schedule_plan(session_date: Optional[str] = None) -> dict:
+        """The stored plan for a day, building today's on first read."""
+
+        target = session_date or schedule_now_ist().date().isoformat()
+        plan = scheduler.plan_for(target, create=session_date is None)
+        if plan is None:
+            plan = build_daily_plan(
+                target,
+                max_positions=settings.scheduler_max_positions,
+                account_prefix=settings.scheduler_account_prefix,
+            )
+        return plan.to_dict()
+
+    @app.get("/schedule/plans")
+    def schedule_plans(limit: int = Query(default=30, ge=1, le=365)) -> list:
+        return research_store.schedule_plans(limit)
+
+    @app.post("/schedule/tick")
+    def schedule_tick() -> dict:
+        """Advance the schedule now. Useful for ops and when a tick was missed."""
+
+        return {"actions": scheduler.tick()}
+
+    @app.get("/reports/daily")
+    def daily_reports_list(limit: int = Query(default=60, ge=1, le=365)) -> list:
+        return research_store.daily_reports(limit)
+
+    @app.get("/reports/daily/{session_date}")
+    def daily_report(session_date: str) -> dict:
+        report = research_store.daily_report(session_date)
+        if not report:
+            raise HTTPException(status_code=404, detail="no report for that date")
+        return report
+
+    @app.post("/reports/daily/{session_date}/build", status_code=201)
+    def build_daily_report(session_date: str) -> dict:
+        """Compile (or recompile) the report for a day from its recorded runs."""
+
+        return daily_reports_builder.build(session_date)
 
     @app.get("/observations/sessions")
     def observation_sessions() -> list:
@@ -835,6 +932,17 @@ app = create_app()
 
 
 def run() -> None:
+    import os
+
     import uvicorn
 
-    uvicorn.run("jupiter_trading.api:app", host="127.0.0.1", port=8000, reload=True)
+    # Railway and other hosts inject $PORT and expect a bind on all interfaces.
+    # Locally, with no PORT set, keep the friendly localhost + reload defaults.
+    port = int(os.getenv("PORT", "8000"))
+    hosted = "PORT" in os.environ
+    uvicorn.run(
+        "jupiter_trading.api:app",
+        host="0.0.0.0" if hosted else "127.0.0.1",
+        port=port,
+        reload=not hosted,
+    )
