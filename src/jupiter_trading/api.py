@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .accounts import PaperAccountManager
@@ -37,6 +37,7 @@ from .strategy_engine import (
 from .survey import MarketSurvey, SurveyInstrument
 from .trade_rules import EntryPolicy, ExitPolicy, cost_model
 from .universe import Nifty50Universe, Nifty100Universe, UniverseError
+from .upstox_auth import UpstoxAuthError, UpstoxTokenStore
 
 
 class OrderRequest(BaseModel):
@@ -179,6 +180,12 @@ class MomentumBatchRequest(BaseModel):
         return MomentumRunRequest(**fields)
 
 
+class UpstoxTokenRequest(BaseModel):
+    """Set the live Upstox access token directly (when you already hold one)."""
+
+    access_token: str = Field(min_length=10, max_length=4096)
+
+
 class ExitReplayRequest(BaseModel):
     """Re-score a recorded run's monitoring trace under a different rule."""
 
@@ -240,12 +247,19 @@ def create_app(
         accounts.create("momentum", "Momentum research account", 100_000)
     strategies = StrategyService(accounts, research_store)
     coordinator = MarketCoordinator(accounts, strategies)
+    token_store = UpstoxTokenStore(
+        research_store,
+        api_key=settings.upstox_api_key,
+        api_secret=settings.upstox_api_secret,
+        redirect_uri=settings.upstox_redirect_uri,
+        env_token=settings.upstox_access_token,
+    )
     market_stream = UpstoxMarketStream(
-        settings.upstox_access_token,
+        token_store.current_token(),
         coordinator.on_quote,
         coordinator.update_market_status,
     )
-    search_client = instrument_search or UpstoxInstrumentSearch(settings.upstox_access_token)
+    search_client = instrument_search or UpstoxInstrumentSearch(token_store.current_token())
     backtests = BacktestEngine(research_store, settings.fee_schedule)
     exit_replays = ExitReplayEngine(research_store, settings.fee_schedule)
     nifty50 = Nifty50Universe()
@@ -254,7 +268,14 @@ def create_app(
     daily_reports_builder = DailyReportBuilder(research_store)
 
     def market_data() -> UpstoxMarketData:
-        return market_data_client or _upstox_client(settings)
+        # Read the live token each call, so a morning re-auth reaches the next
+        # run without a restart.
+        if market_data_client is not None:
+            return market_data_client
+        try:
+            return UpstoxMarketData(token_store.current_token())
+        except ValueError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
 
     def _scheduler_launch(slot, sched_config) -> str:
         # _launch_runner is defined further down; closures resolve at call time.
@@ -283,7 +304,7 @@ def create_app(
             allocation_per_position=settings.scheduler_allocation,
             initial_cash=settings.scheduler_initial_cash,
         ),
-        market_ready=lambda: bool(settings.upstox_access_token),
+        market_ready=lambda: bool(token_store.current_token()),
     )
 
     @asynccontextmanager
@@ -340,6 +361,7 @@ def create_app(
     app.state.exit_replays = exit_replays
     app.state.momentum_runners = momentum_runners
     app.state.scheduler = scheduler
+    app.state.token_store = token_store
     app.state.daily_reports = daily_reports_builder
 
     @app.get("/health")
@@ -347,7 +369,8 @@ def create_app(
         return {
             "status": "ok",
             "mode": "paper",
-            "upstox_configured": bool(settings.upstox_access_token),
+            "upstox_configured": bool(token_store.current_token()),
+            "upstox_token": token_store.status(),
             "paper_accounts": len(accounts.list()),
             "strategies": len(strategies.list()),
         }
@@ -726,6 +749,42 @@ def create_app(
         except (MarketDataError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
+    @app.get("/auth/upstox/status")
+    def upstox_auth_status() -> dict:
+        return token_store.status()
+
+    @app.get("/auth/upstox/login-url")
+    def upstox_login_url() -> dict:
+        """The Upstox login link to open each morning to refresh the token."""
+
+        try:
+            return {"authorization_url": token_store.authorization_url()}
+        except UpstoxAuthError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/auth/upstox/callback", include_in_schema=False)
+    def upstox_callback(code: Optional[str] = None, error: Optional[str] = None):
+        """Upstox redirects here after login; exchange the code for a token.
+
+        Returns a tiny self-contained page so a morning re-auth ends with a
+        human-readable confirmation in the browser, token already live.
+        """
+
+        if error:
+            return HTMLResponse(_auth_page(False, error), status_code=400)
+        if not code:
+            return HTMLResponse(_auth_page(False, "no authorization code in redirect"), 400)
+        try:
+            status = token_store.exchange_code(code)
+        except UpstoxAuthError as problem:
+            return HTMLResponse(_auth_page(False, str(problem)), status_code=502)
+        return HTMLResponse(_auth_page(True, f"Token live, valid until {status['expires_at_ist']}"))
+
+    @app.put("/auth/upstox/token")
+    def set_upstox_token(request: UpstoxTokenRequest) -> dict:
+        token_store.set_token(request.access_token)
+        return token_store.status()
+
     @app.get("/schedule/status")
     def schedule_status() -> dict:
         return scheduler.status()
@@ -921,14 +980,21 @@ def _broker(accounts: PaperAccountManager, account_id: str):
         raise HTTPException(status_code=404, detail="paper account not found") from error
 
 
-def _upstox_client(settings: Settings) -> UpstoxMarketData:
-    try:
-        return UpstoxMarketData(settings.upstox_access_token)
-    except ValueError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-
 app = create_app()
+
+
+def _auth_page(ok: bool, message: str) -> str:
+    colour = "#176b4c" if ok else "#b64c3f"
+    title = "Upstox token refreshed" if ok else "Token refresh failed"
+    safe = message.replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        "<!doctype html><meta charset=utf-8>"
+        "<title>Jupiter · Upstox</title>"
+        "<body style='font-family:system-ui;max-width:520px;margin:80px auto;padding:0 20px'>"
+        f"<h1 style='color:{colour};font-size:20px'>{title}</h1>"
+        f"<p style='color:#444;line-height:1.5'>{safe}</p>"
+        "<p style='color:#888;font-size:13px'>You can close this tab.</p></body>"
+    )
 
 
 def run() -> None:

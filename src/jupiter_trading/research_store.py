@@ -86,6 +86,11 @@ class ResearchStore:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS credentials (
+                    name TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS idx_strategy_events
                     ON strategy_events(strategy_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_momentum_runs_account_updated
@@ -298,6 +303,24 @@ class ResearchStore:
                 "SELECT payload FROM momentum_runs WHERE id = ?", (run_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def set_credential(self, name: str, value: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO credentials (name, value) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                (name, value),
+            )
+
+    def get_credential(self, name: str) -> Optional[tuple]:
+        """The stored value and when it was last written, or None."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value, updated_at FROM credentials WHERE name = ?", (name,)
+            ).fetchone()
+        return (row[0], row[1]) if row else None
 
     def save_schedule_plan(self, session_date: str, payload: dict) -> None:
         with self._lock, self._connection:

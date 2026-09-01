@@ -33,6 +33,11 @@ class Settings:
     upstox_access_token: str = field(
         default_factory=lambda: os.getenv("UPSTOX_ACCESS_TOKEN", "")
     )
+    upstox_api_key: str = field(default_factory=lambda: os.getenv("UPSTOX_API_KEY", ""))
+    upstox_api_secret: str = field(default_factory=lambda: os.getenv("UPSTOX_API_SECRET", ""))
+    upstox_redirect_uri: str = field(
+        default_factory=lambda: os.getenv("UPSTOX_REDIRECT_URI", "")
+    )
     scheduler_enabled: bool = field(default_factory=lambda: _bool("SCHEDULER_ENABLED", False))
     scheduler_max_positions: int = field(
         default_factory=lambda: int(_float("SCHEDULER_MAX_POSITIONS", 5))

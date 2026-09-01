@@ -4,23 +4,43 @@ Two services: the FastAPI backend (Railway) and the dashboard (see the frontend
 note below). They talk cross-origin, so both the API's `CORS_ALLOW_ORIGINS` and
 the dashboard's `NEXT_PUBLIC_API_BASE` must name each other.
 
-## The one hard blocker: the Upstox token
+## The Upstox token: one click each morning
 
-Upstox access tokens **expire every day** (around 03:30 IST) and can only be
-refreshed through an interactive OAuth login with your API key and secret. Until
-a fresh token is set each morning, every scheduled run fails at market-data
-fetch and the scheduler marks the day's slots `SKIPPED (market data
-unavailable)`. Unattended daily automation therefore needs one of:
+Upstox access tokens **expire daily at ~03:30 IST**, and Upstox has no
+refresh-token grant - the authorization step is an interactive login with your
+credentials and 2FA. That one login cannot be removed without handing over your
+Upstox username/password/TOTP, which this app deliberately does not do.
 
-- a small morning job that runs the Upstox OAuth exchange and writes the new
-  `UPSTOX_ACCESS_TOKEN` to the Railway service (Upstox offers an extended-token
-  flow for exactly this - worth setting up), or
-- you pasting the token into Railway's variables each morning before 09:15 IST.
+Everything around that login is automated. Configure the OAuth app once:
 
-Nothing else in this stack can refresh it for you, because the login is
-interactive and tied to your Upstox credentials. `GET /health` reports
-`upstox_configured`, and `GET /schedule/status` shows whether slots are being
-skipped, so you can tell at a glance whether today's token is live.
+| Variable | Value |
+| --- | --- |
+| `UPSTOX_API_KEY` | your Upstox app's API key |
+| `UPSTOX_API_SECRET` | your Upstox app's API secret |
+| `UPSTOX_REDIRECT_URI` | `https://<your-railway-app>.up.railway.app/auth/upstox/callback` |
+
+Set that same callback URL as the redirect URI in your Upstox developer app.
+Then each morning:
+
+1. Open the dashboard's **Reports** tab and click **Refresh token** (or hit
+   `GET /auth/upstox/login-url` and open the URL).
+2. Log into Upstox. It redirects to `/auth/upstox/callback`, which exchanges the
+   code for a token, stores it, and shows a confirmation page.
+
+The token is now live - no redeploy, no env-var edit. It is persisted on the
+research database (the Railway volume), so a restart keeps it, and every run
+reads the current token, so the next scheduled run picks it up. `GET
+/auth/upstox/status` reports whether the token is present and still within its
+03:30 window; `GET /health` includes the same. If it is stale at 09:15 the
+scheduler cleanly marks the day's slots `SKIPPED (market data unavailable)`.
+
+You can also set a token directly with `PUT /auth/upstox/token` (body
+`{"access_token": "..."}`) if you already hold one, and `UPSTOX_ACCESS_TOKEN`
+still seeds the store on first boot for a quick start.
+
+**Fully unattended** would require automating the Upstox login form with your
+stored credentials and TOTP - fragile and a credential-handling risk, so it is
+out of scope here. The one-click morning refresh is the safe maximum.
 
 ## Backend on Railway
 
@@ -35,7 +55,9 @@ The repo ships a `Dockerfile` and `railway.json`.
    | Variable | Value |
    | --- | --- |
    | `PAPER_DB_PATH` | `/data/paper_trading.db` |
-   | `UPSTOX_ACCESS_TOKEN` | today's token (see above) |
+   | `UPSTOX_API_KEY` / `UPSTOX_API_SECRET` | your Upstox app credentials (for the one-click refresh) |
+   | `UPSTOX_REDIRECT_URI` | `https://<app>.up.railway.app/auth/upstox/callback` |
+   | `UPSTOX_ACCESS_TOKEN` | optional seed token for first boot (see token section) |
    | `SCHEDULER_ENABLED` | `true` |
    | `SCHEDULER_MAX_POSITIONS` | `5` |
    | `SCHEDULER_ALLOCATION` | `100000` (per position) |

@@ -312,9 +312,20 @@ curl -X POST 'http://127.0.0.1:8000/reports/daily/2026-08-28/build'  # (re)build
 ```
 
 Runs, observations, plans and reports all persist in SQLite, so the record
-survives restarts as long as the database file does. Deployment (Railway
-backend, the frontend note, and the daily Upstox-token requirement that gates
-unattended runs) is documented in `DEPLOY.md`.
+survives restarts as long as the database file does.
+
+### The Upstox token
+
+Upstox tokens expire daily at ~03:30 IST and Upstox has no refresh grant, so a
+login is required each morning. The machine half is automated: configure the
+OAuth app (`UPSTOX_API_KEY`, `UPSTOX_API_SECRET`, `UPSTOX_REDIRECT_URI`), then
+click **Refresh token** in the dashboard (or open `GET /auth/upstox/login-url`).
+The Upstox login redirects to `/auth/upstox/callback`, which exchanges the code,
+stores the token on the research database, and makes it live for the next run
+with no restart. `GET /auth/upstox/status` reports freshness. The token is read
+per run, so a morning refresh reaches the 09:15 launch. The one interactive
+login is the only manual step; automating it would mean storing brokerage
+credentials, which this app does not do. Full setup is in `DEPLOY.md`.
 
 ## Backtesting and reports
 

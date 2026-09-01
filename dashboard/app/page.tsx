@@ -36,6 +36,7 @@ type BatchResult = {started:Array<{label:string;run:MomentumRun}>;failed:Array<{
 type ScheduleSlot = {index:number;start_ist:string;end_ist:string;account_id:string;label:string;duration_seconds:number;max_positions:number;entry_timeframe_seconds:number;status:string;runner_id?:string|null;detail?:string|null};
 type Coverage = {covered_pct:number;largest_gap_seconds:number;concurrent_peak:number;session_open_ist?:string;session_close_ist?:string};
 type SchedulePlan = {session_date:string;account_prefix:string;slots:ScheduleSlot[];coverage:Coverage};
+type TokenStatus = {has_token:boolean;likely_valid:boolean;updated_at?:string|null;expires_at_ist?:string|null;oauth_configured:boolean};
 type ScheduleStatus = {enabled:boolean;running:boolean;session_date:string;is_trading_day:boolean;entry_timeframes:number[];max_positions:number;reentry_cooldown_seconds:number;plan:SchedulePlan|null;report_ready:boolean;last_actions:Array<Record<string,unknown>>};
 type ReportRun = {run_id:string;account_id:string;config_key:string;status:string;started_at?:string;finished_at?:string;duration_seconds?:number;max_positions?:number;entry_timeframe_seconds?:number;net_pnl:number;gross_pnl:number;fees:number;round_trips:number;wins:number;win_rate_pct:number;symbols_traded:string[];exit_reasons:Record<string,number>;monitoring_count:number;errors:string[]};
 type ConfigRollup = {key:string|number;runs:number;net_pnl:number;round_trips:number;wins:number;win_rate_pct:number};
@@ -424,12 +425,16 @@ function ReportsView({openRun}:{openRun:(id:string)=>void}) {
 }
 
 function ScheduleStrip({status}:{status:ScheduleStatus|null}) {
+  const [token,setToken]=useState<TokenStatus|null>(null);
+  useEffect(()=>{let live=true;const load=()=>request<TokenStatus>('/auth/upstox/status').then(t=>{if(live)setToken(t)}).catch(()=>{});load();const timer=window.setInterval(load,30000);return()=>{live=false;window.clearInterval(timer);};},[]);
+  const refreshToken=async()=>{try{const {authorization_url}=await request<{authorization_url:string}>('/auth/upstox/login-url');window.open(authorization_url,'_blank','noopener');}catch(error){alert(error instanceof Error?error.message:'Set UPSTOX_API_KEY/SECRET/REDIRECT_URI on the backend first');}};
   if(!status)return null;
   const plan=status.plan;
   const done=plan?plan.slots.filter(s=>s.status!=='PENDING').length:0;
   return <section className="schedule-strip"><div className="sched-head"><div><span className={`live-dot ${status.enabled?'':'off'}`}/><div><p className="eyebrow">Scheduler</p><h2>{status.enabled?(status.running?'Running':'Enabled'):'Disabled'}</h2></div></div>
     <div className="sched-stats"><span><small>Session</small><b>{status.session_date}</b></span><span><small>Trading day</small><b>{status.is_trading_day?'Yes':'No'}</b></span><span><small>Runs today</small><b>{done}/{plan?plan.slots.length:status.entry_timeframes.length}</b></span><span><small>Positions</small><b>{status.max_positions}</b></span><span><small>Cooldown</small><b>{Math.round(status.reentry_cooldown_seconds/60)}m</b></span><span><small>Report</small><b>{status.report_ready?'Ready':'Pending'}</b></span></div></div>
-    {!status.enabled&&<p className="sched-warn">Scheduler is off. Set <code>SCHEDULER_ENABLED=true</code> on the backend and provide a fresh Upstox token each morning for unattended runs.</p>}
+    <div className="token-row"><span className={`token-dot ${token?.likely_valid?'ok':'stale'}`}/><b>Upstox token</b><span>{token?token.likely_valid?`live · expires ${token.expires_at_ist?token.expires_at_ist.slice(11,16):''} IST`:token.has_token?'stale — refresh before the open':'not set':'…'}</span>{token?.oauth_configured&&<button className="text-button" onClick={refreshToken}>Refresh token →</button>}</div>
+    {!status.enabled&&<p className="sched-warn">Scheduler is off. Set <code>SCHEDULER_ENABLED=true</code> on the backend, and refresh the Upstox token each morning (it expires ~03:30 IST) so the 09:15 runs have market data.</p>}
     {plan&&<div className="sched-timeline">{plan.slots.map(slot=><div key={slot.index} className={`sched-slot ${slot.status.toLowerCase()}`} title={`${slot.label} · ${slot.status}`}><span>{slot.start_ist.slice(11,16)}</span><b>{slot.label}</b><em>{slot.status.toLowerCase()}</em></div>)}</div>}
   </section>;
 }

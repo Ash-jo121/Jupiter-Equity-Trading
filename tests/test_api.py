@@ -273,3 +273,59 @@ def test_daily_report_can_be_built_and_fetched(tmp_path) -> None:
 def test_manual_tick_is_a_no_op_while_the_scheduler_is_disabled(tmp_path) -> None:
     with TestClient(create_app(_paper_settings(tmp_path))) as client:
         assert client.post("/schedule/tick").json() == {"actions": []}
+
+
+def test_upstox_token_can_be_set_and_status_reflects_it(tmp_path) -> None:
+    settings = _paper_settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        before = client.get("/auth/upstox/status").json()
+        assert before["has_token"] is False
+        assert before["oauth_configured"] is False
+
+        put = client.put("/auth/upstox/token", json={"access_token": "live-token-123"})
+        assert put.status_code == 200
+        assert put.json()["has_token"] is True
+
+        health = client.get("/health").json()
+        assert health["upstox_configured"] is True
+        assert health["upstox_token"]["has_token"] is True
+
+
+def test_login_url_needs_oauth_configuration(tmp_path) -> None:
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        # No API key/secret/redirect -> the login URL cannot be built.
+        assert client.get("/auth/upstox/login-url").status_code == 400
+
+
+def test_login_url_is_returned_when_oauth_is_configured(tmp_path) -> None:
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="",
+        upstox_api_key="KEY",
+        upstox_api_secret="SECRET",
+        upstox_redirect_uri="https://app.example/auth/upstox/callback",
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    with TestClient(create_app(settings)) as client:
+        url = client.get("/auth/upstox/login-url").json()["authorization_url"]
+        assert "client_id=KEY" in url
+        assert "SECRET" not in url  # secret never leaves the server
+
+
+def test_callback_without_a_code_shows_a_failure_page(tmp_path) -> None:
+    with TestClient(create_app(_paper_settings(tmp_path))) as client:
+        response = client.get("/auth/upstox/callback")
+        assert response.status_code == 400
+        assert "failed" in response.text.lower()
+
+
+def test_a_seeded_env_token_is_live_from_boot(tmp_path) -> None:
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="env-seeded-token",
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/auth/upstox/status").json()["has_token"] is True
