@@ -15,6 +15,7 @@ from .backtest import BacktestEngine, ExitReplayEngine, ReplayGates
 from .config import Settings
 from .daily_report import DailyReportBuilder
 from .domain import DepthLevel, Order, OrderType, Product, Quote, Side, Validity
+from .holiday_calendar import HolidayCalendarError, NseHolidayCalendar
 from .instrument_search import InstrumentSearchError, UpstoxInstrumentSearch
 from .market_data import MarketDataError, UpstoxMarketData
 from .market_stream import UpstoxMarketStream
@@ -230,6 +231,7 @@ def create_app(
     settings: Optional[Settings] = None,
     instrument_search: Optional[UpstoxInstrumentSearch] = None,
     market_data_client: Optional[UpstoxMarketData] = None,
+    holiday_calendar: Optional[NseHolidayCalendar] = None,
 ) -> FastAPI:
     settings = settings or Settings()
     repository = SQLiteRepository(settings.database_path)
@@ -253,6 +255,7 @@ def create_app(
         api_secret=settings.upstox_api_secret,
         redirect_uri=settings.upstox_redirect_uri,
         env_token=settings.upstox_access_token,
+        analytics_token=settings.upstox_analytics_token,
     )
     market_stream = UpstoxMarketStream(
         token_store.current_token(),
@@ -266,6 +269,7 @@ def create_app(
     nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
     daily_reports_builder = DailyReportBuilder(research_store)
+    nse_holidays = holiday_calendar or NseHolidayCalendar()
 
     def market_data() -> UpstoxMarketData:
         # Read the live token each call, so a morning re-auth reaches the next
@@ -304,7 +308,8 @@ def create_app(
             allocation_per_position=settings.scheduler_allocation,
             initial_cash=settings.scheduler_initial_cash,
         ),
-        market_ready=lambda: bool(token_store.current_token()),
+        market_ready=lambda: token_store.status()["likely_valid"],
+        trading_day_check=nse_holidays.is_trading_day,
     )
 
     @asynccontextmanager
@@ -363,6 +368,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.token_store = token_store
     app.state.daily_reports = daily_reports_builder
+    app.state.nse_holidays = nse_holidays
 
     @app.get("/health")
     def health() -> dict:
@@ -778,7 +784,8 @@ def create_app(
             status = token_store.exchange_code(code)
         except UpstoxAuthError as problem:
             return HTMLResponse(_auth_page(False, str(problem)), status_code=502)
-        return HTMLResponse(_auth_page(True, f"Token live, valid until {status['expires_at_ist']}"))
+        expiry = status["expires_at_ist"] or "the provider-reported expiry"
+        return HTMLResponse(_auth_page(True, f"Token live, valid until {expiry}"))
 
     @app.put("/auth/upstox/token")
     def set_upstox_token(request: UpstoxTokenRequest) -> dict:
@@ -788,6 +795,23 @@ def create_app(
     @app.get("/schedule/status")
     def schedule_status() -> dict:
         return scheduler.status()
+
+    @app.get("/schedule/calendar")
+    def schedule_calendar(year: Optional[int] = Query(default=None, ge=2000, le=2100)) -> dict:
+        target_year = year or schedule_now_ist().year
+        try:
+            holidays = nse_holidays.holidays(target_year)
+        except HolidayCalendarError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {
+            "year": target_year,
+            "segment": NseHolidayCalendar.segment,
+            "source": NseHolidayCalendar.url,
+            "count": len(holidays),
+            "holidays": holidays,
+            "fallback_active": bool(nse_holidays.last_error),
+            "warning": nse_holidays.last_error,
+        }
 
     @app.get("/schedule/plan")
     def schedule_plan(session_date: Optional[str] = None) -> dict:

@@ -33,6 +33,9 @@ class Settings:
     upstox_access_token: str = field(
         default_factory=lambda: os.getenv("UPSTOX_ACCESS_TOKEN", "")
     )
+    upstox_analytics_token: str = field(
+        default_factory=lambda: os.getenv("UPSTOX_ANALYTICS_TOKEN", "")
+    )
     upstox_api_key: str = field(default_factory=lambda: os.getenv("UPSTOX_API_KEY", ""))
     upstox_api_secret: str = field(default_factory=lambda: os.getenv("UPSTOX_API_SECRET", ""))
     upstox_redirect_uri: str = field(

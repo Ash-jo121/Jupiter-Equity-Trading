@@ -34,17 +34,16 @@ def _token_valid_until(issued: datetime) -> datetime:
 
 
 class UpstoxTokenStore:
-    """The live Upstox access token: persisted, refreshable without a redeploy.
+    """Select the live Upstox token without exposing it to strategy code.
 
-    Upstox has no refresh-token grant - the token is daily and the authorization
-    step is an interactive login. This store does the machine half of that: it
-    exchanges the returned auth code for a token and persists it on the research
-    database (so a restart keeps it), and every Upstox client reads the current
-    token from here rather than from a fixed environment variable. The only human
-    step left is clicking through the login once a morning.
+    A read-only Analytics Token is preferred for this paper-trading application:
+    it is long-lived and can supply market data without a daily OAuth login. When
+    one is not configured, the store falls back to the standard daily access-token
+    flow and persists exchanged tokens in the research database.
 
-    An env-var token seeds the store on first boot, so nothing breaks before the
-    first callback; a token captured via the callback then supersedes it.
+    The analytics token deliberately remains environment-owned rather than being
+    copied into SQLite. A standard env-var token seeds the store on first boot; a
+    token captured via OAuth then supersedes that seed.
     """
 
     def __init__(
@@ -54,18 +53,22 @@ class UpstoxTokenStore:
         api_secret: str = "",
         redirect_uri: str = "",
         env_token: str = "",
+        analytics_token: str = "",
         timeout: float = 10.0,
     ) -> None:
         self.store = store
         self.api_key = api_key
         self.api_secret = api_secret
         self.redirect_uri = redirect_uri
+        self._analytics_token = analytics_token
         self._timeout = timeout
         self._lock = RLock()
         if env_token and self.store.get_credential(CREDENTIAL_NAME) is None:
             self.store.set_credential(CREDENTIAL_NAME, env_token)
 
     def current_token(self) -> str:
+        if self._analytics_token:
+            return self._analytics_token
         with self._lock:
             record = self.store.get_credential(CREDENTIAL_NAME)
         return record[0] if record else ""
@@ -135,6 +138,15 @@ class UpstoxTokenStore:
         return self.status()
 
     def status(self) -> dict:
+        if self._analytics_token:
+            return {
+                "has_token": True,
+                "likely_valid": True,
+                "token_type": "analytics",
+                "updated_at": None,
+                "expires_at_ist": None,
+                "oauth_configured": self.configured_for_oauth,
+            }
         with self._lock:
             record = self.store.get_credential(CREDENTIAL_NAME)
         has_token = bool(record and record[0])
@@ -154,6 +166,7 @@ class UpstoxTokenStore:
         return {
             "has_token": has_token,
             "likely_valid": valid,
+            "token_type": "oauth" if has_token else None,
             "updated_at": updated_at,
             "expires_at_ist": expires_at,
             "oauth_configured": self.configured_for_oauth,

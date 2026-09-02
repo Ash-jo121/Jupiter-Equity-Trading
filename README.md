@@ -294,7 +294,10 @@ plan and launches any slot whose start has arrived - so it is unit tested
 without threads, and a restart mid-session resumes from the saved slot states
 rather than relaunching or skipping. A slot missed by more than a grace window
 is marked `SKIPPED`; a launch failure marks that one arm `FAILED` and the rest
-proceed.
+proceed. Before creating a plan, the scheduler checks the official NSE `CM`
+holiday calendar, cached by year. `GET /schedule/calendar?year=2026` shows the
+dates currently being applied. Weekends, regular cash-market holidays, and
+special sessions outside the normal 09:15-15:30 window are skipped.
 
 ### The daily report
 
@@ -316,16 +319,20 @@ survives restarts as long as the database file does.
 
 ### The Upstox token
 
-Upstox tokens expire daily at ~03:30 IST and Upstox has no refresh grant, so a
-login is required each morning. The machine half is automated: configure the
-OAuth app (`UPSTOX_API_KEY`, `UPSTOX_API_SECRET`, `UPSTOX_REDIRECT_URI`), then
-click **Refresh token** in the dashboard (or open `GET /auth/upstox/login-url`).
-The Upstox login redirects to `/auth/upstox/callback`, which exchanges the code,
-stores the token on the research database, and makes it live for the next run
-with no restart. `GET /auth/upstox/status` reports freshness. The token is read
-per run, so a morning refresh reaches the 09:15 launch. The one interactive
-login is the only manual step; automating it would mean storing brokerage
-credentials, which this app does not do. Full setup is in `DEPLOY.md`.
+For unattended paper research, generate a read-only **Analytics Token** in
+Upstox Developer Apps and set it as `UPSTOX_ANALYTICS_TOKEN`. It is valid for one
+year and supports the market quote, historical-data and WebSocket APIs used by
+this application. Because paper orders never leave Jupiter, no trading-capable
+Upstox credential is required. The scheduler can therefore run each trading day
+without a 03:30 token refresh.
+
+Standard OAuth remains available as a fallback. Its access token expires daily
+at ~03:30 IST and has no refresh-token grant, so it still requires an interactive
+login. Configure `UPSTOX_API_KEY`, `UPSTOX_API_SECRET` and
+`UPSTOX_REDIRECT_URI`, then click **Refresh token** in the dashboard. The callback
+exchanges and persists the token without a restart. The app never automates the
+Upstox login form or stores account passwords/TOTP secrets. Full setup is in
+`DEPLOY.md`.
 
 ## Backtesting and reports
 

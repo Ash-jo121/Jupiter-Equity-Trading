@@ -161,7 +161,7 @@ def coverage_summary(slots: List[ScheduledSlot]) -> dict:
 
 
 def is_trading_day(session_date: str) -> bool:
-    """Weekday check. NSE trading holidays are not modelled - see the README."""
+    """Basic weekday calendar used when no exchange calendar is injected."""
 
     return date.fromisoformat(session_date).weekday() < 5
 

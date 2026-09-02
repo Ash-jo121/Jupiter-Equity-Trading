@@ -66,12 +66,14 @@ class DailyScheduler:
         build_report: Callable[[str], dict],
         config: Optional[SchedulerConfig] = None,
         market_ready: Optional[Callable[[], bool]] = None,
+        trading_day_check: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.store = store
         self._launch = launch
         self._build_report = build_report
         self.config = config or SchedulerConfig()
         self._market_ready = market_ready or (lambda: True)
+        self._trading_day_check = trading_day_check or is_trading_day
         self._lock = RLock()
         self._stop = Event()
         self._thread: Optional[Thread] = None
@@ -109,7 +111,7 @@ class DailyScheduler:
         actions: List[dict] = []
         if not self.config.enabled:
             return actions
-        if not is_trading_day(session_date):
+        if not self._trading_day_check(session_date):
             return actions
 
         with self._lock:
@@ -211,7 +213,7 @@ class DailyScheduler:
             "enabled": self.config.enabled,
             "running": bool(self._thread and self._thread.is_alive()),
             "session_date": session_date,
-            "is_trading_day": is_trading_day(session_date),
+            "is_trading_day": self._trading_day_check(session_date),
             "entry_timeframes": list(self.config.entry_timeframes),
             "max_positions": self.config.max_positions,
             "reentry_cooldown_seconds": self.config.reentry_cooldown_seconds,

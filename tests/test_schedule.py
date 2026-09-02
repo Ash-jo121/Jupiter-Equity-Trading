@@ -169,6 +169,22 @@ def test_weekends_are_ignored(tmp_path) -> None:
     assert launched == []
 
 
+def test_exchange_holidays_are_ignored(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "sched.db"))
+    launched = []
+    scheduler = DailyScheduler(
+        store,
+        lambda slot, cfg: launched.append(slot) or "x",
+        lambda date: {},
+        SchedulerConfig(enabled=True),
+        trading_day_check=lambda day: day != "2026-09-14",
+    )
+
+    assert scheduler.tick(_at("2026-09-14", 9, 16)) == []
+    assert launched == []
+    assert store.schedule_plan("2026-09-14") is None
+
+
 def test_one_failing_arm_does_not_stop_the_others(tmp_path) -> None:
     store = ResearchStore(str(tmp_path / "sched.db"))
     launched = []

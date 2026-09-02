@@ -1,8 +1,11 @@
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
 from jupiter_trading.api import create_app
 from jupiter_trading.config import Settings
+from jupiter_trading.holiday_calendar import NseHolidayCalendar
 from jupiter_trading.paper_broker import FeeSchedule, RiskLimits
 
 
@@ -232,6 +235,22 @@ def test_schedule_status_reports_disabled_by_default(tmp_path) -> None:
         assert "session_date" in status
 
 
+def test_schedule_calendar_exposes_cash_market_holidays(tmp_path) -> None:
+    calendar = NseHolidayCalendar(cache_hours=12)
+    calendar._cache[2026] = (
+        datetime.now().astimezone(),
+        [{"date": "2026-09-14", "description": "Ganesh Chaturthi"}],
+    )
+    with TestClient(create_app(_paper_settings(tmp_path), holiday_calendar=calendar)) as client:
+        response = client.get("/schedule/calendar", params={"year": 2026})
+
+    assert response.status_code == 200
+    assert response.json()["segment"] == "CM"
+    assert response.json()["holidays"] == [
+        {"date": "2026-09-14", "description": "Ganesh Chaturthi"}
+    ]
+
+
 def test_daily_report_can_be_built_and_fetched(tmp_path) -> None:
     from jupiter_trading.research_store import ResearchStore
 
@@ -329,3 +348,19 @@ def test_a_seeded_env_token_is_live_from_boot(tmp_path) -> None:
     )
     with TestClient(create_app(settings)) as client:
         assert client.get("/auth/upstox/status").json()["has_token"] is True
+
+
+def test_an_analytics_token_is_reported_as_long_lived(tmp_path) -> None:
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="stale-daily-token",
+        upstox_analytics_token="year-long-analytics-token",
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    with TestClient(create_app(settings)) as client:
+        status = client.get("/auth/upstox/status").json()
+        assert status["has_token"] is True
+        assert status["likely_valid"] is True
+        assert status["token_type"] == "analytics"
+        assert status["expires_at_ist"] is None

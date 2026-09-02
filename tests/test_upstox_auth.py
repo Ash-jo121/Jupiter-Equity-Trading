@@ -20,6 +20,22 @@ def test_an_env_token_seeds_the_store_on_first_boot(tmp_path) -> None:
     assert ts.current_token() == "ENV"
 
 
+def test_an_analytics_token_takes_precedence_and_is_long_lived(tmp_path) -> None:
+    db = store(tmp_path)
+    UpstoxTokenStore(db, env_token="DAILY").set_token("OAUTH")
+    ts = UpstoxTokenStore(db, analytics_token="ANALYTICS")
+
+    assert ts.current_token() == "ANALYTICS"
+    assert ts.status() == {
+        "has_token": True,
+        "likely_valid": True,
+        "token_type": "analytics",
+        "updated_at": None,
+        "expires_at_ist": None,
+        "oauth_configured": False,
+    }
+
+
 def test_a_stored_token_is_not_overwritten_by_the_env_on_later_boots(tmp_path) -> None:
     db = store(tmp_path)
     UpstoxTokenStore(db, env_token="ENV").set_token("FRESH")
@@ -70,9 +86,11 @@ def test_status_reports_absence_and_presence(tmp_path) -> None:
     absent = ts.status()
     assert absent["has_token"] is False
     assert absent["likely_valid"] is False
+    assert absent["token_type"] is None
     ts.set_token("T")
     present = ts.status()
     assert present["has_token"] is True
+    assert present["token_type"] == "oauth"
     assert present["updated_at"] is not None
 
 

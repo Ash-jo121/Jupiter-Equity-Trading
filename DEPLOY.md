@@ -4,14 +4,22 @@ Two services: the FastAPI backend (Railway) and the dashboard (see the frontend
 note below). They talk cross-origin, so both the API's `CORS_ALLOW_ORIGINS` and
 the dashboard's `NEXT_PUBLIC_API_BASE` must name each other.
 
-## The Upstox token: one click each morning
+## The Upstox token: unattended paper-market data
 
-Upstox access tokens **expire daily at ~03:30 IST**, and Upstox has no
-refresh-token grant - the authorization step is an interactive login with your
-credentials and 2FA. That one login cannot be removed without handing over your
-Upstox username/password/TOTP, which this app deliberately does not do.
+Use an Upstox **Analytics Token** for this paper-only application. It is
+read-only, lasts for one year, and supports the market-data and WebSocket APIs
+used by the strategy. Generate it once under **Upstox Developer Apps →
+Analytics**, store it in the backend as `UPSTOX_ANALYTICS_TOKEN`, and rotate it
+before its displayed expiry date. Do not commit it.
 
-Everything around that login is automated. Configure the OAuth app once:
+No static IP is required for the market quote, historical-data, market
+information, or WebSocket APIs used here. Static IP registration is only needed
+for the Analytics Token's supported account-specific read APIs, which the paper
+engine does not need.
+
+The standard OAuth flow remains an optional fallback. Those access tokens expire
+daily at ~03:30 IST and Upstox does not expose a refresh-token grant. Configure
+the following only if you want that fallback:
 
 | Variable | Value |
 | --- | --- |
@@ -20,14 +28,14 @@ Everything around that login is automated. Configure the OAuth app once:
 | `UPSTOX_REDIRECT_URI` | `https://<your-railway-app>.up.railway.app/auth/upstox/callback` |
 
 Set that same callback URL as the redirect URI in your Upstox developer app.
-Then each morning:
+To issue a daily token:
 
 1. Open the dashboard's **Reports** tab and click **Refresh token** (or hit
    `GET /auth/upstox/login-url` and open the URL).
 2. Log into Upstox. It redirects to `/auth/upstox/callback`, which exchanges the
    code for a token, stores it, and shows a confirmation page.
 
-The token is now live - no redeploy, no env-var edit. It is persisted on the
+The OAuth token is then live - no redeploy or env-var edit. It is persisted on the
 research database (the Railway volume), so a restart keeps it, and every run
 reads the current token, so the next scheduled run picks it up. `GET
 /auth/upstox/status` reports whether the token is present and still within its
@@ -38,9 +46,8 @@ You can also set a token directly with `PUT /auth/upstox/token` (body
 `{"access_token": "..."}`) if you already hold one, and `UPSTOX_ACCESS_TOKEN`
 still seeds the store on first boot for a quick start.
 
-**Fully unattended** would require automating the Upstox login form with your
-stored credentials and TOTP - fragile and a credential-handling risk, so it is
-out of scope here. The one-click morning refresh is the safe maximum.
+Do not automate the Upstox login form or store Upstox passwords/TOTP secrets.
+Use the Analytics Token instead for fully unattended paper runs.
 
 ## Backend on Railway
 
@@ -55,9 +62,10 @@ The repo ships a `Dockerfile` and `railway.json`.
    | Variable | Value |
    | --- | --- |
    | `PAPER_DB_PATH` | `/data/paper_trading.db` |
-   | `UPSTOX_API_KEY` / `UPSTOX_API_SECRET` | your Upstox app credentials (for the one-click refresh) |
-   | `UPSTOX_REDIRECT_URI` | `https://<app>.up.railway.app/auth/upstox/callback` |
-   | `UPSTOX_ACCESS_TOKEN` | optional seed token for first boot (see token section) |
+   | `UPSTOX_ANALYTICS_TOKEN` | preferred read-only, one-year token for unattended paper runs |
+   | `UPSTOX_API_KEY` / `UPSTOX_API_SECRET` | optional standard OAuth fallback credentials |
+   | `UPSTOX_REDIRECT_URI` | optional OAuth fallback callback: `https://<app>.up.railway.app/auth/upstox/callback` |
+   | `UPSTOX_ACCESS_TOKEN` | optional daily OAuth seed token |
    | `SCHEDULER_ENABLED` | `true` |
    | `SCHEDULER_MAX_POSITIONS` | `5` |
    | `SCHEDULER_ALLOCATION` | `100000` (per position) |
@@ -118,16 +126,18 @@ frontend origin in `CORS_ALLOW_ORIGINS`.
 
 ## NSE holidays
 
-`is_trading_day` only skips weekends; it does not know NSE trading holidays. On a
-holiday the scheduler will still build a plan and try to launch - the runs simply
-find the market closed and record nothing tradeable. Add the holiday list to
-`schedule.is_trading_day` if you want those days skipped cleanly.
+The scheduler loads the official NSE holiday-master `CM` calendar by year and
+caches it for 12 hours. It skips weekends and cash-market holidays before a plan
+or run is created. The published 2026 calendar is bundled as an offline fallback;
+for later years the scheduler fails closed if NSE is unreachable, then retries on
+subsequent scheduler ticks. Inspect the applied dates at
+`GET /schedule/calendar?year=2026`.
 
 ## Local development
 
 ```bash
 # backend
-UPSTOX_ACCESS_TOKEN=... SCHEDULER_ENABLED=false jupiter-api   # localhost:8000
+UPSTOX_ANALYTICS_TOKEN=... SCHEDULER_ENABLED=false jupiter-api   # localhost:8000
 
 # dashboard (proxies /api to localhost:8000 in dev)
 cd dashboard && npm install && npm run dev                    # localhost:3000
