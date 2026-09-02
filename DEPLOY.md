@@ -97,19 +97,14 @@ Vercel will not work.
 
 Two honest paths:
 
-### Recommended: Cloudflare (already configured)
+### Recommended: private OpenAI Sites / Cloudflare Worker
 
-```bash
-cd dashboard
-echo "NEXT_PUBLIC_API_BASE=https://<your-railway-app>.up.railway.app" > .env
-npm install
-npm run build
-npx wrangler deploy      # or connect the repo in the Cloudflare dashboard
-```
-
-Set `NEXT_PUBLIC_API_BASE` to the Railway URL (baked in at build time, so
-rebuild if it changes), and set the backend's `CORS_ALLOW_ORIGINS` to the
-resulting Cloudflare URL.
+The dashboard contains `.openai/hosting.json` and a server-side `/api` proxy.
+Deploy it as an owner-only Site and set the Site runtime variable
+`JUPITER_BACKEND_URL` to the Railway backend URL. The browser then calls the
+private Site on the same origin; the Worker forwards requests to Railway, so the
+backend URL is not baked into the browser bundle and Railway CORS is not needed
+for dashboard traffic.
 
 ### If you specifically want Vercel
 
@@ -121,8 +116,9 @@ migration is mostly mechanical (it makes no server calls of its own beyond
 and it can be done as a separate step; until then, Cloudflare is the working
 frontend host.
 
-Either way the API base is `NEXT_PUBLIC_API_BASE` and the backend must list the
-frontend origin in `CORS_ALLOW_ORIGINS`.
+The optional `NEXT_PUBLIC_API_BASE` path remains available for split deployments
+that intentionally call Railway directly from the browser; those deployments
+must configure Railway `CORS_ALLOW_ORIGINS`.
 
 ## NSE holidays
 

@@ -40,6 +40,8 @@ export default defineConfig(async () => {
   process.env.WRANGLER_WRITE_LOGS ??= 'false';
   process.env.WRANGLER_LOG_PATH ??= '.wrangler/logs';
   process.env.MINIFLARE_REGISTRY_PATH ??= '.wrangler/registry';
+  const backendUrl =
+    process.env.JUPITER_BACKEND_URL || 'http://127.0.0.1:8000';
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import('@cloudflare/vite-plugin');
@@ -52,7 +54,8 @@ export default defineConfig(async () => {
         : {}),
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8000',
+          target: backendUrl,
+          changeOrigin: true,
           rewrite: (path: string) => path.replace(/^\/api/, ''),
         },
       },
