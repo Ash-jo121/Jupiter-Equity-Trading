@@ -23,7 +23,7 @@ REPORT_DELAY_SECONDS = 180
 @dataclass(frozen=True)
 class SchedulerConfig:
     enabled: bool = False
-    entry_timeframes: tuple = (0, 60, 180, 300)
+    entry_timeframes: tuple = (0, 60)
     max_positions: int = 5
     reentry_cooldown_seconds: float = 900.0  # 15 min before a stock can re-enter
     account_prefix: str = "auto"

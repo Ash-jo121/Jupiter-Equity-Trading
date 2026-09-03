@@ -15,7 +15,7 @@ from jupiter_trading.paper_broker import FeeSchedule, RiskLimits
 from jupiter_trading.repository import InMemoryRepository
 from jupiter_trading.research_store import ResearchStore
 from jupiter_trading.strategy_engine import MarketCoordinator, StrategyService
-from jupiter_trading.survey import SurveyInstrument
+from jupiter_trading.survey import SharedSurveyCache, SurveyInstrument
 
 
 class RisingThenReversingMarket:
@@ -58,6 +58,38 @@ class LowVolumeMarket(RisingThenReversingMarket):
             Candle(now + timedelta(minutes=index * 5), 99, 101, 98, 99, volume, 0)
             for index, volume in enumerate([200, 200, 200, 100, 100, 100, 100])
         ]
+
+
+class CountingSurveyMarket:
+    def __init__(self) -> None:
+        self.ltp_calls = 0
+        self.candle_calls = 0
+
+    def ltp(self, instrument_keys) -> dict:
+        self.ltp_calls += 1
+        return {key: Quote(key, 100.0) for key in instrument_keys}
+
+    def intraday_candles(self, instrument_key, unit, interval) -> list:
+        self.candle_calls += 1
+        now = datetime.now(timezone.utc)
+        return [
+            Candle(now + timedelta(minutes=index * 5), 99, 101, 98, 100, volume, 0)
+            for index, volume in enumerate([100, 100, 100, 200, 200, 200, 200])
+        ]
+
+
+def test_shared_survey_cache_reuses_one_market_snapshot() -> None:
+    market = CountingSurveyMarket()
+    cache = SharedSurveyCache(ttl_seconds=300)
+    instruments = [SurveyInstrument("TEST", "NSE_EQ|TEST")]
+
+    first = cache.run(market, instruments, 1.2)
+    second = cache.run(market, instruments, 1.2)
+
+    assert market.ltp_calls == 1
+    assert market.candle_calls == 1
+    assert first["shared_cache"]["hit"] is False
+    assert second["shared_cache"]["hit"] is True
 
 
 def test_legacy_reversal_mode_buys_momentum_and_sells_reversal(tmp_path) -> None:
@@ -324,8 +356,8 @@ def test_the_three_bar_verdict_is_recorded_even_when_another_gate_blocks(tmp_pat
     assert not runner.snapshot()["open_positions"]
 
 
-def test_a_small_negative_nifty_print_does_not_block_an_entry_by_default(tmp_path) -> None:
-    """The index moves far less than a single stock, so its noise is not a signal."""
+def test_a_small_negative_nifty_print_blocks_an_entry_by_default(tmp_path) -> None:
+    """The production strategy always requires positive short-term NIFTY momentum."""
 
     accounts = PaperAccountManager(
         repository=InMemoryRepository(),
@@ -341,7 +373,7 @@ def test_a_small_negative_nifty_print_does_not_block_an_entry_by_default(tmp_pat
         market_data=FallingNiftyMarket(),
         accounts=accounts,
         coordinator=MarketCoordinator(accounts, strategies),
-        runner_id="nifty-off",
+        runner_id="nifty-required",
     )
 
     runner._scan()
@@ -349,11 +381,10 @@ def test_a_small_negative_nifty_print_does_not_block_an_entry_by_default(tmp_pat
         runner._poll()
 
     snapshot = runner.snapshot()
-    assert any(order.side == Side.BUY for order in accounts.get().orders.values())
-    assert "NIFTY_SHORT_TERM_NOT_POSITIVE" not in {
+    assert not accounts.get().orders
+    assert "NIFTY_SHORT_TERM_NOT_POSITIVE" in {
         row["decision"] for row in snapshot["monitoring"]
     }
-    # The context is still recorded on every check, it just no longer gates.
     assert all(row["nifty_price"] is not None for row in snapshot["monitoring"])
     assert snapshot["monitoring"][-1]["nifty_recent_15m_change_pct"] is not None
 

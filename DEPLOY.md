@@ -81,8 +81,9 @@ The repo ships a `Dockerfile` and `railway.json`.
    database. Scale by running more arms per day, not more replicas.
 5. Health check is `GET /health`.
 
-Once up, the scheduler launches four full-session runs (one per entry timeframe)
-at 09:15 IST; `GET /schedule/status` shows them, and after they settle past the
+Once up, the scheduler launches two full-session runs (5-second ticks and
+1-minute bars) at 09:15 IST. They share one cached NIFTY 100 survey;
+`GET /schedule/status` shows them, and after they settle past the
 15:30 close the day's report appears at `GET /reports/daily/{date}` and in the
 dashboard's Reports tab. Each run needs its account funded to cover
 `max_positions x allocation`, which `SCHEDULER_INITIAL_CASH` provides.

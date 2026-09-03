@@ -8,10 +8,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
 
-# The one axis worth comparing head to head: 5s ticks, 1m, 3m, 5m entry bars.
+# The one axis worth comparing head to head: raw 5s ticks versus 1m entry bars.
 # Everything else (full-session duration, position cap) is held fixed so each
 # run differs by exactly this, over the identical universe and session.
-ENTRY_TIMEFRAMES = (0, 60, 180, 300)
+ENTRY_TIMEFRAMES = (0, 60)
 TIMEFRAME_LABELS = {0: "5s", 60: "1m", 180: "3m", 300: "5m"}
 
 

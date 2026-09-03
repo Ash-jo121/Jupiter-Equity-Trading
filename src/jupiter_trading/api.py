@@ -35,7 +35,7 @@ from .strategy_engine import (
     StrategyService,
     StrategyStatus,
 )
-from .survey import MarketSurvey, SurveyInstrument
+from .survey import MarketSurvey, SharedSurveyCache, SurveyInstrument
 from .trade_rules import EntryPolicy, ExitPolicy, cost_model
 from .universe import Nifty50Universe, Nifty100Universe, UniverseError
 from .upstox_auth import UpstoxAuthError, UpstoxTokenStore
@@ -136,7 +136,7 @@ class MomentumRunRequest(BaseModel):
     entry_mode: Literal["THREE_BAR", "ROLLING_WINDOW"] = "THREE_BAR"
     exit_mode: Literal["RATCHET", "REVERSAL"] = "RATCHET"
     entry_bars: int = Field(default=3, ge=2, le=12)
-    require_nifty_confirmation: bool = False
+    require_nifty_confirmation: Literal[True] = True
     entry_cost_multiple: float = Field(default=1.0, ge=0)
     entry_noise_multiple: float = Field(default=2.0, ge=0)
     entry_timeframe_seconds: float = Field(default=0.0, ge=0, le=900)
@@ -268,6 +268,7 @@ def create_app(
     nifty50 = Nifty50Universe()
     nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
+    shared_survey_cache = SharedSurveyCache()
     daily_reports_builder = DailyReportBuilder(research_store)
     nse_holidays = holiday_calendar or NseHolidayCalendar()
 
@@ -293,6 +294,7 @@ def create_app(
             allocation_per_position=sched_config.allocation_per_position,
             entry_mode="THREE_BAR",
             exit_mode="RATCHET",
+            require_nifty_confirmation=True,
         )
         return _launch_runner(request, label=slot.label)["id"]
 
@@ -628,6 +630,7 @@ def create_app(
             accounts=accounts,
             coordinator=coordinator,
             store=research_store,
+            survey_cache=shared_survey_cache,
         )
         return momentum_runners.add(runner)
 

@@ -182,6 +182,15 @@ def test_a_batch_variant_cannot_set_a_field_that_does_not_exist() -> None:
         request.merged(request.variants[0], 0)
 
 
+def test_live_momentum_request_cannot_disable_nifty_confirmation() -> None:
+    from pydantic import ValidationError
+
+    from jupiter_trading.api import MomentumRunRequest
+
+    with pytest.raises(ValidationError):
+        MomentumRunRequest(require_nifty_confirmation=False)
+
+
 def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
     from datetime import datetime, timedelta, timezone
 
@@ -220,8 +229,8 @@ def test_schedule_plan_endpoint_returns_one_full_session_run_per_timeframe(tmp_p
     with TestClient(create_app(_paper_settings(tmp_path))) as client:
         plan = client.get("/schedule/plan", params={"session_date": "2026-08-31"}).json()
         assert plan["session_date"] == "2026-08-31"
-        assert len(plan["slots"]) == 4  # 5s, 1m, 3m, 5m
-        assert {s["entry_timeframe_seconds"] for s in plan["slots"]} == {0, 60, 180, 300}
+        assert len(plan["slots"]) == 2  # 5s and 1m
+        assert {s["entry_timeframe_seconds"] for s in plan["slots"]} == {0, 60}
         assert plan["coverage"]["covered_pct"] == 100.0
         # Every run spans the whole session, so all share the open and close.
         assert len({s["start_ist"] for s in plan["slots"]}) == 1

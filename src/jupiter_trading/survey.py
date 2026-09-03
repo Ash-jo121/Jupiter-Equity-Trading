@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import dataclass
 from statistics import median
+from threading import Condition, RLock
+from time import monotonic
 from typing import List
 
 from .market_data import UpstoxMarketData
@@ -103,6 +106,71 @@ class MarketSurvey:
             "analyzed": len(rows),
             "failures": failures,
         }
+
+
+class SharedSurveyCache:
+    """Share one expensive NIFTY survey between concurrent strategy runners.
+
+    Intraday candles are five-minute bars, so asking Upstox for the same 100
+    histories once per runner, once per minute, adds load without adding new
+    information. The first caller refreshes the snapshot while concurrent and
+    subsequent callers reuse it. A failed or partial refresh is cached only
+    briefly so the service can recover without another synchronized burst.
+    """
+
+    def __init__(self, ttl_seconds: float = 285.0, failure_ttl_seconds: float = 60.0) -> None:
+        if ttl_seconds <= 0 or failure_ttl_seconds <= 0:
+            raise ValueError("survey cache TTLs must be positive")
+        self.ttl_seconds = ttl_seconds
+        self.failure_ttl_seconds = failure_ttl_seconds
+        self._condition = Condition(RLock())
+        self._entries: dict[tuple, tuple[float, float, dict]] = {}
+        self._refreshing: set[tuple] = set()
+
+    def run(
+        self,
+        market_data: UpstoxMarketData,
+        instruments: List[SurveyInstrument],
+        minimum_relative_volume: float,
+    ) -> dict:
+        key = (
+            tuple(item.instrument_key for item in instruments),
+            round(minimum_relative_volume, 6),
+        )
+        with self._condition:
+            while True:
+                now = monotonic()
+                entry = self._entries.get(key)
+                if entry and now < entry[0]:
+                    return self._copy(entry, cache_hit=True, now=now)
+                if key not in self._refreshing:
+                    self._refreshing.add(key)
+                    break
+                self._condition.wait()
+
+        try:
+            result = MarketSurvey(market_data, minimum_relative_volume).run(instruments)
+            built_at = monotonic()
+            healthy = result["analyzed"] == result["requested"]
+            ttl = self.ttl_seconds if healthy else self.failure_ttl_seconds
+            entry = (built_at + ttl, built_at, deepcopy(result))
+            with self._condition:
+                self._entries[key] = entry
+            return self._copy(entry, cache_hit=False, now=built_at)
+        finally:
+            with self._condition:
+                self._refreshing.discard(key)
+                self._condition.notify_all()
+
+    @staticmethod
+    def _copy(entry: tuple[float, float, dict], cache_hit: bool, now: float) -> dict:
+        _expires_at, built_at, result = entry
+        payload = deepcopy(result)
+        payload["shared_cache"] = {
+            "hit": cache_hit,
+            "age_seconds": round(max(0.0, now - built_at), 2),
+        }
+        return payload
 
 
 def _relative_volume(candles) -> dict:

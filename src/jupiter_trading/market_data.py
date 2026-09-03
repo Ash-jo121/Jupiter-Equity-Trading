@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from threading import Condition
+from time import monotonic
 from typing import Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -13,6 +16,31 @@ from .domain import Quote
 
 class MarketDataError(RuntimeError):
     pass
+
+
+class _SlidingWindowRateLimiter:
+    """Process-wide guard below Upstox's standard 50 requests/second ceiling."""
+
+    def __init__(self, requests_per_second: int = 20) -> None:
+        self.requests_per_second = requests_per_second
+        self._condition = Condition()
+        self._timestamps: deque[float] = deque()
+
+    def acquire(self) -> None:
+        with self._condition:
+            while True:
+                now = monotonic()
+                while self._timestamps and now - self._timestamps[0] >= 1.0:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.requests_per_second:
+                    self._timestamps.append(now)
+                    return
+                self._condition.wait(
+                    timeout=max(0.001, 1.0 - (now - self._timestamps[0]))
+                )
+
+
+_STANDARD_API_LIMITER = _SlidingWindowRateLimiter()
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,7 @@ class UpstoxMarketData:
             },
         )
         try:
+            _STANDARD_API_LIMITER.acquire()
             with urlopen(request, timeout=self._timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:

@@ -165,11 +165,10 @@ horizon from 3 to 30 minutes, and the entry signal's forward 15-minute return wa
 indistinguishable from zero. Resampling fixes the stop's geometry; it is not a substitute for
 finding an edge, which is why this is meant to be forward-tested rather than assumed.
 
-NIFTY 50 context is recorded on every observation but does **not** gate entries by default. The
-index moves an order of magnitude less than a single stock, so a print like −0.04% is noise rather
-than a reason to stand aside, and as a hard gate it blocked entire sessions. Set
-`require_nifty_confirmation` on the run (or the dashboard's NIFTY confirmation control) to make it
-a gate again and compare.
+NIFTY 50 confirmation is mandatory for the live momentum strategy. An entry is rejected unless
+both the rolling NIFTY window and its trailing 15-minute move are positive. This is fixed in the
+API and dashboard rather than exposed as a run-time toggle, so every forward run uses the same
+broad-market guardrail.
 
 ### Exit
 
@@ -264,10 +263,10 @@ The point of the automation layer is to sweep configurations unattended while
 the market is open, so patterns can accumulate over days without anyone at the
 keyboard. `SCHEDULER_ENABLED=true` turns it on.
 
-At the open the scheduler launches **one full-session run per entry timeframe**:
-5s ticks, 1m, 3m, and 5m bars. Every run spans 09:15-15:30, holds the same
+At the open the scheduler launches **two full-session runs**: 5s ticks and 1m
+bars. Every run spans 09:15-15:30, holds the same
 `SCHEDULER_MAX_POSITIONS` (default 5), and is identical but for its entry
-timeframe - so the day's four P&L numbers are a clean, like-for-like comparison
+timeframe - so the day's two P&L numbers are a clean, like-for-like comparison
 of that one axis, over the identical universe and session. Duration and position
 count are held fixed on purpose: duration is a sampling window, not a strategy
 knob, and fixing it at the whole session removes the end-of-session liquidation
@@ -275,6 +274,12 @@ artifact and gives the most representative sample. Each run is on its own paper
 account, because concurrent runs sharing an account would fight over cash and
 positions - so each account is funded with `SCHEDULER_INITIAL_CASH`, which must
 cover `max_positions x allocation`.
+
+The two runners share one cached NIFTY 100 survey. Five-minute intraday candles
+are refreshed once per five-minute window and the process-wide Upstox client is
+throttled below the standard per-second limit. Partial or rate-limited scans are
+reported as degraded data in the run detail instead of being presented as a
+conclusive no-trade result.
 
 A full-session run would exhaust the universe by mid-morning under the old
 "trade each stock once per run" rule, so automated runs use a **re-entry

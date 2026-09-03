@@ -14,7 +14,7 @@ from .domain import Order, OrderType, Product, Quote, Side, Validity
 from .market_data import UpstoxMarketData
 from .research_store import ResearchStore
 from .strategy_engine import MarketCoordinator
-from .survey import MarketSurvey, SurveyInstrument
+from .survey import MarketSurvey, SharedSurveyCache, SurveyInstrument
 from .trade_rules import (
     BarAggregator,
     EntryPolicy,
@@ -50,7 +50,7 @@ class MomentumRunnerConfig:
     entry_mode: str = "THREE_BAR"
     exit_mode: str = "RATCHET"
     entry_bars: int = 3
-    require_nifty_confirmation: bool = False
+    require_nifty_confirmation: bool = True
     minimum_cost_floor_pct: float = 0.01
     entry_cost_multiple: float = 1.0
     entry_noise_multiple: float = 2.0
@@ -135,6 +135,7 @@ class MomentumReversalRunner:
         coordinator: MarketCoordinator,
         runner_id: Optional[str] = None,
         store: Optional[ResearchStore] = None,
+        survey_cache: Optional[SharedSurveyCache] = None,
     ) -> None:
         self.id = runner_id or str(uuid4())
         self.config = config
@@ -143,6 +144,7 @@ class MomentumReversalRunner:
         self.accounts = accounts
         self.coordinator = coordinator
         self.store = store
+        self.survey_cache = survey_cache
         self._symbols = {item.instrument_key: item.symbol for item in self.instruments}
         self._lock = RLock()
         self._stop = Event()
@@ -168,6 +170,15 @@ class MomentumReversalRunner:
         self._cooldown_until: Dict[str, datetime] = {}
         self._events: list[dict] = []
         self._errors: list[str] = []
+        self._data_health = {
+            "status": "WAITING",
+            "requested": len(self.instruments),
+            "analyzed": 0,
+            "failures": 0,
+            "rate_limited": 0,
+            "cache_hit": False,
+            "cache_age_seconds": None,
+        }
         self._dirty = False
         self._flushed_observations = 0
         self._history_size = max(13, config.entry_bars)
@@ -254,6 +265,7 @@ class MomentumReversalRunner:
                 "events": list(self._events),
                 "monitoring": list(self._monitoring),
                 "errors": list(self._errors),
+                "data_health": dict(self._data_health),
                 "fills": fills,
                 "metrics": {
                     "gross_pnl": round(gross_pnl, 2),
@@ -288,9 +300,17 @@ class MomentumReversalRunner:
 
     def _scan(self) -> None:
         try:
-            result = MarketSurvey(
-                self.market_data, self.config.minimum_relative_volume
-            ).run(self.instruments)
+            result = (
+                self.survey_cache.run(
+                    self.market_data,
+                    self.instruments,
+                    self.config.minimum_relative_volume,
+                )
+                if self.survey_cache
+                else MarketSurvey(
+                    self.market_data, self.config.minimum_relative_volume
+                ).run(self.instruments)
+            )
             candidates = [
                 row
                 for row in result["results"]
@@ -315,6 +335,19 @@ class MomentumReversalRunner:
                     }
             except Exception as error:  # noqa: BLE001 - context must not stop trading
                 market_context_error = str(error)[:200]
+            requested = result.get("requested", len(self.instruments))
+            analyzed = result["analyzed"]
+            rate_limited = sum(
+                "429" in failure.get("error", "")
+                or "rate limited" in failure.get("error", "").lower()
+                for failure in result["failures"]
+            )
+            data_status = (
+                "UNAVAILABLE"
+                if analyzed == 0
+                else "DEGRADED" if analyzed < requested else "OK"
+            )
+            cache = result.get("shared_cache", {})
             with self._lock:
                 self._scan_count += 1
                 self._candidates = {row["instrument_key"]: row for row in candidates}
@@ -336,10 +369,23 @@ class MomentumReversalRunner:
                     }
                     for row in result["results"]
                 }
+                self._data_health = {
+                    "status": data_status,
+                    "requested": requested,
+                    "analyzed": analyzed,
+                    "failures": len(result["failures"]),
+                    "rate_limited": rate_limited,
+                    "cache_hit": bool(cache.get("hit", False)),
+                    "cache_age_seconds": cache.get("age_seconds"),
+                }
                 self._record(
                     "SCAN",
                     {
-                        "analyzed": result["analyzed"],
+                        "requested": requested,
+                        "analyzed": analyzed,
+                        "data_status": data_status,
+                        "rate_limited": rate_limited,
+                        "shared_cache": cache,
                         "failures": result["failures"],
                         "candidates": [row["symbol"] for row in candidates],
                         "low_volume_rejections": [
