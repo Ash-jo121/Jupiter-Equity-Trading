@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .accounts import PaperAccountManager
 from .domain import Order, OrderType, Product, Quote, Side, Validity
-from .market_data import UpstoxMarketData
+from .market_data import SharedQuoteCache, UpstoxMarketData
 from .research_store import ResearchStore
 from .strategy_engine import MarketCoordinator
 from .survey import MarketSurvey, SharedSurveyCache, SurveyInstrument
@@ -50,7 +50,7 @@ class MomentumRunnerConfig:
     entry_mode: str = "THREE_BAR"
     exit_mode: str = "RATCHET"
     entry_bars: int = 3
-    require_nifty_confirmation: bool = True
+    require_nifty_confirmation: bool = False
     minimum_cost_floor_pct: float = 0.01
     entry_cost_multiple: float = 1.0
     entry_noise_multiple: float = 2.0
@@ -136,6 +136,7 @@ class MomentumReversalRunner:
         runner_id: Optional[str] = None,
         store: Optional[ResearchStore] = None,
         survey_cache: Optional[SharedSurveyCache] = None,
+        quote_cache: Optional[SharedQuoteCache] = None,
     ) -> None:
         self.id = runner_id or str(uuid4())
         self.config = config
@@ -145,10 +146,13 @@ class MomentumReversalRunner:
         self.coordinator = coordinator
         self.store = store
         self.survey_cache = survey_cache
+        self.quote_cache = quote_cache
         self._symbols = {item.instrument_key: item.symbol for item in self.instruments}
         self._lock = RLock()
         self._stop = Event()
         self._thread: Optional[Thread] = None
+        self._scan_thread: Optional[Thread] = None
+        self._accept_background_scans = False
         self._status = "DRAFT"
         self._started_at: Optional[str] = None
         self._finished_at: Optional[str] = None
@@ -197,6 +201,7 @@ class MomentumReversalRunner:
             if self._status != "DRAFT":
                 raise ValueError("runner has already been started")
             self._status = "RUNNING"
+            self._accept_background_scans = True
             self._started_at = self._now()
             self._record("STARTED", {"config": asdict(self.config)})
             self._thread = Thread(
@@ -283,7 +288,7 @@ class MomentumReversalRunner:
             while monotonic() < deadline and not self._stop.is_set():
                 now = monotonic()
                 if now >= next_scan:
-                    self._scan()
+                    self._request_scan()
                     next_scan = now + self.config.rescan_interval_seconds
                 self._poll()
                 remaining = max(0.0, deadline - monotonic())
@@ -291,6 +296,8 @@ class MomentumReversalRunner:
         except Exception as error:  # noqa: BLE001 - keeps cleanup and liquidation running
             self._error(error)
         finally:
+            with self._lock:
+                self._accept_background_scans = False
             self._liquidate()
             with self._lock:
                 self._status = "FAILED" if self._errors else "COMPLETED"
@@ -298,13 +305,30 @@ class MomentumReversalRunner:
                 self._record("FINISHED", {"session_pnl": self.snapshot()["session_pnl"]})
                 self._persist()
 
-    def _scan(self) -> None:
+    def _request_scan(self) -> None:
+        """Refresh discovery off-thread so live monitoring never waits on candles."""
+
+        with self._lock:
+            if self._scan_thread and self._scan_thread.is_alive():
+                return
+            self._scan_thread = Thread(
+                target=self._background_scan,
+                name=f"momentum-scan-{self.id[:8]}",
+                daemon=True,
+            )
+            self._scan_thread.start()
+
+    def _background_scan(self) -> None:
+        self._scan(background=True)
+
+    def _scan(self, background: bool = False) -> None:
         try:
             result = (
                 self.survey_cache.run(
                     self.market_data,
                     self.instruments,
                     self.config.minimum_relative_volume,
+                    context_instrument_key=NIFTY50_INDEX_KEY,
                 )
                 if self.survey_cache
                 else MarketSurvey(
@@ -319,22 +343,30 @@ class MomentumReversalRunner:
                 and row["momentum_score"] >= self.config.minimum_score
                 and row["recent_15m_change_pct"] > 0
             ][: self.config.candidate_limit]
-            market_context_error = None
-            try:
-                nifty_candles = self.market_data.intraday_candles(
-                    NIFTY50_INDEX_KEY, "minutes", 5
-                )
-                if nifty_candles:
-                    self._market_bases = {
+            market_context = result.get("market_context")
+            if market_context is None:
+                # A runner without the application-wide cache keeps the same
+                # standalone behaviour used by tests and direct integrations.
+                try:
+                    nifty_candles = self.market_data.intraday_candles(
+                        NIFTY50_INDEX_KEY, "minutes", 5
+                    )
+                    market_context = {
                         "session_open": nifty_candles[0].open,
                         "recent_15m": (
                             nifty_candles[-4].close
                             if len(nifty_candles) >= 4
                             else nifty_candles[0].close
                         ),
+                        "error": None,
                     }
-            except Exception as error:  # noqa: BLE001 - context must not stop trading
-                market_context_error = str(error)[:200]
+                except Exception as error:  # noqa: BLE001 - descriptive context only
+                    market_context = {
+                        "session_open": None,
+                        "recent_15m": None,
+                        "error": str(error)[:200],
+                    }
+            market_context_error = market_context.get("error")
             requested = result.get("requested", len(self.instruments))
             analyzed = result["analyzed"]
             rate_limited = sum(
@@ -349,7 +381,14 @@ class MomentumReversalRunner:
             )
             cache = result.get("shared_cache", {})
             with self._lock:
+                if background and not self._accept_background_scans:
+                    return
                 self._scan_count += 1
+                if market_context.get("session_open") is not None:
+                    self._market_bases = {
+                        "session_open": market_context["session_open"],
+                        "recent_15m": market_context.get("recent_15m"),
+                    }
                 self._candidates = {row["instrument_key"]: row for row in candidates}
                 # Held positions drop out of the candidate list, but the trailing
                 # stop still wants their latest participation reading.
@@ -403,7 +442,10 @@ class MomentumReversalRunner:
                 )
             self._persist()
         except Exception as error:  # noqa: BLE001 - an individual rescan may recover
-            self._error(error)
+            with self._lock:
+                should_record = not background or self._accept_background_scans
+            if should_record:
+                self._error(error)
 
     def _poll(self) -> None:
         with self._lock:
@@ -412,7 +454,15 @@ class MomentumReversalRunner:
         if not keys:
             return
         try:
-            quotes = self.market_data.ltp(keys)
+            quotes = (
+                self.quote_cache.get(
+                    self.market_data,
+                    keys,
+                    max_age_seconds=max(0.001, self.config.poll_interval_seconds * 0.9),
+                )
+                if self.quote_cache
+                else self.market_data.ltp(keys)
+            )
         except Exception as error:  # noqa: BLE001 - an individual poll may recover
             self._error(error)
             return

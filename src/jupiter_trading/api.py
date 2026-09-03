@@ -17,7 +17,7 @@ from .daily_report import DailyReportBuilder
 from .domain import DepthLevel, Order, OrderType, Product, Quote, Side, Validity
 from .holiday_calendar import HolidayCalendarError, NseHolidayCalendar
 from .instrument_search import InstrumentSearchError, UpstoxInstrumentSearch
-from .market_data import MarketDataError, UpstoxMarketData
+from .market_data import MarketDataError, SharedQuoteCache, UpstoxMarketData
 from .market_stream import UpstoxMarketStream
 from .momentum_runner import (
     MomentumReversalRunner,
@@ -136,7 +136,7 @@ class MomentumRunRequest(BaseModel):
     entry_mode: Literal["THREE_BAR", "ROLLING_WINDOW"] = "THREE_BAR"
     exit_mode: Literal["RATCHET", "REVERSAL"] = "RATCHET"
     entry_bars: int = Field(default=3, ge=2, le=12)
-    require_nifty_confirmation: Literal[True] = True
+    require_nifty_confirmation: bool = False
     entry_cost_multiple: float = Field(default=1.0, ge=0)
     entry_noise_multiple: float = Field(default=2.0, ge=0)
     entry_timeframe_seconds: float = Field(default=0.0, ge=0, le=900)
@@ -269,6 +269,7 @@ def create_app(
     nifty100 = Nifty100Universe()
     momentum_runners = MomentumRunnerService(research_store)
     shared_survey_cache = SharedSurveyCache()
+    shared_quote_cache = SharedQuoteCache()
     daily_reports_builder = DailyReportBuilder(research_store)
     nse_holidays = holiday_calendar or NseHolidayCalendar()
 
@@ -294,7 +295,7 @@ def create_app(
             allocation_per_position=sched_config.allocation_per_position,
             entry_mode="THREE_BAR",
             exit_mode="RATCHET",
-            require_nifty_confirmation=True,
+            require_nifty_confirmation=False,
         )
         return _launch_runner(request, label=slot.label)["id"]
 
@@ -367,6 +368,7 @@ def create_app(
     app.state.backtests = backtests
     app.state.exit_replays = exit_replays
     app.state.momentum_runners = momentum_runners
+    app.state.shared_quote_cache = shared_quote_cache
     app.state.scheduler = scheduler
     app.state.token_store = token_store
     app.state.daily_reports = daily_reports_builder
@@ -631,6 +633,7 @@ def create_app(
             coordinator=coordinator,
             store=research_store,
             survey_cache=shared_survey_cache,
+            quote_cache=shared_quote_cache,
         )
         return momentum_runners.add(runner)
 

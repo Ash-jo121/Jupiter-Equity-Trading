@@ -4,7 +4,7 @@ import json
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from threading import Condition
+from threading import Condition, RLock
 from time import monotonic
 from typing import Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
@@ -41,6 +41,86 @@ class _SlidingWindowRateLimiter:
 
 
 _STANDARD_API_LIMITER = _SlidingWindowRateLimiter()
+
+
+class SharedQuoteCache:
+    """Coalesce near-simultaneous LTP reads from concurrent strategy runners.
+
+    Each instrument is timestamped independently. A second runner reuses fresh
+    quotes and requests only keys that were absent from the first runner's
+    batch, so differently configured runs still see all of their own symbols.
+    """
+
+    def __init__(self, ttl_seconds: float = 4.5) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("quote cache TTL must be positive")
+        self.ttl_seconds = ttl_seconds
+        self._condition = Condition(RLock())
+        self._quotes: dict[str, tuple[float, Quote]] = {}
+        self._refreshing = False
+        self._requests = 0
+        self._cache_hits = 0
+
+    def get(
+        self,
+        market_data: UpstoxMarketData,
+        instrument_keys: Iterable[str],
+        max_age_seconds: Optional[float] = None,
+    ) -> Dict[str, Quote]:
+        keys = list(dict.fromkeys(instrument_keys))
+        if not keys:
+            return {}
+        max_age = min(
+            self.ttl_seconds,
+            max_age_seconds if max_age_seconds is not None else self.ttl_seconds,
+        )
+        if max_age <= 0:
+            raise ValueError("quote maximum age must be positive")
+
+        with self._condition:
+            while True:
+                now = monotonic()
+                missing = [
+                    key
+                    for key in keys
+                    if key not in self._quotes
+                    or now - self._quotes[key][0] >= max_age
+                ]
+                if not missing:
+                    self._cache_hits += 1
+                    return {key: self._quotes[key][1] for key in keys}
+                if not self._refreshing:
+                    self._refreshing = True
+                    break
+                self._condition.wait()
+
+        try:
+            fresh = market_data.ltp(missing)
+            fetched_at = monotonic()
+            with self._condition:
+                self._requests += 1
+                for key, quote_value in fresh.items():
+                    self._quotes[key] = (fetched_at, quote_value)
+        finally:
+            with self._condition:
+                self._refreshing = False
+                self._condition.notify_all()
+
+        with self._condition:
+            return {
+                key: self._quotes[key][1]
+                for key in keys
+                if key in self._quotes
+                and monotonic() - self._quotes[key][0] < max_age
+            }
+
+    def stats(self) -> dict:
+        with self._condition:
+            return {
+                "requests": self._requests,
+                "cache_hits": self._cache_hits,
+                "instruments": len(self._quotes),
+            }
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from statistics import median
 from threading import Condition, RLock
 from time import monotonic
-from typing import List
+from typing import List, Optional
 
 from .market_data import UpstoxMarketData
 
@@ -132,10 +132,12 @@ class SharedSurveyCache:
         market_data: UpstoxMarketData,
         instruments: List[SurveyInstrument],
         minimum_relative_volume: float,
+        context_instrument_key: Optional[str] = None,
     ) -> dict:
         key = (
             tuple(item.instrument_key for item in instruments),
             round(minimum_relative_volume, 6),
+            context_instrument_key,
         )
         with self._condition:
             while True:
@@ -150,6 +152,10 @@ class SharedSurveyCache:
 
         try:
             result = MarketSurvey(market_data, minimum_relative_volume).run(instruments)
+            if context_instrument_key:
+                result["market_context"] = _candle_context(
+                    market_data, context_instrument_key
+                )
             built_at = monotonic()
             healthy = result["analyzed"] == result["requested"]
             ttl = self.ttl_seconds if healthy else self.failure_ttl_seconds
@@ -171,6 +177,30 @@ class SharedSurveyCache:
             "age_seconds": round(max(0.0, now - built_at), 2),
         }
         return payload
+
+
+def _candle_context(
+    market_data: UpstoxMarketData, instrument_key: str
+) -> dict:
+    """Capture shared session and trailing-15-minute reference prices."""
+
+    try:
+        candles = market_data.intraday_candles(instrument_key, "minutes", 5)
+        if not candles:
+            raise ValueError("intraday candles were not returned")
+        return {
+            "session_open": candles[0].open,
+            "recent_15m": (
+                candles[-4].close if len(candles) >= 4 else candles[0].close
+            ),
+            "error": None,
+        }
+    except Exception as error:  # noqa: BLE001 - context is descriptive, not a gate
+        return {
+            "session_open": None,
+            "recent_15m": None,
+            "error": str(error)[:200],
+        }
 
 
 def _relative_volume(candles) -> dict:

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 import pytest
 
@@ -90,6 +91,67 @@ def test_shared_survey_cache_reuses_one_market_snapshot() -> None:
     assert market.candle_calls == 1
     assert first["shared_cache"]["hit"] is False
     assert second["shared_cache"]["hit"] is True
+
+
+def test_shared_survey_cache_includes_one_shared_nifty_context_read() -> None:
+    market = CountingSurveyMarket()
+    cache = SharedSurveyCache(ttl_seconds=300)
+    instruments = [SurveyInstrument("TEST", "NSE_EQ|TEST")]
+
+    first = cache.run(
+        market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY
+    )
+    second = cache.run(
+        market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY
+    )
+
+    assert market.ltp_calls == 1
+    assert market.candle_calls == 2  # one stock plus one shared NIFTY baseline
+    assert first["market_context"] == second["market_context"]
+    assert second["shared_cache"]["hit"] is True
+
+
+def test_background_survey_does_not_block_live_quote_polling(tmp_path) -> None:
+    class BlockingSurveyMarket(CountingSurveyMarket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.candle_started = Event()
+            self.release_candle = Event()
+
+        def intraday_candles(self, instrument_key, unit, interval):
+            if instrument_key == "NSE_EQ|TEST":
+                self.candle_started.set()
+                assert self.release_candle.wait(timeout=2)
+            return super().intraday_candles(instrument_key, unit, interval)
+
+    market = BlockingSurveyMarket()
+    accounts = PaperAccountManager(
+        repository=InMemoryRepository(),
+        initial_cash=100_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    store = ResearchStore(str(tmp_path / "research.db"))
+    runner = MomentumReversalRunner(
+        config=MomentumRunnerConfig(account_id="default"),
+        instruments=[SurveyInstrument("TEST", "NSE_EQ|TEST")],
+        market_data=market,
+        accounts=accounts,
+        coordinator=MarketCoordinator(accounts, StrategyService(accounts, store)),
+        survey_cache=SharedSurveyCache(ttl_seconds=300),
+    )
+    runner._status = "RUNNING"
+    runner._accept_background_scans = True
+
+    runner._request_scan()
+    assert market.candle_started.wait(timeout=1)
+    runner._poll()
+
+    assert runner.snapshot()["poll_count"] == 1
+    market.release_candle.set()
+    runner._scan_thread.join(timeout=2)
+    assert runner.snapshot()["scan_count"] == 1
 
 
 def test_legacy_reversal_mode_buys_momentum_and_sells_reversal(tmp_path) -> None:
@@ -356,8 +418,8 @@ def test_the_three_bar_verdict_is_recorded_even_when_another_gate_blocks(tmp_pat
     assert not runner.snapshot()["open_positions"]
 
 
-def test_a_small_negative_nifty_print_blocks_an_entry_by_default(tmp_path) -> None:
-    """The production strategy always requires positive short-term NIFTY momentum."""
+def test_a_small_negative_nifty_print_does_not_block_an_entry_by_default(tmp_path) -> None:
+    """NIFTY is recorded as context but does not change today's entry strategy."""
 
     accounts = PaperAccountManager(
         repository=InMemoryRepository(),
@@ -373,7 +435,7 @@ def test_a_small_negative_nifty_print_blocks_an_entry_by_default(tmp_path) -> No
         market_data=FallingNiftyMarket(),
         accounts=accounts,
         coordinator=MarketCoordinator(accounts, strategies),
-        runner_id="nifty-required",
+        runner_id="nifty-context-only",
     )
 
     runner._scan()
@@ -381,8 +443,8 @@ def test_a_small_negative_nifty_print_blocks_an_entry_by_default(tmp_path) -> No
         runner._poll()
 
     snapshot = runner.snapshot()
-    assert not accounts.get().orders
-    assert "NIFTY_SHORT_TERM_NOT_POSITIVE" in {
+    assert any(order.side == Side.BUY for order in accounts.get().orders.values())
+    assert "NIFTY_SHORT_TERM_NOT_POSITIVE" not in {
         row["decision"] for row in snapshot["monitoring"]
     }
     assert all(row["nifty_price"] is not None for row in snapshot["monitoring"])

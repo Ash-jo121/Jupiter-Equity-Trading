@@ -165,10 +165,9 @@ horizon from 3 to 30 minutes, and the entry signal's forward 15-minute return wa
 indistinguishable from zero. Resampling fixes the stop's geometry; it is not a substitute for
 finding an edge, which is why this is meant to be forward-tested rather than assumed.
 
-NIFTY 50 confirmation is mandatory for the live momentum strategy. An entry is rejected unless
-both the rolling NIFTY window and its trailing 15-minute move are positive. This is fixed in the
-API and dashboard rather than exposed as a run-time toggle, so every forward run uses the same
-broad-market guardrail.
+NIFTY 50 momentum is recorded with every observation as market context, but it does not block an
+entry in the default live strategy. Entries continue to be decided by the stock's three-bar price
+movement, cost/noise threshold, and relative-volume confirmation.
 
 ### Exit
 
@@ -275,11 +274,14 @@ account, because concurrent runs sharing an account would fight over cash and
 positions - so each account is funded with `SCHEDULER_INITIAL_CASH`, which must
 cover `max_positions x allocation`.
 
-The two runners share one cached NIFTY 100 survey. Five-minute intraday candles
-are refreshed once per five-minute window and the process-wide Upstox client is
-throttled below the standard per-second limit. Partial or rate-limited scans are
-reported as degraded data in the run detail instead of being presented as a
-conclusive no-trade result.
+The two runners share one cached NIFTY 100 survey, one NIFTY context baseline,
+and one short-lived live-quote cache. Five-minute intraday candles are refreshed
+in a background worker once per five-minute window, so a slow survey does not
+pause five-second position monitoring. Near-simultaneous runner polls reuse the
+same timestamped Upstox quote and request only any missing instruments. The
+process-wide Upstox client is also throttled below the standard per-second
+limit. Partial or rate-limited scans are reported as degraded data in the run
+detail instead of being presented as a conclusive no-trade result.
 
 A full-session run would exhaust the universe by mid-morning under the old
 "trade each stock once per run" rule, so automated runs use a **re-entry

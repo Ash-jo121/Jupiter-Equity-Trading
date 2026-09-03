@@ -182,13 +182,10 @@ def test_a_batch_variant_cannot_set_a_field_that_does_not_exist() -> None:
         request.merged(request.variants[0], 0)
 
 
-def test_live_momentum_request_cannot_disable_nifty_confirmation() -> None:
-    from pydantic import ValidationError
-
+def test_live_momentum_request_does_not_gate_on_nifty_by_default() -> None:
     from jupiter_trading.api import MomentumRunRequest
 
-    with pytest.raises(ValidationError):
-        MomentumRunRequest(require_nifty_confirmation=False)
+    assert MomentumRunRequest().require_nifty_confirmation is False
 
 
 def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
