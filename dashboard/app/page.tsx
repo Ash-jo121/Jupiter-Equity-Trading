@@ -133,7 +133,14 @@ function LatestRun({run,openRun}:{run?:MomentumRun;openRun:(id:string)=>void}) {
 
 function RunsView({runs,openRun}:{runs:MomentumRun[];openRun:(id:string)=>void}) {return <section className="runs-page"><div className="page-title"><div><p className="eyebrow">Run archive</p><h1>Every test.<br/><em>Every outcome.</em></h1><p>Completed and active momentum runs, kept separately from legacy strategies.</p></div><div className="archive-count"><strong>{runs.length}</strong><span>total runs</span></div></div>{runs.length?<div className="runs-list">{runs.map((run,index)=><button className="run-row" key={run.id} onClick={()=>openRun(run.id)}><span className="run-number">{String(runs.length-index).padStart(2,'0')}</span><div className="run-main"><span className={`status ${run.status.toLowerCase()}`}>{run.status}</span><h2>{formatDate(run.started_at)}</h2><small>{Math.round(run.config.duration_seconds/60)} min · {run.scan_count} scans · {new Set(run.fills.map(fill=>fill.symbol)).size} stocks</small></div><div className="run-symbols">{[...new Set(run.fills.map(fill=>fill.symbol))].slice(0,4).map(symbol=><span key={symbol}>{symbol}</span>)}</div><div className="run-result"><small>Net P&L</small><strong className={run.session_pnl>=0?'positive':'negative'}>{signedMoney(run.session_pnl)}</strong><span>{money.format(run.portfolio.equity)} final equity</span></div><span className="row-arrow">→</span></button>)}</div>:<Empty text="No runs have been recorded yet."/>}</section>}
 
-function RunDetail({run,back}:{run:MomentumRun;back:()=>void}) {const outcomes=useMemo(()=>runOutcomes(run),[run]);const duration=run.started_at&&run.finished_at?(new Date(run.finished_at).getTime()-new Date(run.started_at).getTime())/60000:run.config.duration_seconds/60;const gross=run.metrics?.gross_pnl??outcomes.reduce((sum,row)=>sum+row.grossPnl,0),fees=run.metrics?.fees??outcomes.reduce((sum,row)=>sum+row.fees,0);return <section className="run-detail"><button className="back-button" onClick={back}>← All runs</button><div className="detail-title"><div><span className={`status ${run.status.toLowerCase()}`}>{run.status}</span><p className="eyebrow">Momentum run · {run.id.slice(0,8)}</p><h1>{formatDate(run.started_at)}</h1><p>{number.format(duration)} minutes · {run.scan_count} {universeName(run)} survey cycles · {run.poll_count} price polls</p></div><div className={`result-orb ${run.session_pnl>=0?'gain':'loss'}`}><span>Net result</span><strong>{signedMoney(run.session_pnl)}</strong><small>{signedPct((run.session_pnl/(run.initial_equity||run.portfolio.initial_cash))*100)}</small></div></div><section className="detail-kpis"><Metric label="Starting equity" value={money.format(run.initial_equity||run.portfolio.initial_cash)}/><Metric label="Final equity" value={money.format(run.portfolio.equity)}/><Metric label="Gross trading P&L" value={signedMoney(gross)} tone={gross>=0?'positive':'negative'}/><Metric label="Execution costs" value={money.format(fees)}/></section><CostFloorPanel run={run}/><EntryEvidence run={run}/><PositionLedger run={run}/><DecisionFunnel run={run}/><MonitoringTrace run={run}/><ReplayPanel run={run}/><section className="panel outcome-panel"><div className="panel-head"><div><p className="eyebrow">Stock outcomes</p><h2>Round trips</h2></div><span className="count">{outcomes.length} stocks</span></div>{outcomes.length?<div className="table-wrap"><table><thead><tr><th>Stock</th><th>Qty</th><th>Buy</th><th>Sell</th><th>Exit</th><th>Gross P&L</th><th>Fees</th><th>Net P&L</th></tr></thead><tbody>{outcomes.map(row=><tr key={row.symbol}><td className="stock-name">{row.symbol}</td><td>{row.quantity}</td><td>{money.format(row.buyPrice)}</td><td>{row.sellPrice?money.format(row.sellPrice):'Open'}</td><td><span className="reason">{row.exitReason}</span></td><td className={row.grossPnl>=0?'positive':'negative'}>{signedMoney(row.grossPnl)}</td><td>{money.format(row.fees)}</td><td className={row.netPnl>=0?'positive':'negative'}><strong>{signedMoney(row.netPnl)}</strong></td></tr>)}</tbody></table></div>:<Empty text="This run did not find enough movement to place a trade."/>}</section><section className="detail-grid"><article className="panel"><div className="panel-head"><div><p className="eyebrow">Execution timeline</p><h2>Entries and exits</h2></div></div><div className="timeline">{run.events.filter(event=>['ENTRY_FILLED','EXIT_FILLED'].includes(event.type)).map((event,index)=><div className="timeline-row" key={`${event.timestamp}-${index}`}><span className={`timeline-dot ${event.type==='ENTRY_FILLED'?'buy':'sell'}`}/><div><strong>{event.symbol}</strong><small>{event.type==='ENTRY_FILLED'?'Position opened':`Closed · ${(event.reason||'').replaceAll('_',' ')}`}</small></div><b>{event.observed_price?money.format(event.observed_price):'—'}</b><time>{formatTime(event.timestamp)}</time></div>)}</div></article><article className="panel"><div className="panel-head"><div><p className="eyebrow">Run settings</p><h2>Guardrails used</h2></div></div><dl className="settings-list"><div><dt>Tradable universe</dt><dd>{universeName(run)}</dd></div><div><dt>Capital per position</dt><dd>{money.format(run.config.allocation_per_position)}</dd></div><div><dt>Maximum positions</dt><dd>{run.config.max_positions}</dd></div><div><dt>Entry momentum</dt><dd>+{run.config.entry_momentum_pct}%</dd></div><div><dt>NIFTY momentum</dt><dd>{run.config.require_nifty_confirmation?'Required positive':'Recorded, not gated'}</dd></div><div><dt>Relative volume</dt><dd>≥{(run.config.minimum_relative_volume||1.2).toFixed(2)}×</dd></div><div><dt>Entry rule</dt><dd>{(run.config.entry_mode||'ROLLING_WINDOW').replaceAll('_',' ').toLowerCase()}{run.config.entry_bars?` · ${run.config.entry_bars} bars`:''}</dd></div><div><dt>Entry timeframe</dt><dd>{run.config.entry_timeframe_seconds?`${run.config.entry_timeframe_seconds/60}-minute bars`:'5-second ticks'}</dd></div><div><dt>Entry bar</dt><dd>max of {run.config.entry_momentum_pct}%, {run.config.entry_cost_multiple??1}× cost, {run.config.entry_noise_multiple??2}× noise</dd></div><div><dt>Exit rule</dt><dd>{(run.config.exit_mode||'REVERSAL').toLowerCase()}</dd></div>{run.config.exit_mode==='RATCHET'?<><div><dt>Survive stop</dt><dd>{run.config.survive_stop_multiple}× floor</dd></div><div><dt>Lock at</dt><dd>{run.config.lock_multiple}× floor</dd></div><div><dt>Ride from</dt><dd>{run.config.ride_multiple}× floor</dd></div><div><dt>Trail window</dt><dd>{run.config.trail_window} samples</dd></div><div><dt>Fast trail on decay</dt><dd>{run.config.fast_trail_window} samples</dd></div><div><dt>Confirmation</dt><dd>{run.config.confirmation_samples} bars</dd></div><div><dt>Time stop</dt><dd>{run.config.time_stop_seconds}s</dd></div></>:<><div><dt>Trailing reversal</dt><dd>−{run.config.reversal_pct}%</dd></div><div><dt>Hard stop</dt><dd>−{run.config.hard_stop_pct}%</dd></div></>}</dl>{run.errors.length>0&&<div className="error-box">{run.errors.join(' · ')}</div>}</article></section></section>}
+const RUN_REPORT_SECTIONS={overview:'Overview',trades:'Entry & exit',monitoring:'Price trace',replay:'Replay'} as const;
+type RunReportSection=keyof typeof RUN_REPORT_SECTIONS;
+
+function RunReportTabs({value,onChange}:{value:RunReportSection;onChange:(value:RunReportSection)=>void}) {
+  return <nav className="report-tabs" role="tablist" aria-label="Run report sections">{Object.entries(RUN_REPORT_SECTIONS).map(([key,label])=><button key={key} role="tab" aria-selected={value===key} className={value===key?'active':''} onClick={()=>onChange(key as RunReportSection)}>{label}</button>)}</nav>;
+}
+
+function RunDetail({run,back}:{run:MomentumRun;back:()=>void}) {const [section,setSection]=useState<RunReportSection>('overview'),[entryOpen,setEntryOpen]=useState(false),[exitOpen,setExitOpen]=useState(false);const outcomes=useMemo(()=>runOutcomes(run),[run]);const duration=run.started_at&&run.finished_at?(new Date(run.finished_at).getTime()-new Date(run.started_at).getTime())/60000:run.config.duration_seconds/60;const gross=run.metrics?.gross_pnl??outcomes.reduce((sum,row)=>sum+row.grossPnl,0),fees=run.metrics?.fees??outcomes.reduce((sum,row)=>sum+row.fees,0);return <section className={`run-detail run-section-${section}`}><button className="back-button" onClick={back}>← All runs</button><div className="detail-title"><div><span className={`status ${run.status.toLowerCase()}`}>{run.status}</span><p className="eyebrow">Momentum run · {run.id.slice(0,8)}</p><h1>{formatDate(run.started_at)}</h1><p>{number.format(duration)} minutes · {run.scan_count} {universeName(run)} survey cycles · {run.poll_count} price polls</p></div><div className={`result-orb ${run.session_pnl>=0?'gain':'loss'}`}><span>Net result</span><strong>{signedMoney(run.session_pnl)}</strong><small>{signedPct((run.session_pnl/(run.initial_equity||run.portfolio.initial_cash))*100)}</small></div></div><section className="detail-kpis"><Metric label="Starting equity" value={money.format(run.initial_equity||run.portfolio.initial_cash)}/><Metric label="Final equity" value={money.format(run.portfolio.equity)}/><Metric label="Gross trading P&L" value={signedMoney(gross)} tone={gross>=0?'positive':'negative'}/><Metric label="Execution costs" value={money.format(fees)}/></section><RunReportTabs value={section} onChange={setSection}/><CostFloorPanel run={run}/><div className="accordion-stack"><section className="analysis-accordion"><button className="accordion-trigger" aria-expanded={entryOpen} onClick={()=>setEntryOpen(open=>!open)}><span><small>Entry analysis</small><strong>Why positions were opened</strong></span><span>{run.events.filter(event=>event.type==='ENTRY_FILLED').length} entries <b>{entryOpen?'−':'+'}</b></span></button>{entryOpen&&<EntryEvidence run={run}/>}</section><section className="analysis-accordion"><button className="accordion-trigger" aria-expanded={exitOpen} onClick={()=>setExitOpen(open=>!open)}><span><small>Exit analysis</small><strong>How positions were managed</strong></span><span>{run.events.filter(event=>event.type==='EXIT_FILLED').length} exits <b>{exitOpen?'−':'+'}</b></span></button>{exitOpen&&<PositionLedger run={run}/>}</section></div><DecisionFunnel run={run}/><MonitoringTrace run={run}/><ReplayPanel run={run}/><section className="panel outcome-panel"><div className="panel-head"><div><p className="eyebrow">Stock outcomes</p><h2>Round trips</h2></div><span className="count">{outcomes.length} stocks</span></div>{outcomes.length?<div className="table-wrap"><table><thead><tr><th>Stock</th><th>Qty</th><th>Buy</th><th>Sell</th><th>Exit</th><th>Gross P&L</th><th>Fees</th><th>Net P&L</th></tr></thead><tbody>{outcomes.map(row=><tr key={row.symbol}><td className="stock-name">{row.symbol}</td><td>{row.quantity}</td><td>{money.format(row.buyPrice)}</td><td>{row.sellPrice?money.format(row.sellPrice):'Open'}</td><td><span className="reason">{row.exitReason}</span></td><td className={row.grossPnl>=0?'positive':'negative'}>{signedMoney(row.grossPnl)}</td><td>{money.format(row.fees)}</td><td className={row.netPnl>=0?'positive':'negative'}><strong>{signedMoney(row.netPnl)}</strong></td></tr>)}</tbody></table></div>:<Empty text="This run did not find enough movement to place a trade."/>}</section><section className="detail-grid"><article className="panel"><div className="panel-head"><div><p className="eyebrow">Execution timeline</p><h2>Entries and exits</h2></div></div><div className="timeline">{run.events.filter(event=>['ENTRY_FILLED','EXIT_FILLED'].includes(event.type)).map((event,index)=><div className="timeline-row" key={`${event.timestamp}-${index}`}><span className={`timeline-dot ${event.type==='ENTRY_FILLED'?'buy':'sell'}`}/><div><strong>{event.symbol}</strong><small>{event.type==='ENTRY_FILLED'?'Position opened':`Closed · ${(event.reason||'').replaceAll('_',' ')}`}</small></div><b>{event.observed_price?money.format(event.observed_price):'—'}</b><time>{formatTime(event.timestamp)}</time></div>)}</div></article><article className="panel"><div className="panel-head"><div><p className="eyebrow">Run settings</p><h2>Guardrails used</h2></div></div><dl className="settings-list"><div><dt>Tradable universe</dt><dd>{universeName(run)}</dd></div><div><dt>Capital per position</dt><dd>{money.format(run.config.allocation_per_position)}</dd></div><div><dt>Maximum positions</dt><dd>{run.config.max_positions}</dd></div><div><dt>Entry momentum</dt><dd>+{run.config.entry_momentum_pct}%</dd></div><div><dt>NIFTY momentum</dt><dd>{run.config.require_nifty_confirmation?'Required positive':'Recorded, not gated'}</dd></div><div><dt>Relative volume</dt><dd>≥{(run.config.minimum_relative_volume||1.2).toFixed(2)}×</dd></div><div><dt>Entry rule</dt><dd>{(run.config.entry_mode||'ROLLING_WINDOW').replaceAll('_',' ').toLowerCase()}{run.config.entry_bars?` · ${run.config.entry_bars} bars`:''}</dd></div><div><dt>Entry timeframe</dt><dd>{run.config.entry_timeframe_seconds?`${run.config.entry_timeframe_seconds/60}-minute bars`:'5-second ticks'}</dd></div><div><dt>Entry bar</dt><dd>max of {run.config.entry_momentum_pct}%, {run.config.entry_cost_multiple??1}× cost, {run.config.entry_noise_multiple??2}× noise</dd></div><div><dt>Exit rule</dt><dd>{(run.config.exit_mode||'REVERSAL').toLowerCase()}</dd></div>{run.config.exit_mode==='RATCHET'?<><div><dt>Survive stop</dt><dd>{run.config.survive_stop_multiple}× floor</dd></div><div><dt>Lock at</dt><dd>{run.config.lock_multiple}× floor</dd></div><div><dt>Ride from</dt><dd>{run.config.ride_multiple}× floor</dd></div><div><dt>Trail window</dt><dd>{run.config.trail_window} samples</dd></div><div><dt>Fast trail on decay</dt><dd>{run.config.fast_trail_window} samples</dd></div><div><dt>Confirmation</dt><dd>{run.config.confirmation_samples} bars</dd></div><div><dt>Time stop</dt><dd>{run.config.time_stop_seconds}s</dd></div></>:<><div><dt>Trailing reversal</dt><dd>−{run.config.reversal_pct}%</dd></div><div><dt>Hard stop</dt><dd>−{run.config.hard_stop_pct}%</dd></div></>}</dl>{run.errors.length>0&&<div className="error-box">{run.errors.join(' · ')}</div>}</article></section></section>}
 
 function EntryEvidence({run}:{run:MomentumRun}) {
   const entries=run.events.filter(event=>event.type==='ENTRY_FILLED');
@@ -249,13 +256,22 @@ function PositionLedger({run}:{run:MomentumRun}) {
 }
 
 
-function TraceChart({rows,symbol}:{rows:MonitoringObservation[];symbol:string}) {
+function eventMarkers(rows:MonitoringObservation[],symbol:string,events:RunEvent[]) {
+  return events.filter(event=>event.symbol===symbol&&['ENTRY_FILLED','EXIT_FILLED'].includes(event.type)).map(event=>{
+    const eventTime=Date.parse(event.timestamp);
+    const index=rows.reduce((best,row,rowIndex)=>Math.abs(Date.parse(row.timestamp)-eventTime)<Math.abs(Date.parse(rows[best].timestamp)-eventTime)?rowIndex:best,0);
+    return {event,index,price:event.observed_price??rows[index].price};
+  });
+}
+
+function TraceChart({rows,symbol,events}:{rows:MonitoringObservation[];symbol:string;events:RunEvent[]}) {
   const [hover,setHover]=useState<number|null>(null);
   if(rows.length<2)return <Empty text="Not enough observations to plot yet."/>;
   const prices=rows.map(row=>row.price);
   const stops=rows.map(row=>row.exit?.stop_price??null);
   const withStops=stops.filter((value):value is number=>value!==null);
-  const low=Math.min(...prices,...withStops), high=Math.max(...prices,...withStops);
+  const markers=eventMarkers(rows,symbol,events), markerPrices=markers.map(marker=>marker.price);
+  const low=Math.min(...prices,...withStops,...markerPrices), high=Math.max(...prices,...withStops,...markerPrices);
   const span=(high-low)||Math.max(high*0.0005,0.05);
   const pad=span*0.12, top=high+pad, bottom=low-pad, range=top-bottom;
   const W=1000, H=320;
@@ -269,8 +285,8 @@ function TraceChart({rows,symbol}:{rows:MonitoringObservation[];symbol:string}) 
     });
     return parts.join(' ');
   };
-  const entries=rows.map((row,index)=>({row,index})).filter(item=>item.row.decision==='ENTRY_FILLED');
-  const exits=rows.map((row,index)=>({row,index})).filter(item=>item.row.decision.startsWith('EXIT_'));
+  const entries=markers.filter(marker=>marker.event.type==='ENTRY_FILLED');
+  const exits=markers.filter(marker=>marker.event.type==='EXIT_FILLED');
   const active=hover===null?null:rows[hover];
   const ticks=[0,0.25,0.5,0.75,1].map(fraction=>bottom+range*fraction);
   return <div className="trace-chart-wrap">
@@ -282,8 +298,8 @@ function TraceChart({rows,symbol}:{rows:MonitoringObservation[];symbol:string}) 
       {ticks.map((value,index)=><line key={index} className="grid" x1={0} x2={W} y1={y(value)} y2={y(value)} vectorEffect="non-scaling-stroke"/>)}
       <path className="chart-stop" d={line(stops)} vectorEffect="non-scaling-stroke"/>
       <path className="chart-price" d={line(prices)} vectorEffect="non-scaling-stroke"/>
-      {entries.map(item=><line key={`in-${item.index}`} className="mark-entry" x1={x(item.index)} x2={x(item.index)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/>)}
-      {exits.map(item=><line key={`out-${item.index}`} className="mark-exit" x1={x(item.index)} x2={x(item.index)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/>)}
+      {entries.map((item,index)=><g key={`in-${index}`}><line className="mark-entry" x1={x(item.index)} x2={x(item.index)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/><circle className="point-entry" cx={x(item.index)} cy={y(item.price)} r={5} vectorEffect="non-scaling-stroke"/></g>)}
+      {exits.map((item,index)=><g key={`out-${index}`}><line className="mark-exit" x1={x(item.index)} x2={x(item.index)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/><circle className="point-exit" cx={x(item.index)} cy={y(item.price)} r={6} vectorEffect="non-scaling-stroke"/></g>)}
       {hover!==null&&<line className="mark-hover" x1={x(hover)} x2={x(hover)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/>}
     </svg>
     <div className="chart-axis">{[...ticks].reverse().map((value,index)=><span key={index}>{value.toFixed(2)}</span>)}</div>
@@ -304,6 +320,51 @@ function TraceChart({rows,symbol}:{rows:MonitoringObservation[];symbol:string}) 
   </div>;
 }
 
+type PriceCandle={timestamp:string;open:number;high:number;low:number;close:number;stop:number|null};
+
+function minuteCandles(rows:MonitoringObservation[]):PriceCandle[] {
+  const candles=new Map<number,PriceCandle>();
+  [...rows].sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp)).forEach(row=>{
+    const bucket=Math.floor(Date.parse(row.timestamp)/60000)*60000;
+    const candle=candles.get(bucket);
+    if(candle){candle.high=Math.max(candle.high,row.price);candle.low=Math.min(candle.low,row.price);candle.close=row.price;if(row.exit?.stop_price!==undefined)candle.stop=row.exit.stop_price;}
+    else candles.set(bucket,{timestamp:new Date(bucket).toISOString(),open:row.price,high:row.price,low:row.price,close:row.price,stop:row.exit?.stop_price??null});
+  });
+  return [...candles.values()];
+}
+
+function CandlestickChart({rows,symbol,events}:{rows:MonitoringObservation[];symbol:string;events:RunEvent[]}) {
+  const [hover,setHover]=useState<number|null>(null);
+  const candles=useMemo(()=>minuteCandles(rows),[rows]);
+  if(candles.length<2)return <Empty text="At least two one-minute candles are needed."/>;
+  const markers=eventMarkers(rows,symbol,events).map(marker=>{
+    const eventTime=Date.parse(marker.event.timestamp);
+    const index=candles.reduce((best,candle,candleIndex)=>Math.abs(Date.parse(candle.timestamp)-eventTime)<Math.abs(Date.parse(candles[best].timestamp)-eventTime)?candleIndex:best,0);
+    return {...marker,index};
+  });
+  const stops=candles.map(candle=>candle.stop).filter((value):value is number=>value!==null);
+  const markerPrices=markers.map(marker=>marker.price);
+  const low=Math.min(...candles.map(candle=>candle.low),...stops,...markerPrices),high=Math.max(...candles.map(candle=>candle.high),...stops,...markerPrices);
+  const span=(high-low)||Math.max(high*0.0005,0.05),pad=span*0.12,top=high+pad,bottom=low-pad,range=top-bottom;
+  const W=1000,H=320,slot=W/candles.length,body=Math.max(1.5,Math.min(10,slot*.62));
+  const x=(index:number)=>(index+.5)*slot,y=(value:number)=>H-(value-bottom)/range*H;
+  const stopPath=candles.map((candle,index)=>candle.stop===null?'':`${index>0&&candles[index-1].stop!==null?'L':'M'}${x(index).toFixed(1)},${y(candle.stop).toFixed(1)}`).join(' ');
+  const active=hover===null?null:candles[hover],ticks=[0,.25,.5,.75,1].map(fraction=>bottom+range*fraction);
+  return <div className="trace-chart-wrap">
+    <svg className="trace-chart candle-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label={`${symbol} one-minute candlestick chart`}
+      onMouseLeave={()=>setHover(null)} onMouseMove={event=>{const box=event.currentTarget.getBoundingClientRect();const ratio=(event.clientX-box.left)/box.width;setHover(Math.max(0,Math.min(candles.length-1,Math.floor(ratio*candles.length))));}}>
+      {ticks.map((value,index)=><line key={index} className="grid" x1={0} x2={W} y1={y(value)} y2={y(value)} vectorEffect="non-scaling-stroke"/>)}
+      {candles.map((candle,index)=>{const rising=candle.close>=candle.open,bodyTop=y(Math.max(candle.open,candle.close)),bodyHeight=Math.max(1.5,Math.abs(y(candle.open)-y(candle.close)));return <g key={candle.timestamp} className={rising?'candle-up':'candle-down'}><line className="candle-wick" x1={x(index)} x2={x(index)} y1={y(candle.high)} y2={y(candle.low)} vectorEffect="non-scaling-stroke"/><rect className="candle-body" x={x(index)-body/2} y={bodyTop} width={body} height={bodyHeight}/></g>})}
+      {stopPath&&<path className="chart-stop" d={stopPath} vectorEffect="non-scaling-stroke"/>}
+      {markers.map((marker,index)=><g key={`${marker.event.type}-${index}`}><line className={marker.event.type==='ENTRY_FILLED'?'mark-entry':'mark-exit'} x1={x(marker.index)} x2={x(marker.index)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/><circle className={marker.event.type==='ENTRY_FILLED'?'point-entry':'point-exit'} cx={x(marker.index)} cy={y(marker.price)} r={marker.event.type==='ENTRY_FILLED'?5:6} vectorEffect="non-scaling-stroke"/></g>)}
+      {hover!==null&&<line className="mark-hover" x1={x(hover)} x2={x(hover)} y1={0} y2={H} vectorEffect="non-scaling-stroke"/>}
+    </svg>
+    <div className="chart-axis">{[...ticks].reverse().map((value,index)=><span key={index}>{value.toFixed(2)}</span>)}</div>
+    <div className="chart-legend"><span><i className="swatch candle-up-swatch"/>Up candle</span><span><i className="swatch candle-down-swatch"/>Down candle</span><span><i className="swatch stop"/>Trailing stop</span><span><i className="swatch entry"/>Entry</span><span><i className="swatch exit"/>Exit</span><span className="chart-range">1-minute OHLC · {candles.length} candles</span></div>
+    {active&&<div className="chart-readout"><b>{formatTime(active.timestamp)}</b><span>O {money.format(active.open)}</span><span>H {money.format(active.high)}</span><span>L {money.format(active.low)}</span><span>C {money.format(active.close)}</span>{active.stop!==null&&<span>stop {money.format(active.stop)}</span>}</div>}
+  </div>;
+}
+
 const TRACE_VIEWS={gates:'Entry gates',exit:'Exit management',market:'Market context'} as const;
 type TraceView=keyof typeof TRACE_VIEWS;
 
@@ -314,21 +375,21 @@ function MonitoringTrace({run}:{run:MomentumRun}) {
   const [view,setView]=useState<TraceView>('gates');
   const [filter,setFilter]=useState('ALL');
   const [showAll,setShowAll]=useState(false);
-  const [format,setFormat]=useState<'table'|'chart'>('table');
+  const [format,setFormat]=useState<'table'|'chart'|'candles'>('table');
   const symbol=symbols.includes(selectedSymbol)?selectedSymbol:(symbols[0]||'');
   const matching=useMemo(()=>monitoring.filter(item=>item.symbol===symbol&&(filter==='ALL'||item.decision===filter)),[monitoring,symbol,filter]);
   const decisions=useMemo(()=>[...new Set(monitoring.filter(item=>item.symbol===symbol).map(item=>item.decision))],[monitoring,symbol]);
   if(!monitoring.length)return <section className="panel monitoring-panel"><div className="panel-head"><div><p className="eyebrow">Every price check</p><h2>Monitoring trace</h2></div><span className="count">0 observations</span></div><Empty text={run.data_health&&run.data_health.status!=='OK'?'No price chart is available because the stock survey did not return enough market data.':'No stock has qualified for five-second monitoring yet.'}/></section>;
-  const rows=format==='chart'||showAll?matching:matching.slice(-200);
+  const rows=format!=='table'||showAll?matching:matching.slice(-200);
   return <section className="panel monitoring-panel"><div className="panel-head"><div><p className="eyebrow">Every price check</p><h2>Monitoring trace</h2></div>
     <div className="trace-controls">
-      <div className="format-switch" role="tablist" aria-label="Trace format"><button role="tab" aria-selected={format==='table'} className={format==='table'?'on':''} onClick={()=>setFormat('table')}>Table</button><button role="tab" aria-selected={format==='chart'} className={format==='chart'?'on':''} onClick={()=>setFormat('chart')}>Chart</button></div>
+      <div className="format-switch" role="tablist" aria-label="Trace format"><button role="tab" aria-selected={format==='table'} className={format==='table'?'on':''} onClick={()=>setFormat('table')}>Table</button><button role="tab" aria-selected={format==='chart'} className={format==='chart'?'on':''} onClick={()=>setFormat('chart')}>Chart</button><button role="tab" aria-selected={format==='candles'} className={format==='candles'?'on':''} onClick={()=>setFormat('candles')}>Candlestick</button></div>
       <label className="trace-select">Stock<select value={symbol} onChange={event=>{setSelectedSymbol(event.target.value);setFilter('ALL')}}>{symbols.map(item=><option key={item}>{item}</option>)}</select></label>
       <label className="trace-select">Columns<select value={view} onChange={event=>setView(event.target.value as TraceView)}>{Object.entries(TRACE_VIEWS).map(([key,label])=><option key={key} value={key}>{label}</option>)}</select></label>
       <label className="trace-select">Decision<select value={filter} onChange={event=>setFilter(event.target.value)}><option value="ALL">All</option>{decisions.map(item=><option key={item} value={item}>{item.replaceAll('_',' ')}</option>)}</select></label>
     </div></div>
     <p className="trace-help">{matching.length} of {monitoring.filter(item=>item.symbol===symbol).length} checks for {symbol}{rows.length<matching.length?` · showing the most recent ${rows.length}`:''}. {matching.length>rows.length&&<button className="text-button" onClick={()=>setShowAll(true)}>Show every row →</button>}</p>
-    {format==='chart'?<TraceChart rows={rows} symbol={symbol}/>:<div className="table-wrap trace-table"><table><thead><tr><th>Time</th><th>Price</th>{view==='gates'&&<><th>3-bar window</th><th>First → last</th><th>Needed</th><th>Bar set by</th><th>Stock noise</th><th>Trigger price</th><th>Relative volume</th><th>NIFTY 15 min</th></>}{view==='exit'&&<><th>Phase</th><th>Stop</th><th>Gap to stop</th><th>Unrealized</th><th>Net of cost</th><th>Trail low</th><th>Volume</th><th>Breaches</th></>}{view==='market'&&<><th>5-sec change</th><th>Rolling change</th><th>Session</th><th>Stock 15 min</th><th>Score</th><th>Range position</th><th>NIFTY price</th></>}<th>Decision</th></tr></thead>
+    {format==='chart'?<TraceChart rows={rows} symbol={symbol} events={run.events}/>:format==='candles'?<CandlestickChart rows={rows} symbol={symbol} events={run.events}/>:<div className="table-wrap trace-table"><table><thead><tr><th>Time</th><th>Price</th>{view==='gates'&&<><th>3-bar window</th><th>First → last</th><th>Needed</th><th>Bar set by</th><th>Stock noise</th><th>Trigger price</th><th>Relative volume</th><th>NIFTY 15 min</th></>}{view==='exit'&&<><th>Phase</th><th>Stop</th><th>Gap to stop</th><th>Unrealized</th><th>Net of cost</th><th>Trail low</th><th>Volume</th><th>Breaches</th></>}{view==='market'&&<><th>5-sec change</th><th>Rolling change</th><th>Session</th><th>Stock 15 min</th><th>Score</th><th>Range position</th><th>NIFTY price</th></>}<th>Decision</th></tr></thead>
     <tbody>{rows.map((row,index)=><tr key={`${row.timestamp}-${index}`} className={row.decision==='ENTRY_FILLED'?'entry-row':row.decision.startsWith('EXIT_')?'exit-row':''}>
       <td>{formatTime(row.timestamp)}</td><td className="stock-name">{money.format(row.price)}</td>
       {view==='gates'&&<><td className="mono">{row.entry_check?.window.map(value=>value.toFixed(2)).join(' → ')||'—'}</td><td className={cleared(row.entry_check)?'positive':'negative'}>{row.entry_check?.rise_pct!==undefined&&row.entry_check.rise_pct!==null?signedPct(row.entry_check.rise_pct):'—'}</td><td>{row.entry_check?.threshold_pct!==undefined&&row.entry_check.threshold_pct!==null?`≥${row.entry_check.threshold_pct.toFixed(3)}%`:'—'}</td><td><span className="decision block">{(row.entry_check?.threshold_source||'—').replaceAll('_',' ')}</span></td><td className="mono">{row.entry_check?.noise_pct!==undefined&&row.entry_check.noise_pct!==null?`${row.entry_check.noise_pct.toFixed(3)}%`:'—'}</td><td>{row.entry_check?.trigger_price?money.format(row.entry_check.trigger_price):'—'}</td><td className={(row.relative_volume||0)>=(run.config.minimum_relative_volume||1.2)?'positive':'negative'}>{optionalRatio(row.relative_volume)}</td><td className={!run.config.require_nifty_confirmation?'':(row.nifty_recent_15m_change_pct||0)>0?'positive':'negative'}>{optionalPct(row.nifty_recent_15m_change_pct)}</td></>}
@@ -448,12 +509,18 @@ function ScheduleStrip({status}:{status:ScheduleStatus|null}) {
   </section>;
 }
 
+const DAILY_REPORT_SECTIONS={overview:'Overview',runs:'Runs',decisions:'Decisions'} as const;
+type DailyReportSection=keyof typeof DAILY_REPORT_SECTIONS;
+
 function DailyReportView({report,openRun}:{report:DailyReport;openRun:(id:string)=>void}) {
+  const [section,setSection]=useState<DailyReportSection>('overview');
   const t=report.totals;
   return <>
     <section className="detail-kpis report-kpis"><Metric label="Net P&L" value={signedMoney(t.net_pnl)} tone={t.net_pnl>=0?'positive':'negative'}/><Metric label="Runs" value={`${t.runs_that_traded}/${t.runs} traded`}/><Metric label="Round trips" value={`${t.round_trips}`}/><Metric label="Win rate" value={`${t.win_rate_pct}%`}/><Metric label="Fees" value={money.format(t.fees)}/><Metric label="Observations" value={number.format(t.observations)}/></section>
 
-    <section className="report-grid">
+    <nav className="report-tabs daily-report-tabs" role="tablist" aria-label="Daily report sections">{Object.entries(DAILY_REPORT_SECTIONS).map(([key,label])=><button key={key} role="tab" aria-selected={section===key} className={section===key?'active':''} onClick={()=>setSection(key as DailyReportSection)}>{label}{key==='runs'?` · ${report.runs.length}`:''}</button>)}</nav>
+
+    {section==='overview'&&<><section className="report-grid">
       <RollupCard title="By entry timeframe" rows={report.by_timeframe} render={k=>tfLabel(Number(k))}/>
       <RollupCard title="By duration" rows={report.by_duration} render={k=>`${Number(k)/60}m`}/>
       <RollupCard title="By max positions" rows={report.by_positions} render={k=>`${k} pos`}/>
@@ -462,15 +529,16 @@ function DailyReportView({report,openRun}:{report:DailyReport;openRun:(id:string
     {(report.best_run||report.worst_run)&&<section className="report-extremes">
       {report.best_run&&<article className={`extreme good`}><p className="eyebrow">Best arm</p><h3>{report.best_run.config_key}</h3><strong>{signedMoney(report.best_run.net_pnl)}</strong><small>{report.best_run.round_trips} trades · {report.best_run.win_rate_pct}% win</small></article>}
       {report.worst_run&&<article className={`extreme bad`}><p className="eyebrow">Worst arm</p><h3>{report.worst_run.config_key}</h3><strong>{signedMoney(report.worst_run.net_pnl)}</strong><small>{report.worst_run.round_trips} trades · {report.worst_run.win_rate_pct}% win</small></article>}
-    </section>}
+    </section>}</>}
 
-    <section className="panel"><div className="panel-head"><div><p className="eyebrow">Per run</p><h2>Every arm today</h2></div><span className="count">{report.runs.length} runs</span></div>
+    {section==='runs'&&<section className="panel"><div className="panel-head"><div><p className="eyebrow">Per run</p><h2>Every arm today</h2></div><span className="count">{report.runs.length} runs</span></div>
       <div className="table-wrap"><table><thead><tr><th>Config</th><th>Started</th><th>Timeframe</th><th>Trades</th><th>Win%</th><th>Fees</th><th>Net P&L</th><th></th></tr></thead>
       <tbody>{report.runs.map(r=><tr key={r.run_id}><td className="stock-name">{r.config_key}</td><td>{r.started_at?formatTime(r.started_at):'—'}</td><td>{tfLabel(r.entry_timeframe_seconds)}</td><td>{r.round_trips}</td><td>{r.win_rate_pct}%</td><td>{money.format(r.fees)}</td><td className={r.net_pnl>=0?'positive':'negative'}><strong>{signedMoney(r.net_pnl)}</strong></td><td><button className="text-button" onClick={()=>openRun(r.run_id)}>Open →</button></td></tr>)}</tbody></table></div>
-      {!report.runs.length&&<Empty text="No runs recorded for this session."/>}</section>
+      {!report.runs.length&&<Empty text="No runs recorded for this session."/>}</section>}
 
-    {report.decision_totals.length>0&&<section className="panel"><div className="panel-head"><div><p className="eyebrow">Across every run</p><h2>What the day did</h2></div><span className="count">{number.format(report.decision_totals.reduce((s,d)=>s+d.count,0))} checks</span></div>
+    {section==='decisions'&&report.decision_totals.length>0&&<section className="panel"><div className="panel-head"><div><p className="eyebrow">Across every run</p><h2>What the day did</h2></div><span className="count">{number.format(report.decision_totals.reduce((s,d)=>s+d.count,0))} checks</span></div>
       <div className="funnel">{report.decision_totals.slice(0,10).map(d=><div className="funnel-row" key={d.decision}><span className={`decision ${decisionTone(d.decision)}`}>{d.decision.replaceAll('_',' ')}</span><div className="funnel-bar"><i className={decisionTone(d.decision)} style={{width:`${Math.max(d.share_pct,1.5)}%`}}/></div><b>{d.count}</b><small>{d.share_pct.toFixed(1)}%</small></div>)}</div></section>}
+    {section==='decisions'&&!report.decision_totals.length&&<Empty text="No monitoring decisions were recorded for this session."/>}
   </>;
 }
 
