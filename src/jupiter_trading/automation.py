@@ -84,7 +84,29 @@ class DailyScheduler:
     def plan_for(self, session_date: str, create: bool = False) -> Optional[DailyPlan]:
         stored = self.store.schedule_plan(session_date)
         if stored:
-            return DailyPlan.from_dict(stored)
+            plan = DailyPlan.from_dict(stored)
+            # Plans can be created before a deployment changes the configured
+            # experiment arms. Until anything has launched, the saved plan is
+            # only a draft, so make it match the current scheduler settings.
+            # Once a slot has moved past PENDING it is execution history and
+            # must never be rewritten.
+            configured_timeframes = list(dict.fromkeys(self.config.entry_timeframes))
+            stored_timeframes = [slot.entry_timeframe_seconds for slot in plan.slots]
+            plan_is_draft = all(slot.status == "PENDING" for slot in plan.slots)
+            configuration_changed = (
+                stored_timeframes != configured_timeframes
+                or any(slot.max_positions != self.config.max_positions for slot in plan.slots)
+                or plan.account_prefix != self.config.account_prefix
+            )
+            if create and plan_is_draft and configuration_changed:
+                plan = build_daily_plan(
+                    session_date,
+                    timeframes=self.config.entry_timeframes,
+                    max_positions=self.config.max_positions,
+                    account_prefix=self.config.account_prefix,
+                )
+                self._save(plan)
+            return plan
         if not create:
             return None
         plan = build_daily_plan(

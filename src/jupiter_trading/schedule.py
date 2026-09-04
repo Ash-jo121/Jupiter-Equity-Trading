@@ -83,7 +83,7 @@ def build_daily_plan(
 
     Every run opens at 09:15 and closes at 15:30, so the session is covered by
     construction with no staggering to engineer. The runs are identical but for
-    their entry timeframe, which makes the day's four P&L numbers a clean,
+    their entry timeframe, which makes the day's P&L numbers a clean,
     like-for-like comparison of that one axis. A re-entry cooldown (set on the
     scheduler, applied at launch) keeps each run trading through the day rather
     than exhausting the universe by mid-morning.

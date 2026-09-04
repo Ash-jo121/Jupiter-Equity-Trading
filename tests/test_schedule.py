@@ -129,6 +129,32 @@ def test_arms_are_not_relaunched_after_a_restart(tmp_path) -> None:
     assert relaunched == []
 
 
+def test_an_unlaunched_saved_plan_tracks_the_current_arms(tmp_path) -> None:
+    scheduler, store, launched, _ = _scheduler(tmp_path, entry_timeframes=(0, 60))
+    old_plan = build_daily_plan(MONDAY, timeframes=(0, 60, 180, 300))
+    store.save_schedule_plan(MONDAY, old_plan.to_dict())
+
+    scheduler.tick(_at(MONDAY, 9, 16))
+
+    assert [slot.entry_timeframe_seconds for slot in launched] == [0, 60]
+    saved = store.schedule_plan(MONDAY)
+    assert [slot["entry_timeframe_seconds"] for slot in saved["slots"]] == [0, 60]
+
+
+def test_a_started_saved_plan_is_preserved_as_history(tmp_path) -> None:
+    scheduler, store, launched, _ = _scheduler(tmp_path, entry_timeframes=(0, 60))
+    old_plan = build_daily_plan(MONDAY, timeframes=(0, 60, 180, 300))
+    old_plan.slots[0].status = "LAUNCHED"
+    old_plan.slots[0].runner_id = "existing-runner"
+    store.save_schedule_plan(MONDAY, old_plan.to_dict())
+
+    scheduler.tick(_at(MONDAY, 9, 16))
+
+    assert [slot.entry_timeframe_seconds for slot in launched] == [60, 180, 300]
+    saved = store.schedule_plan(MONDAY)
+    assert len(saved["slots"]) == 4
+
+
 def test_arms_missed_past_the_grace_window_are_skipped(tmp_path) -> None:
     scheduler, store, launched, _ = _scheduler(
         tmp_path, catch_up_grace_seconds=1800
