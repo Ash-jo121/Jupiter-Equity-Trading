@@ -449,12 +449,39 @@ class RatchetExit:
             self.stop_price = candidate
             self.stop_source = source
 
+    @classmethod
+    def from_dict(cls, value: dict, policy: Optional[ExitPolicy] = None) -> RatchetExit:
+        """Restore every state field needed to continue a ratchet after restart."""
+
+        rule = cls(
+            float(value["entry_price"]),
+            float(value["cost_floor_pct"]),
+            datetime.fromisoformat(value["entered_at"]),
+            policy,
+            value.get("structural_stop"),
+        )
+        rule.phase = ExitPhase(value["phase"])
+        rule.peak_price = float(value["peak_price"])
+        rule.last_price = float(value["last_price"])
+        rule.stop_price = float(value["stop_price"])
+        rule.stop_source = value["stop_source"]
+        rule.breaches = int(value.get("breaches", 0))
+        rule.samples = int(value.get("samples", 0))
+        rule.reason = value.get("reason")
+        rule.trail_low = value.get("trail_low")
+        rule.trail_window_used = int(value.get("trail_window", 0))
+        rule.volume_state = value.get("volume_state", "UNKNOWN")
+        rule.seconds_held = float(value.get("seconds_held", 0))
+        rule._prices.extend(float(item) for item in value.get("price_window", []))
+        return rule
+
     def to_dict(self) -> dict:
         unrealized_pct = (self.last_price / self.entry_price - 1) * 100
         return {
             "phase": self.phase.value,
             "reason": self.reason,
             "entry_price": round(self.entry_price, 4),
+            "entered_at": self.entered_at.isoformat(),
             "last_price": round(self.last_price, 4),
             "peak_price": round(self.peak_price, 4),
             "stop_price": round(self.stop_price, 4),
@@ -478,6 +505,7 @@ class RatchetExit:
             "seconds_held": round(self.seconds_held, 1),
             "time_stop_seconds": self.policy.time_stop_seconds,
             "samples": self.samples,
+            "price_window": list(self._prices),
         }
 
 

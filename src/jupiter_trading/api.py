@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from threading import Event
 from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .accounts import PaperAccountManager
@@ -15,9 +16,11 @@ from .backtest import BacktestEngine, ExitReplayEngine, ReplayGates
 from .config import Settings
 from .daily_report import DailyReportBuilder
 from .domain import DepthLevel, Order, OrderType, Product, Quote, Side, Validity
+from .entry_comparison import build_comparison, export_csv
+from .entry_experiment import VARIANTS, ExperimentConfig, ExperimentIdentity
 from .holiday_calendar import HolidayCalendarError, NseHolidayCalendar
 from .instrument_search import InstrumentSearchError, UpstoxInstrumentSearch
-from .market_data import MarketDataError, SharedQuoteCache, UpstoxMarketData
+from .market_data import MarketDataError, SharedCandleCache, SharedQuoteCache, UpstoxMarketData
 from .market_stream import UpstoxMarketStream
 from .momentum_runner import (
     MomentumReversalRunner,
@@ -118,10 +121,14 @@ class SurveyRequest(BaseModel):
 
 
 class MomentumRunRequest(BaseModel):
-    account_id: str = Field(
-        default="momentum", pattern=r"^[a-zA-Z0-9_-]{1,40}$"
-    )
+    account_id: str = Field(default="momentum", pattern=r"^[a-zA-Z0-9_-]{1,40}$")
     initial_cash: float = Field(default=100_000, gt=0)
+    signal_strategy: Literal[
+        "MOMENTUM_REVERSAL",
+        "MACD_EARLY",
+        "MACD_EARLY_PRICE_CONFIRM",
+        "MACD_FRESH_CONFIRMED",
+    ] = "MOMENTUM_REVERSAL"
     duration_seconds: int = Field(default=300, ge=30, le=25_200)
     poll_interval_seconds: float = Field(default=5, ge=1, le=60)
     rescan_interval_seconds: float = Field(default=60, ge=15, le=600)
@@ -179,6 +186,24 @@ class MomentumBatchRequest(BaseModel):
         safe = "".join(char if char.isalnum() else "-" for char in slug.lower())[:20]
         fields["account_id"] = variant.account_id or f"{self.account_prefix}-{safe}"
         return MomentumRunRequest(**fields)
+
+
+class EntryExperimentRequest(BaseModel):
+    """The frozen shared settings for the exact three-arm paper experiment."""
+
+    experiment_id: Optional[str] = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_-]{1,34}$"
+    )
+    initial_cash: float = Field(default=1_000_000, gt=0)
+    allocation_per_position: float = Field(default=25_000, gt=0)
+    max_positions: int = Field(default=2, ge=1, le=10)
+    duration_seconds: int = Field(default=22_500, ge=30, le=25_200)
+    poll_interval_seconds: float = Field(default=5, ge=1, le=60)
+    rescan_interval_seconds: float = Field(default=285, ge=15, le=600)
+    candidate_limit: int = Field(default=10, ge=1, le=50)
+    minimum_score: float = Field(default=0.15, ge=0)
+    minimum_relative_volume: float = Field(default=1.2, ge=1)
+    require_nifty_confirmation: bool = False
 
 
 class UpstoxTokenRequest(BaseModel):
@@ -270,6 +295,7 @@ def create_app(
     momentum_runners = MomentumRunnerService(research_store)
     shared_survey_cache = SharedSurveyCache()
     shared_quote_cache = SharedQuoteCache()
+    shared_candle_cache = SharedCandleCache()
     daily_reports_builder = DailyReportBuilder(research_store)
     nse_holidays = holiday_calendar or NseHolidayCalendar()
 
@@ -283,12 +309,32 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
+    def _refresh_nse_execution_status() -> str:
+        status = market_data().market_status("NSE")
+        value = str(status.get("status") or "UNKNOWN")
+        coordinator.update_market_status({"NSE_EQ": value})
+        return value
+
+    def _scheduler_market_ready() -> bool:
+        if not token_store.status()["likely_valid"]:
+            return False
+        try:
+            return _refresh_nse_execution_status() == "NORMAL_OPEN"
+        except (MarketDataError, HTTPException):
+            coordinator.update_market_status({"NSE_EQ": "UNKNOWN"})
+            return False
+
+    scheduler_barriers = {}
+
     def _scheduler_launch(slot, sched_config) -> str:
         # _launch_runner is defined further down; closures resolve at call time.
         request = MomentumRunRequest(
             account_id=slot.account_id,
             initial_cash=sched_config.initial_cash,
+            signal_strategy=slot.entry_mode,
             duration_seconds=slot.duration_seconds,
+            poll_interval_seconds=5,
+            rescan_interval_seconds=285,
             max_positions=slot.max_positions,
             entry_timeframe_seconds=slot.entry_timeframe_seconds,
             reentry_cooldown_seconds=sched_config.reentry_cooldown_seconds,
@@ -297,7 +343,61 @@ def create_app(
             exit_mode="RATCHET",
             require_nifty_confirmation=False,
         )
-        return _launch_runner(request, label=slot.label)["id"]
+        experiment = ExperimentConfig(
+            initial_cash=sched_config.initial_cash,
+            allocation_per_position=sched_config.allocation_per_position,
+            max_positions=slot.max_positions,
+            duration_seconds=slot.duration_seconds,
+        )
+        session_id = slot.start_ist[:10]
+        experiment_id = f"{sched_config.account_prefix}-{session_id}"
+        barrier_state = scheduler_barriers.setdefault(
+            session_id,
+            {
+                "event": Event(),
+                "prepared": 0,
+                "failed": False,
+                "run_ids": [],
+                "variants": [],
+            },
+        )
+        try:
+            run = _launch_runner(
+                request,
+                label=slot.label.split(" · ", 1)[0],
+                experiment_id=experiment_id,
+                session_id=session_id,
+                shared_config_hash=experiment.shared_hash,
+                start_barrier=barrier_state["event"],
+            )
+            runner_id = run["id"]
+            barrier_state["run_ids"].append(runner_id)
+            barrier_state["variants"].append(
+                {"label": slot.label.split(" · ", 1)[0], "entry_mode": slot.entry_mode, "run": run}
+            )
+            return runner_id
+        except Exception:
+            barrier_state["failed"] = True
+            raise
+        finally:
+            barrier_state["prepared"] += 1
+            if barrier_state["prepared"] >= len(sched_config.entry_variants):
+                if barrier_state["failed"]:
+                    for runner_id in barrier_state["run_ids"]:
+                        momentum_runners.stop(runner_id)
+                else:
+                    research_store.save_experiment(
+                        {
+                            "experiment_id": experiment_id,
+                            "session_id": session_id,
+                            "status": "RUNNING",
+                            "shared_config_hash": experiment.shared_hash,
+                            "resolved_config": experiment.resolved(),
+                            "variants": barrier_state["variants"],
+                            "started_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                barrier_state["event"].set()
 
     scheduler = DailyScheduler(
         research_store,
@@ -311,16 +411,14 @@ def create_app(
             allocation_per_position=settings.scheduler_allocation,
             initial_cash=settings.scheduler_initial_cash,
         ),
-        market_ready=lambda: token_store.status()["likely_valid"],
+        market_ready=_scheduler_market_ready,
         trading_day_check=nse_holidays.is_trading_day,
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         configured_keys = (
-            list(settings.upstox_stream_instruments)
-            if settings.upstox_stream_auto_start
-            else []
+            list(settings.upstox_stream_instruments) if settings.upstox_stream_auto_start else []
         )
         strategy_keys = [
             leg["instrument_key"]
@@ -456,13 +554,17 @@ def create_app(
         order_id: str, request: ModifyOrderRequest, account_id: str = "default"
     ) -> dict:
         try:
-            return _broker(accounts, account_id).modify(
-                order_id,
-                quantity=request.quantity,
-                limit_price=request.limit_price,
-                trigger_price=request.trigger_price,
-                validity=request.validity,
-            ).to_dict()
+            return (
+                _broker(accounts, account_id)
+                .modify(
+                    order_id,
+                    quantity=request.quantity,
+                    limit_price=request.limit_price,
+                    trigger_price=request.trigger_price,
+                    validity=request.validity,
+                )
+                .to_dict()
+            )
         except KeyError as error:
             raise HTTPException(status_code=404, detail="order not found") from error
         except ValueError as error:
@@ -568,31 +670,43 @@ def create_app(
     @app.get("/market/status")
     def exchange_status(exchange: str = "NSE") -> dict:
         try:
-            status = market_data().market_status(exchange)
-            if exchange == "NSE":
-                coordinator.update_market_status({"NSE_EQ": status["status"]})
-            return status
+            # This is deliberately read-only. Execution state is refreshed by
+            # run launch and the runner's periodic scan, not by dashboard views.
+            return market_data().market_status(exchange)
         except MarketDataError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
-    def _launch_runner(request: MomentumRunRequest, label: Optional[str] = None) -> dict:
+    def _launch_runner(
+        request: MomentumRunRequest,
+        label: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        shared_config_hash: Optional[str] = None,
+        start_barrier: Optional[Event] = None,
+    ) -> dict:
         """Provision the account if needed and start one configured run."""
+
+        status = _refresh_nse_execution_status()
+        if status != "NORMAL_OPEN":
+            raise ValueError(f"NSE is not open for execution (status: {status})")
 
         account_id = request.account_id
         try:
             accounts.get(account_id)
         except KeyError:
             accounts.create(
-                account_id, label or "Momentum reversal paper session", request.initial_cash
+                account_id,
+                label
+                or "Momentum reversal paper session",
+                request.initial_cash,
             )
         if momentum_runners.has_active(account_id):
-            raise ValueError(
-                f"a momentum run is already active for paper account '{account_id}'"
-            )
+            raise ValueError(f"a momentum run is already active for paper account '{account_id}'")
         constituents = nifty100.constituents()
         runner = MomentumReversalRunner(
             config=MomentumRunnerConfig(
                 account_id=account_id,
+                signal_strategy=request.signal_strategy,
                 duration_seconds=request.duration_seconds,
                 poll_interval_seconds=request.poll_interval_seconds,
                 rescan_interval_seconds=request.rescan_interval_seconds,
@@ -623,10 +737,13 @@ def create_app(
                 time_stop_seconds=request.time_stop_seconds,
                 universe_name=Nifty100Universe.name,
                 universe_size=Nifty100Universe.expected_count,
+                experiment_id=experiment_id,
+                session_id=session_id,
+                variant_label=label,
+                shared_config_hash=shared_config_hash,
             ),
             instruments=[
-                SurveyInstrument(item["symbol"], item["instrument_key"])
-                for item in constituents
+                SurveyInstrument(item["symbol"], item["instrument_key"]) for item in constituents
             ],
             market_data=market_data(),
             accounts=accounts,
@@ -634,6 +751,9 @@ def create_app(
             store=research_store,
             survey_cache=shared_survey_cache,
             quote_cache=shared_quote_cache,
+            candle_cache=shared_candle_cache,
+            market_status_refresh=_refresh_nse_execution_status,
+            start_barrier=start_barrier,
         )
         return momentum_runners.add(runner)
 
@@ -645,6 +765,149 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (UniverseError, MarketDataError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/momentum-strategies")
+    def momentum_strategies() -> list:
+        """Strategies accepted by the shared paper-session runner."""
+
+        return [
+            {
+                "id": "MOMENTUM_REVERSAL",
+                "name": "Momentum reversal",
+                "timeframe": "5-second ticks or 1-minute bars",
+            }
+        ] + [
+            {"id": mode, "name": label, "timeframe": "Completed 1-minute candles"}
+            for label, mode in VARIANTS
+        ]
+
+    @app.post("/entry-experiments", status_code=202)
+    def start_entry_experiment(request: EntryExperimentRequest) -> dict:
+        """Prevalidate and release the exact A/B/C paper runs on one barrier."""
+
+        try:
+            config = ExperimentConfig(
+                initial_cash=request.initial_cash,
+                allocation_per_position=request.allocation_per_position,
+                max_positions=request.max_positions,
+                duration_seconds=request.duration_seconds,
+                poll_interval_seconds=request.poll_interval_seconds,
+                rescan_interval_seconds=request.rescan_interval_seconds,
+                candidate_limit=request.candidate_limit,
+                minimum_score=request.minimum_score,
+                minimum_relative_volume=request.minimum_relative_volume,
+                require_nifty_confirmation=request.require_nifty_confirmation,
+            )
+            identity = ExperimentIdentity.create(request.experiment_id)
+            _refresh_nse_execution_status()
+            nifty100.constituents()  # fail before starting any arm if the universe is unavailable
+            for label, _mode in VARIANTS:
+                account_id = identity.account_id(label)
+                try:
+                    accounts.get(account_id)
+                except KeyError:
+                    continue
+                raise ValueError(
+                    f"paper account '{account_id}' already exists; use a new experiment_id"
+                )
+
+            barrier = Event()
+            started = []
+            try:
+                for label, mode in VARIANTS:
+                    run_request = MomentumRunRequest(
+                        account_id=identity.account_id(label),
+                        initial_cash=config.initial_cash,
+                        signal_strategy=mode,
+                        duration_seconds=config.duration_seconds,
+                        poll_interval_seconds=config.poll_interval_seconds,
+                        rescan_interval_seconds=config.rescan_interval_seconds,
+                        max_positions=config.max_positions,
+                        allocation_per_position=config.allocation_per_position,
+                        candidate_limit=config.candidate_limit,
+                        minimum_score=config.minimum_score,
+                        minimum_relative_volume=config.minimum_relative_volume,
+                        entry_mode="THREE_BAR",  # legacy field; not an experiment gate
+                        exit_mode="RATCHET",
+                        entry_timeframe_seconds=60,
+                        reentry_cooldown_seconds=0,
+                        require_nifty_confirmation=config.require_nifty_confirmation,
+                    )
+                    started.append(
+                        {
+                            "label": label,
+                            "entry_mode": mode,
+                            "run": _launch_runner(
+                                run_request,
+                                label,
+                                identity.experiment_id,
+                                identity.session_id,
+                                config.shared_hash,
+                                barrier,
+                            ),
+                        }
+                    )
+            except Exception:
+                for arm in started:
+                    momentum_runners.stop(arm["run"]["id"])
+                raise
+            finally:
+                barrier.set()
+            payload = {
+                "experiment_id": identity.experiment_id,
+                "session_id": identity.session_id,
+                "status": "RUNNING",
+                "shared_config_hash": config.shared_hash,
+                "resolved_config": config.resolved(),
+                "variants": started,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            research_store.save_experiment(payload)
+            return payload
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (UniverseError, MarketDataError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/entry-experiments")
+    def list_entry_experiments() -> list:
+        return research_store.experiments()
+
+    @app.get("/entry-experiments/{experiment_id}")
+    def get_entry_experiment(experiment_id: str) -> dict:
+        experiment = research_store.experiment(experiment_id)
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="entry experiment not found")
+        run_ids = [item["run"]["id"] for item in experiment.get("variants", [])]
+        experiment["runs"] = [momentum_runners.get(run_id, False) for run_id in run_ids]
+        return experiment
+
+    @app.get("/entry-experiments/{experiment_id}/comparison")
+    def compare_entry_experiment(experiment_id: str) -> dict:
+        experiment = research_store.experiment(experiment_id)
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="entry experiment not found")
+        run_ids = [item["run"]["id"] for item in experiment.get("variants", [])]
+        runs = [momentum_runners.get(run_id, False) for run_id in run_ids]
+        return build_comparison(experiment, runs)
+
+    @app.get("/entry-experiments/{experiment_id}/exports/{kind}")
+    def export_entry_experiment(experiment_id: str, kind: str) -> PlainTextResponse:
+        experiment = research_store.experiment(experiment_id)
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="entry experiment not found")
+        run_ids = [item["run"]["id"] for item in experiment.get("variants", [])]
+        runs = [momentum_runners.get(run_id, False) for run_id in run_ids]
+        try:
+            content = export_csv(kind, runs)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        filename = f"{experiment_id}-{kind}.csv"
+        return PlainTextResponse(
+            content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.post("/momentum-runners/batch", status_code=202)
     def start_momentum_runner_batch(request: MomentumBatchRequest) -> dict:
@@ -661,7 +924,10 @@ def create_app(
             merged = request.merged(variant, index)
             try:
                 started.append(
-                    {"label": variant.label or merged.account_id, "run": _launch_runner(merged, variant.label)}
+                    {
+                        "label": variant.label or merged.account_id,
+                        "run": _launch_runner(merged, variant.label),
+                    }
                 )
             except (ValueError, UniverseError, MarketDataError) as error:
                 failed.append({"label": variant.label or merged.account_id, "error": str(error)})
@@ -720,9 +986,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="strategy not found") from error
 
     @app.post("/strategies/{strategy_id}/{action}")
-    def change_strategy_status(
-        strategy_id: str, action: Literal["start", "pause", "stop"]
-    ) -> dict:
+    def change_strategy_status(strategy_id: str, action: Literal["start", "pause", "stop"]) -> dict:
         status = {
             "start": StrategyStatus.RUNNING,
             "pause": StrategyStatus.PAUSED,
@@ -993,9 +1257,7 @@ def create_app(
     ) -> list:
         client = market_data()
         try:
-            candles = client.historical_candles(
-                instrument_key, unit, interval, to_date, from_date
-            )
+            candles = client.historical_candles(instrument_key, unit, interval, to_date, from_date)
             return [candle.to_dict() for candle in candles]
         except (MarketDataError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error

@@ -98,12 +98,8 @@ def test_shared_survey_cache_includes_one_shared_nifty_context_read() -> None:
     cache = SharedSurveyCache(ttl_seconds=300)
     instruments = [SurveyInstrument("TEST", "NSE_EQ|TEST")]
 
-    first = cache.run(
-        market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY
-    )
-    second = cache.run(
-        market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY
-    )
+    first = cache.run(market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY)
+    second = cache.run(market, instruments, 1.2, context_instrument_key=NIFTY50_INDEX_KEY)
 
     assert market.ltp_calls == 1
     assert market.candle_calls == 2  # one stock plus one shared NIFTY baseline
@@ -253,9 +249,7 @@ def test_falling_nifty_blocks_an_entry_only_when_confirmation_is_required(tmp_pa
         runner._poll()
 
     assert not accounts.get().orders
-    assert runner.snapshot()["monitoring"][-1]["decision"] == (
-        "NIFTY_SHORT_TERM_NOT_POSITIVE"
-    )
+    assert runner.snapshot()["monitoring"][-1]["decision"] == ("NIFTY_SHORT_TERM_NOT_POSITIVE")
 
 
 def test_low_relative_volume_is_rejected_during_scan(tmp_path) -> None:
@@ -280,9 +274,7 @@ def test_low_relative_volume_is_rejected_during_scan(tmp_path) -> None:
     snapshot = runner.snapshot()
     assert snapshot["candidates"] == []
     scan = next(event for event in snapshot["events"] if event["type"] == "SCAN")
-    assert scan["low_volume_rejections"] == [
-        {"symbol": "TEST", "relative_volume": 0.5}
-    ]
+    assert scan["low_volume_rejections"] == [{"symbol": "TEST", "relative_volume": 0.5}]
 
 
 class RatchetMarket(RisingThenReversingMarket):
@@ -334,7 +326,9 @@ def test_ratchet_mode_rides_the_move_and_exits_on_the_trailing_stop(tmp_path) ->
         "COST_FLOOR",
         "STOCK_NOISE",
     }
-    assert entry["entry_signal"]["window_change_pct"] >= entry["entry_signal"]["entry_threshold_pct"]
+    assert (
+        entry["entry_signal"]["window_change_pct"] >= entry["entry_signal"]["entry_threshold_pct"]
+    )
     assert entry["entry_signal"]["cost_floor_pct"] > 0
     assert exit_event["reason"] == "TRAILING_STOP"
     assert exit_event["exit_state"]["phase"] == "RIDE"
@@ -478,9 +472,7 @@ def test_a_zero_cost_configuration_still_gets_a_usable_ladder(tmp_path) -> None:
     for _ in range(6):
         runner._poll()
 
-    entry = next(
-        event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED"
-    )
+    entry = next(event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED")
     assert entry["entry_signal"]["cost_floor_pct"] == 0.02
 
 
@@ -517,16 +509,16 @@ def _minute_forward_test_ticks(base):
     ticks = [
         (100.0, base + timedelta(seconds=0)),
         (99.9, base + timedelta(seconds=5)),
-        (99.6, base + timedelta(seconds=10)),   # the wick this test is built around
+        (99.6, base + timedelta(seconds=10)),  # the wick this test is built around
         (99.8, base + timedelta(seconds=15)),
         (100.0, base + timedelta(seconds=55)),  # last tick of minute 0
         (100.2, base + timedelta(seconds=65)),  # opens minute 1, closes minute 0 at 100.0
         (100.4, base + timedelta(seconds=90)),
-        (100.6, base + timedelta(seconds=115)), # last tick of minute 1
-        (100.8, base + timedelta(seconds=125)), # opens minute 2, closes minute 1 at 100.6
+        (100.6, base + timedelta(seconds=115)),  # last tick of minute 1
+        (100.8, base + timedelta(seconds=125)),  # opens minute 2, closes minute 1 at 100.6
         (101.0, base + timedelta(seconds=150)),
-        (101.2, base + timedelta(seconds=170)), # last tick of minute 2
-        (101.4, base + timedelta(seconds=182)), # opens minute 3, closes minute 2 at 101.2
+        (101.2, base + timedelta(seconds=170)),  # last tick of minute 2
+        (101.4, base + timedelta(seconds=182)),  # opens minute 3, closes minute 2 at 101.2
         (101.3, base + timedelta(seconds=185)),
     ]
     # A momentum runner's periodic _scan() calls MarketSurvey, which itself
@@ -579,9 +571,7 @@ def test_a_one_minute_entry_timeframe_waits_for_full_bars_not_five_second_ticks(
     assert "ENTRY_FILLED" not in decisions[:11]
     assert decisions[12] == "ALREADY_TRADED"
 
-    entry = next(
-        event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED"
-    )
+    entry = next(event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED")
     signal = entry["entry_signal"]
     # Direction is close-to-close across three completed 1-minute bars.
     assert signal["entry_check"]["window"] == pytest.approx([100.0, 100.6, 101.2])
@@ -657,9 +647,7 @@ def test_with_the_timeframe_off_bar_mode_reduces_to_the_original_tick_rule(
     for _ in range(6):
         runner._poll()
 
-    entry = next(
-        event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED"
-    )
+    entry = next(event for event in runner.snapshot()["events"] if event["type"] == "ENTRY_FILLED")
     assert entry["entry_signal"]["structural_stop"] == 100.0
 
 
@@ -815,9 +803,19 @@ class ReenterMarket(RisingThenReversingMarket):
     def __init__(self):
         base = datetime(2026, 8, 28, 4, 30, tzinfo=timezone.utc)
         prices = [
-            100.0,                                              # consumed by _scan()
-            100.0, 100.0, 100.0, 100.4, 101.0, 101.3, 99.5,    # entry then exit
-            99.5, 99.5, 100.4, 101.2, 101.5,                   # second rise, later
+            100.0,  # consumed by _scan()
+            100.0,
+            100.0,
+            100.0,
+            100.4,
+            101.0,
+            101.3,
+            99.5,  # entry then exit
+            99.5,
+            99.5,
+            100.4,
+            101.2,
+            101.5,  # second rise, later
         ]
         self._ticks = iter(
             (price, base + timedelta(seconds=5 * i)) for i, price in enumerate(prices)

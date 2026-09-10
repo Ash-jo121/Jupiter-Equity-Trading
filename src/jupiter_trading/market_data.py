@@ -145,6 +145,64 @@ class Candle:
         }
 
 
+class SharedCandleCache:
+    """Coalesce A/B/C one-minute histories into one provider read per minute."""
+
+    def __init__(self) -> None:
+        self._condition = Condition(RLock())
+        self._entries: dict[tuple, tuple[int, datetime, List[Candle]]] = {}
+        self._refreshing: set[tuple] = set()
+        self._hits = 0
+        self._misses = 0
+
+    def get(
+        self,
+        market_data: UpstoxMarketData,
+        instrument_key: str,
+        clock: Optional[datetime] = None,
+    ) -> dict:
+        now = clock or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        generation = int(now.timestamp() // 60)
+        key = (instrument_key, "minutes", 1)
+        with self._condition:
+            while True:
+                cached = self._entries.get(key)
+                if cached and cached[0] == generation:
+                    self._hits += 1
+                    return {
+                        "candles": list(cached[2]),
+                        "received_at": cached[1],
+                        "cache_hit": True,
+                        "generation": generation,
+                    }
+                if key not in self._refreshing:
+                    self._refreshing.add(key)
+                    self._misses += 1
+                    break
+                self._condition.wait()
+        try:
+            candles = market_data.intraday_candles(instrument_key, "minutes", 1)
+            received_at = datetime.now(timezone.utc)
+            with self._condition:
+                self._entries[key] = (generation, received_at, list(candles))
+            return {
+                "candles": list(candles),
+                "received_at": received_at,
+                "cache_hit": False,
+                "generation": generation,
+            }
+        finally:
+            with self._condition:
+                self._refreshing.discard(key)
+                self._condition.notify_all()
+
+    def stats(self) -> dict:
+        with self._condition:
+            return {"hits": self._hits, "misses": self._misses, "entries": len(self._entries)}
+
+
 class UpstoxMarketData:
     """Read-only Upstox V3 REST adapter suitable for an Analytics Token."""
 

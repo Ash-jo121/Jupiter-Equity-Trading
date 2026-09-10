@@ -169,6 +169,34 @@ NIFTY 50 momentum is recorded with every observation as market context, but it d
 entry in the default live strategy. Entries continue to be decided by the stock's three-bar price
 movement, cost/noise threshold, and relative-volume confirmation.
 
+### Three-entry MACD experiment
+
+The current research experiment starts three isolated paper accounts against the same NIFTY 100
+candidate, one-minute candle and quote streams:
+
+- A — `MACD_EARLY`: bullish rejection candle while a negative MACD histogram improves twice.
+- B — `MACD_EARLY_PRICE_CONFIRM`: the same setup, then a later quote must break one tick above
+  the setup high before its two-minute expiry.
+- C — `MACD_FRESH_CONFIRMED`: bullish rejection candle with a fresh MACD bullish cross and
+  expanding positive histogram.
+
+All arms require 1-minute RVOL of at least 1.5x, use 100 completed session bars for warm-up, enter
+only on a quote after the completed signal candle, and receive identical INR 1,000,000 starting
+capital by default. NIFTY direction remains recorded context and is not an entry gate unless the
+request explicitly enables it.
+
+```bash
+curl -X POST http://127.0.0.1:8000/entry-experiments \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_seconds":1800,"allocation_per_position":25000,"max_positions":2}'
+```
+
+The shared exit is unchanged across A/B/C: the existing ratchet remains active on each quote and
+a completed bearish rejection or strong-body candle can latch an earlier exit when MACD contracts
+materially, contracts for two consecutive steps, touches zero, or crosses down. Exit volume is
+recorded as participation context only; it never vetoes this V1 exit. A latched exit waits for a
+fresh later quote and remains pending until the entire residual quantity is reconciled.
+
 ### Exit
 
 The default `RATCHET` exit walks three phases, each keyed to the cost floor:
@@ -226,30 +254,19 @@ curl -X POST http://127.0.0.1:8000/momentum-runners \
 Inspect the returned runner ID with `GET /momentum-runners/{runner_id}` or stop it early with
 `POST /momentum-runners/{runner_id}/stop`. An early stop also liquidates open positions.
 
-### Comparing several configurations in one session
+### Comparing the three entries
 
-`POST /momentum-runners/batch` starts several differently configured runs side by side. Each
-variant inherits `base` and applies its own `overrides`, and each gets its own paper account:
-concurrent runners sharing an account would compete for the same cash and positions, so neither
-result would mean anything.
+The experiment start response contains the immutable experiment ID, shared configuration hash
+and all three run IDs. Use `GET /entry-experiments/{experiment_id}/comparison` for comparison
+JSON. CSV downloads are available below:
 
-```bash
-curl -X POST http://127.0.0.1:8000/momentum-runners/batch \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "base": {"duration_seconds": 1800, "allocation_per_position": 100000},
-        "account_prefix": "fwd",
-        "variants": [
-          {"label": "5s-ticks", "overrides": {"entry_timeframe_seconds": 0}},
-          {"label": "1m-bars",  "overrides": {"entry_timeframe_seconds": 60}}
-        ]
-      }'
-```
+- `/entry-experiments/{experiment_id}/exports/trades`
+- `/entry-experiments/{experiment_id}/exports/signals`
+- `/entry-experiments/{experiment_id}/exports/exits`
+- `/entry-experiments/{experiment_id}/exports/equity`
 
-That provisions `fwd-5s-ticks` and `fwd-1m-bars` and returns which arms started and which failed.
-An override naming a field that does not exist is rejected rather than silently ignored. One run
-per account is still enforced, so re-launching an arm while it is live returns 409. The dashboard
-Home tab has the same thing as a set of selectable arms, and shows every live arm at once.
+The older generic batch endpoint remains API-compatible for historical research, but the
+dashboard and daily automation no longer launch the old momentum double run.
 
 The dashboard's Runs tab lists every momentum run and opens symbol-first execution, fees, exit
 reasons, and P&L details. Its monitoring trace switches between **Table** and **Chart**: the chart
@@ -262,11 +279,10 @@ The point of the automation layer is to sweep configurations unattended while
 the market is open, so patterns can accumulate over days without anyone at the
 keyboard. `SCHEDULER_ENABLED=true` turns it on.
 
-At the open the scheduler launches **two full-session runs**: 5s ticks and 1m
-bars. Every run spans 09:15-15:30, holds the same
-`SCHEDULER_MAX_POSITIONS` (default 5), and is identical but for its entry
-timeframe - so the day's two P&L numbers are a clean, like-for-like comparison
-of that one axis, over the identical universe and session. Duration and position
+At the open the scheduler launches the **three one-minute A/B/C entry variants**.
+Every run spans 09:15-15:30, holds the same
+`SCHEDULER_MAX_POSITIONS` (default 2), and differs only in entry timing.
+Duration and position
 count are held fixed on purpose: duration is a sampling window, not a strategy
 knob, and fixing it at the whole session removes the end-of-session liquidation
 artifact and gives the most representative sample. Each run is on its own paper
@@ -274,8 +290,9 @@ account, because concurrent runs sharing an account would fight over cash and
 positions - so each account is funded with `SCHEDULER_INITIAL_CASH`, which must
 cover `max_positions x allocation`.
 
-The two runners share one cached NIFTY 100 survey, one NIFTY context baseline,
-and one short-lived live-quote cache. Five-minute intraday candles are refreshed
+The three runners share one cached NIFTY 100 survey, one NIFTY context baseline,
+one canonical one-minute candle cache, and one short-lived live-quote cache.
+Five-minute intraday candles are refreshed
 in a background worker once per five-minute window, so a slow survey does not
 pause five-second position monitoring. Near-simultaneous runner polls reuse the
 same timestamped Upstox quote and request only any missing instruments. The
@@ -283,12 +300,17 @@ process-wide Upstox client is also throttled below the standard per-second
 limit. Partial or rate-limited scans are reported as degraded data in the run
 detail instead of being presented as a conclusive no-trade result.
 
-A full-session run would exhaust the universe by mid-morning under the old
-"trade each stock once per run" rule, so automated runs use a **re-entry
-cooldown** (`SCHEDULER_COOLDOWN_SECONDS`, default 15 min): after a stock is
-exited it can set up and be traded again once the cooldown passes, rather than
-being locked out for the day. With the cooldown at zero the permanent
-once-per-stock behaviour returns (the default for short manual runs).
+Before a scheduled or manual run starts, the API refreshes the current NSE
+segment status and requires `NORMAL_OPEN`. Scheduled slots remain pending and
+retry during the opening grace window if the status or token is temporarily
+unavailable. Active runners refresh that status with their background scan.
+IOC paper orders blocked by a closed or unknown market are expired immediately
+with an explicit reason, and stale IOC orders from an earlier session are
+cleared before an opening status can permit new fills.
+
+V1 allows one filled trade per instrument, per run, per session. The scheduled
+cooldown is therefore fixed at zero; a partial entry fill also consumes that
+instrument's session allowance.
 
 ```bash
 curl 'http://127.0.0.1:8000/schedule/status'          # today's plan, filling in live
@@ -300,8 +322,9 @@ The scheduling decision lives in a pure `tick(now)` that reads the persisted
 plan and launches any slot whose start has arrived - so it is unit tested
 without threads, and a restart mid-session resumes from the saved slot states
 rather than relaunching or skipping. A slot missed by more than a grace window
-is marked `SKIPPED`; a launch failure marks that one arm `FAILED` and the rest
-proceed. Before creating a plan, the scheduler checks the official NSE `CM`
+is marked `SKIPPED`. The three arms prepare behind a common barrier; if one
+cannot initialize, the prepared arms are stopped before the barrier is released.
+Before creating a plan, the scheduler checks the official NSE `CM`
 holiday calendar, cached by year. `GET /schedule/calendar?year=2026` shows the
 dates currently being applied. Weekends, regular cash-market holidays, and
 special sessions outside the normal 09:15-15:30 window are skipped.

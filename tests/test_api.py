@@ -57,6 +57,42 @@ def test_market_data_endpoint_requires_token(tmp_path) -> None:
     assert response.json()["detail"] == "UPSTOX_ACCESS_TOKEN is not configured"
 
 
+def test_market_status_endpoint_is_read_only_for_execution_state(tmp_path) -> None:
+    class ClosedMarket:
+        def market_status(self, exchange="NSE"):
+            return {"exchange": exchange, "status": "CLOSING_END"}
+
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="token",
+    )
+    app = create_app(settings, market_data_client=ClosedMarket())
+
+    with TestClient(app) as client:
+        response = client.get("/market/status")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CLOSING_END"
+    assert app.state.accounts.get().market_statuses == {}
+
+
+def test_manual_runner_cannot_start_while_nse_is_closed(tmp_path) -> None:
+    class ClosedMarket:
+        def market_status(self, exchange="NSE"):
+            return {"exchange": exchange, "status": "CLOSING_END"}
+
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="token",
+    )
+
+    with TestClient(create_app(settings, market_data_client=ClosedMarket())) as client:
+        response = client.post("/momentum-runners", json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == ("NSE is not open for execution (status: CLOSING_END)")
+
+
 def test_cost_model_endpoint_reports_the_breakeven_for_a_position_size(tmp_path) -> None:
     settings = Settings(
         slippage_bps=2,
@@ -186,6 +222,66 @@ def test_live_momentum_request_does_not_gate_on_nifty_by_default() -> None:
     from jupiter_trading.api import MomentumRunRequest
 
     assert MomentumRunRequest().require_nifty_confirmation is False
+    assert MomentumRunRequest().signal_strategy == "MOMENTUM_REVERSAL"
+    assert MomentumRunRequest(signal_strategy="MACD_EARLY").signal_strategy == "MACD_EARLY"
+
+
+def test_three_entry_experiment_starts_all_arms_with_one_shared_hash(tmp_path, monkeypatch) -> None:
+    from datetime import timedelta, timezone
+
+    from jupiter_trading.domain import Quote
+    from jupiter_trading.market_data import Candle
+
+    class OpenMarket:
+        def market_status(self, exchange="NSE"):
+            return {"exchange": exchange, "status": "NORMAL_OPEN"}
+
+        def ltp(self, keys):
+            return {key: Quote(key, 100.0) for key in keys}
+
+        def intraday_candles(self, instrument_key, unit="minutes", interval=5):
+            now = datetime.now(timezone.utc) - timedelta(minutes=120)
+            return [
+                Candle(
+                    now + timedelta(minutes=index * interval),
+                    99.5,
+                    100.5,
+                    99.0,
+                    100.0,
+                    100 + index,
+                    0,
+                )
+                for index in range(20)
+            ]
+
+    monkeypatch.setattr(
+        "jupiter_trading.api.Nifty100Universe.constituents",
+        lambda self: [{"symbol": "TEST", "instrument_key": "NSE_EQ|TEST"}],
+    )
+    settings = Settings(
+        database_path=str(tmp_path / "paper.db"),
+        upstox_access_token="token",
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    with TestClient(create_app(settings, market_data_client=OpenMarket())) as client:
+        response = client.post(
+            "/entry-experiments",
+            json={"experiment_id": "spec-test", "duration_seconds": 30},
+        )
+        assert response.status_code == 202
+        result = response.json()
+        assert [item["entry_mode"] for item in result["variants"]] == [
+            "MACD_EARLY",
+            "MACD_EARLY_PRICE_CONFIRM",
+            "MACD_FRESH_CONFIRMED",
+        ]
+        assert len({item["run"]["config"]["account_id"] for item in result["variants"]}) == 3
+        assert {item["run"]["shared_config_hash"] for item in result["variants"]} == {
+            result["shared_config_hash"]
+        }
+        comparison = client.get("/entry-experiments/spec-test/comparison").json()
+        assert comparison["comparison_status"] == "INCOMPLETE"
 
 
 def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
@@ -218,16 +314,23 @@ def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
         assert page["count"] == 5
         assert page["observations"][0]["price"] == 2340.0
 
-        assert client.get("/observations", params={"session_date": "1999-01-01"}).json()["count"] == 0
+        assert (
+            client.get("/observations", params={"session_date": "1999-01-01"}).json()["count"] == 0
+        )
         assert client.get("/observations", params={"limit": 0}).status_code == 422
 
 
-def test_schedule_plan_endpoint_returns_one_full_session_run_per_timeframe(tmp_path) -> None:
+def test_schedule_plan_endpoint_returns_the_three_entry_variants(tmp_path) -> None:
     with TestClient(create_app(_paper_settings(tmp_path))) as client:
         plan = client.get("/schedule/plan", params={"session_date": "2026-08-31"}).json()
         assert plan["session_date"] == "2026-08-31"
-        assert len(plan["slots"]) == 2  # 5s and 1m
-        assert {s["entry_timeframe_seconds"] for s in plan["slots"]} == {0, 60}
+        assert len(plan["slots"]) == 3
+        assert {slot["entry_mode"] for slot in plan["slots"]} == {
+            "MACD_EARLY",
+            "MACD_EARLY_PRICE_CONFIRM",
+            "MACD_FRESH_CONFIRMED",
+        }
+        assert {s["entry_timeframe_seconds"] for s in plan["slots"]} == {60}
         assert plan["coverage"]["covered_pct"] == 100.0
         # Every run spans the whole session, so all share the open and close.
         assert len({s["start_ist"] for s in plan["slots"]}) == 1

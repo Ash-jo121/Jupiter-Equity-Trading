@@ -7,6 +7,7 @@ from typing import Callable, List, Optional
 
 from .research_store import ResearchStore
 from .schedule import (
+    ENTRY_VARIANTS,
     IST,
     DailyPlan,
     ScheduledSlot,
@@ -23,18 +24,18 @@ REPORT_DELAY_SECONDS = 180
 @dataclass(frozen=True)
 class SchedulerConfig:
     enabled: bool = False
-    entry_timeframes: tuple = (0, 60)
-    max_positions: int = 5
-    reentry_cooldown_seconds: float = 900.0  # 15 min before a stock can re-enter
+    entry_variants: tuple = ENTRY_VARIANTS
+    max_positions: int = 2
+    reentry_cooldown_seconds: float = 0.0
     account_prefix: str = "auto"
-    allocation_per_position: float = 100_000.0
-    initial_cash: float = 600_000.0  # must cover max_positions x allocation
+    allocation_per_position: float = 25_000.0
+    initial_cash: float = 1_000_000.0
     tick_seconds: float = 30.0
     catch_up_grace_seconds: float = 1800.0  # a full-session run is worth joining late
 
     def __post_init__(self) -> None:
-        if not self.entry_timeframes:
-            raise ValueError("at least one entry timeframe is required")
+        if not self.entry_variants:
+            raise ValueError("at least one entry variant is required")
         if self.max_positions < 1:
             raise ValueError("max_positions must be at least one")
         if self.allocation_per_position <= 0:
@@ -48,7 +49,7 @@ class SchedulerConfig:
 
 
 class DailyScheduler:
-    """Launches one full-session run per entry timeframe at the open, reports at close.
+    """Launches the three-entry experiment at the open and reports at close.
 
     The decision logic lives in `tick`, which is a pure function of the current
     time and the persisted plan - so it can be unit tested without threads or a
@@ -90,18 +91,18 @@ class DailyScheduler:
             # only a draft, so make it match the current scheduler settings.
             # Once a slot has moved past PENDING it is execution history and
             # must never be rewritten.
-            configured_timeframes = list(dict.fromkeys(self.config.entry_timeframes))
-            stored_timeframes = [slot.entry_timeframe_seconds for slot in plan.slots]
+            configured_modes = [mode for _label, mode in self.config.entry_variants]
+            stored_modes = [slot.entry_mode for slot in plan.slots]
             plan_is_draft = all(slot.status == "PENDING" for slot in plan.slots)
             configuration_changed = (
-                stored_timeframes != configured_timeframes
+                stored_modes != configured_modes
                 or any(slot.max_positions != self.config.max_positions for slot in plan.slots)
                 or plan.account_prefix != self.config.account_prefix
             )
             if create and plan_is_draft and configuration_changed:
                 plan = build_daily_plan(
                     session_date,
-                    timeframes=self.config.entry_timeframes,
+                    variants=self.config.entry_variants,
                     max_positions=self.config.max_positions,
                     account_prefix=self.config.account_prefix,
                 )
@@ -111,7 +112,7 @@ class DailyScheduler:
             return None
         plan = build_daily_plan(
             session_date,
-            timeframes=self.config.entry_timeframes,
+            variants=self.config.entry_variants,
             max_positions=self.config.max_positions,
             account_prefix=self.config.account_prefix,
         )
@@ -155,10 +156,10 @@ class DailyScheduler:
                     actions.append({"slot": slot.index, "action": "SKIPPED"})
                     continue
                 if not self._market_ready():
-                    slot.status = "SKIPPED"
-                    slot.detail = "market data unavailable"
-                    changed = True
-                    actions.append({"slot": slot.index, "action": "SKIPPED_NO_MARKET"})
+                    # Opening status and token refreshes can lag briefly. Keep
+                    # the slot pending so the next scheduler tick can retry it
+                    # until the normal catch-up grace window expires.
+                    actions.append({"slot": slot.index, "action": "WAITING_FOR_MARKET"})
                     continue
                 try:
                     slot.runner_id = self._launch(slot, self.config)
@@ -169,9 +170,7 @@ class DailyScheduler:
                 except Exception as error:  # noqa: BLE001 - one bad arm must not stop the rest
                     slot.status = "FAILED"
                     slot.detail = str(error)[:300]
-                    actions.append(
-                        {"slot": slot.index, "action": "FAILED", "error": slot.detail}
-                    )
+                    actions.append({"slot": slot.index, "action": "FAILED", "error": slot.detail})
                 changed = True
             if changed:
                 self._save(plan)
@@ -194,9 +193,7 @@ class DailyScheduler:
         pending = [slot for slot in plan.slots if slot.status == "PENDING"]
         if pending:
             return None  # some slot has not even started yet
-        last_end = max(
-            datetime.fromisoformat(slot.end_ist) for slot in plan.slots
-        )
+        last_end = max(datetime.fromisoformat(slot.end_ist) for slot in plan.slots)
         if launched and moment < last_end + timedelta(seconds=REPORT_DELAY_SECONDS):
             return None  # let the final run settle before summarising
         try:
@@ -236,7 +233,10 @@ class DailyScheduler:
             "running": bool(self._thread and self._thread.is_alive()),
             "session_date": session_date,
             "is_trading_day": self._trading_day_check(session_date),
-            "entry_timeframes": list(self.config.entry_timeframes),
+            "entry_variants": [
+                {"label": label, "entry_mode": mode}
+                for label, mode in self.config.entry_variants
+            ],
             "max_positions": self.config.max_positions,
             "reentry_cooldown_seconds": self.config.reentry_cooldown_seconds,
             "plan": plan.to_dict() if plan else None,

@@ -8,10 +8,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
 
-# The one axis worth comparing head to head: raw 5s ticks versus 1m entry bars.
-# Everything else (full-session duration, position cap) is held fixed so each
-# run differs by exactly this, over the identical universe and session.
-ENTRY_TIMEFRAMES = (0, 60)
+# The daily automation now runs the spec's three entry variants on one-minute bars.
+ENTRY_TIMEFRAMES = (60,)
+ENTRY_VARIANTS = (
+    ("A", "MACD_EARLY"),
+    ("B", "MACD_EARLY_PRICE_CONFIRM"),
+    ("C", "MACD_FRESH_CONFIRMED"),
+)
 TIMEFRAME_LABELS = {0: "5s", 60: "1m", 180: "3m", 300: "5m"}
 
 
@@ -31,6 +34,7 @@ class ScheduledSlot:
     duration_seconds: int
     max_positions: int
     entry_timeframe_seconds: int
+    entry_mode: str = "MACD_EARLY"
     status: str = "PENDING"  # PENDING -> LAUNCHED / FAILED / SKIPPED
     runner_id: Optional[str] = None
     detail: Optional[str] = None
@@ -75,11 +79,12 @@ def _ist_datetime(session_date: str, moment: time) -> datetime:
 
 def build_daily_plan(
     session_date: str,
-    timeframes: Sequence[int] = ENTRY_TIMEFRAMES,
+    timeframes: Optional[Sequence[int]] = None,
     max_positions: int = 5,
     account_prefix: str = "auto",
+    variants: Sequence[tuple] = ENTRY_VARIANTS,
 ) -> DailyPlan:
-    """One full-session run per entry timeframe.
+    """One full-session run per A/B/C entry variant.
 
     Every run opens at 09:15 and closes at 15:30, so the session is covered by
     construction with no staggering to engineer. The runs are identical but for
@@ -89,8 +94,17 @@ def build_daily_plan(
     than exhausting the universe by mid-morning.
     """
 
-    if not timeframes:
-        raise ValueError("a plan needs at least one entry timeframe")
+    legacy_timeframes = timeframes is not None
+    if legacy_timeframes:
+        # Retain the old helper shape for callers that explicitly build legacy plans.
+        variants = tuple(
+            (timeframe_label(value), "MOMENTUM_REVERSAL", value)
+            for value in dict.fromkeys(timeframes or ())
+        )
+    else:
+        variants = tuple((label, mode, 60) for label, mode in variants)
+    if not variants:
+        raise ValueError("a plan needs at least one entry variant")
     if max_positions < 1:
         raise ValueError("max_positions must be at least one")
     open_at = _ist_datetime(session_date, SESSION_OPEN)
@@ -100,18 +114,24 @@ def build_daily_plan(
         raise ValueError("session close must be after session open")
 
     slots = []
-    for index, timeframe in enumerate(dict.fromkeys(timeframes)):
-        label = f"full-{max_positions}pos-{timeframe_label(timeframe)}"
+    seen = set()
+    for index, (variant_label, entry_mode, timeframe) in enumerate(variants):
+        identity = (variant_label, entry_mode) if legacy_timeframes else entry_mode
+        if identity in seen:
+            continue
+        seen.add(identity)
+        label = f"{variant_label} · {entry_mode.replace('_', ' ').title()}"
         slots.append(
             ScheduledSlot(
                 index=index,
                 start_ist=open_at.isoformat(),
                 end_ist=close_at.isoformat(),
-                account_id=f"{account_prefix}-{session_date}-{timeframe_label(timeframe)}"[:40],
+                account_id=f"{account_prefix}-{session_date}-{variant_label}"[:40],
                 label=label,
                 duration_seconds=duration,
                 max_positions=max_positions,
                 entry_timeframe_seconds=int(timeframe),
+                entry_mode=entry_mode,
             )
         )
     return DailyPlan(session_date=session_date, account_prefix=account_prefix, slots=slots)

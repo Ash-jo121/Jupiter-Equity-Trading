@@ -1,7 +1,12 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from jupiter_trading.domain import Quote
-from jupiter_trading.market_data import SharedQuoteCache, UpstoxMarketData
+from jupiter_trading.market_data import (
+    Candle,
+    SharedCandleCache,
+    SharedQuoteCache,
+    UpstoxMarketData,
+)
 
 
 class FakeUpstox(UpstoxMarketData):
@@ -59,3 +64,25 @@ def test_shared_quote_cache_reuses_quotes_and_only_fetches_missing_keys() -> Non
     assert second == first
     assert extended["A"] is first["A"]
     assert cache.stats() == {"requests": 2, "cache_hits": 1, "instruments": 3}
+
+
+def test_shared_candle_cache_fetches_once_for_all_arms_in_a_logical_minute() -> None:
+    class CountingMarket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def intraday_candles(self, instrument_key, unit, interval):
+            self.calls += 1
+            return [Candle(datetime.now(timezone.utc), 99, 101, 98, 100, 10, 0)]
+
+    market = CountingMarket()
+    cache = SharedCandleCache()
+    clock = datetime(2026, 9, 10, 5, 0, 5, tzinfo=timezone.utc)
+
+    first = cache.get(market, "NSE_EQ|TEST", clock)
+    second = cache.get(market, "NSE_EQ|TEST", clock + timedelta(seconds=20))
+
+    assert market.calls == 1
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert cache.stats() == {"hits": 1, "misses": 1, "entries": 1}

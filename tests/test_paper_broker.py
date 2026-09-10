@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from jupiter_trading.domain import Order, OrderStatus, OrderType, Quote, Side
+from jupiter_trading.domain import Order, OrderStatus, OrderType, Quote, Side, Validity
 from jupiter_trading.paper_broker import FeeSchedule, PaperBroker, RiskLimits
 
 
@@ -35,9 +35,7 @@ def test_market_buy_uses_ask_and_adverse_slippage() -> None:
 
 def test_limit_order_waits_then_fills() -> None:
     broker = paper_broker(initial_cash=100_000, slippage_bps=0)
-    order = broker.submit(
-        Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.LIMIT, limit_price=99)
-    )
+    order = broker.submit(Order("NSE_EQ|TEST", Side.BUY, 10, OrderType.LIMIT, limit_price=99))
 
     assert broker.on_quote(quote(100, ask=100)) == []
     fills = broker.on_quote(quote(98.5, ask=98.6))
@@ -73,6 +71,46 @@ def test_queued_order_fills_on_next_quote_after_market_opens() -> None:
     assert fills[0].price == 101
     assert order.status == OrderStatus.FILLED
     assert broker.cash == 98_990
+
+
+def test_closed_market_expires_ioc_order_with_an_explicit_reason() -> None:
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
+    broker.update_market_status({"NSE_EQ": "CLOSING_END"})
+    broker.on_quote(quote(100))
+
+    order = broker.submit(
+        Order(
+            "NSE_EQ|TEST",
+            Side.BUY,
+            10,
+            OrderType.MARKET,
+            validity=Validity.IOC,
+        )
+    )
+
+    assert order.status == OrderStatus.EXPIRED
+    assert order.rejection_reason == "market status CLOSING_END does not allow execution"
+
+
+def test_status_refresh_expires_stale_ioc_before_the_market_reopens() -> None:
+    broker = paper_broker(initial_cash=100_000, slippage_bps=0)
+    order = broker.submit(
+        Order(
+            "NSE_EQ|TEST",
+            Side.BUY,
+            10,
+            OrderType.MARKET,
+            validity=Validity.IOC,
+        )
+    )
+    assert order.status == OrderStatus.OPEN
+
+    broker.update_market_status({"NSE_EQ": "NORMAL_OPEN"})
+    fills = broker.on_quote(quote(101))
+
+    assert fills == []
+    assert order.status == OrderStatus.EXPIRED
+    assert "refreshed before IOC execution" in order.rejection_reason
 
 
 def test_realized_and_unrealized_pnl() -> None:

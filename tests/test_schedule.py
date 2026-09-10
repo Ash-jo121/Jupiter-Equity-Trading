@@ -5,7 +5,7 @@ import pytest
 from jupiter_trading.automation import DailyScheduler, SchedulerConfig
 from jupiter_trading.research_store import ResearchStore
 from jupiter_trading.schedule import (
-    ENTRY_TIMEFRAMES,
+    ENTRY_VARIANTS,
     build_daily_plan,
     coverage_summary,
     is_trading_day,
@@ -15,10 +15,11 @@ MONDAY = "2026-08-31"
 SATURDAY = "2026-08-29"
 
 
-def test_the_default_plan_is_one_run_per_entry_timeframe() -> None:
+def test_the_default_plan_is_one_run_per_entry_variant() -> None:
     plan = build_daily_plan(MONDAY)
-    assert len(plan.slots) == len(ENTRY_TIMEFRAMES)
-    assert {slot.entry_timeframe_seconds for slot in plan.slots} == set(ENTRY_TIMEFRAMES)
+    assert len(plan.slots) == len(ENTRY_VARIANTS)
+    assert {slot.entry_mode for slot in plan.slots} == {mode for _label, mode in ENTRY_VARIANTS}
+    assert {slot.entry_timeframe_seconds for slot in plan.slots} == {60}
     assert all(slot.max_positions == 5 for slot in plan.slots)
 
 
@@ -36,7 +37,7 @@ def test_full_session_runs_cover_the_entire_day() -> None:
     coverage = coverage_summary(build_daily_plan(MONDAY).slots)
     assert coverage["covered_pct"] == 100.0
     assert coverage["largest_gap_seconds"] == 0
-    assert coverage["concurrent_peak"] == len(ENTRY_TIMEFRAMES)
+    assert coverage["concurrent_peak"] == len(ENTRY_VARIANTS)
 
 
 def test_each_arm_gets_its_own_account() -> None:
@@ -81,9 +82,7 @@ def _scheduler(tmp_path, **config):
         reports.append(session_date)
         return {"session_date": session_date}
 
-    scheduler = DailyScheduler(
-        store, launch, build_report, SchedulerConfig(enabled=True, **config)
-    )
+    scheduler = DailyScheduler(store, launch, build_report, SchedulerConfig(enabled=True, **config))
     return scheduler, store, launched, reports
 
 
@@ -96,14 +95,12 @@ def test_all_arms_launch_at_the_open(tmp_path) -> None:
     scheduler.tick(_at(MONDAY, 9, 0))  # before open
     assert launched == []
     scheduler.tick(_at(MONDAY, 9, 16))  # just after open
-    assert len(launched) == len(ENTRY_TIMEFRAMES)
-    assert {slot.entry_timeframe_seconds for slot in launched} == set(ENTRY_TIMEFRAMES)
+    assert len(launched) == len(ENTRY_VARIANTS)
+    assert {slot.entry_mode for slot in launched} == {mode for _label, mode in ENTRY_VARIANTS}
 
 
 def test_the_cooldown_and_positions_reach_the_launch(tmp_path) -> None:
-    scheduler, _, launched, _ = _scheduler(
-        tmp_path, max_positions=5, reentry_cooldown_seconds=900
-    )
+    scheduler, _, launched, _ = _scheduler(tmp_path, max_positions=5, reentry_cooldown_seconds=900)
     scheduler.tick(_at(MONDAY, 9, 16))
     assert scheduler.config.reentry_cooldown_seconds == 900
     assert all(slot.max_positions == 5 for slot in launched)
@@ -112,7 +109,7 @@ def test_the_cooldown_and_positions_reach_the_launch(tmp_path) -> None:
 def test_a_full_day_launches_all_arms_then_reports_after_close(tmp_path) -> None:
     scheduler, store, launched, reports = _scheduler(tmp_path)
     scheduler.tick(_at(MONDAY, 9, 16))
-    assert len(launched) == len(ENTRY_TIMEFRAMES)
+    assert len(launched) == len(ENTRY_VARIANTS)
     assert reports == []  # runs still going
     scheduler.tick(_at(MONDAY, 15, 34))  # a few minutes past close
     assert reports == [MONDAY]
@@ -122,7 +119,7 @@ def test_a_full_day_launches_all_arms_then_reports_after_close(tmp_path) -> None
 def test_arms_are_not_relaunched_after_a_restart(tmp_path) -> None:
     scheduler, store, launched, _ = _scheduler(tmp_path)
     scheduler.tick(_at(MONDAY, 9, 16))
-    assert len(launched) == len(ENTRY_TIMEFRAMES)
+    assert len(launched) == len(ENTRY_VARIANTS)
     resumed, _, relaunched, _ = _scheduler(tmp_path)
     resumed.store = store
     resumed.tick(_at(MONDAY, 9, 30))
@@ -130,19 +127,21 @@ def test_arms_are_not_relaunched_after_a_restart(tmp_path) -> None:
 
 
 def test_an_unlaunched_saved_plan_tracks_the_current_arms(tmp_path) -> None:
-    scheduler, store, launched, _ = _scheduler(tmp_path, entry_timeframes=(0, 60))
+    scheduler, store, launched, _ = _scheduler(tmp_path, entry_variants=ENTRY_VARIANTS[:2])
     old_plan = build_daily_plan(MONDAY, timeframes=(0, 60, 180, 300))
     store.save_schedule_plan(MONDAY, old_plan.to_dict())
 
     scheduler.tick(_at(MONDAY, 9, 16))
 
-    assert [slot.entry_timeframe_seconds for slot in launched] == [0, 60]
+    assert [slot.entry_mode for slot in launched] == [mode for _label, mode in ENTRY_VARIANTS[:2]]
     saved = store.schedule_plan(MONDAY)
-    assert [slot["entry_timeframe_seconds"] for slot in saved["slots"]] == [0, 60]
+    assert [slot["entry_mode"] for slot in saved["slots"]] == [
+        mode for _label, mode in ENTRY_VARIANTS[:2]
+    ]
 
 
 def test_a_started_saved_plan_is_preserved_as_history(tmp_path) -> None:
-    scheduler, store, launched, _ = _scheduler(tmp_path, entry_timeframes=(0, 60))
+    scheduler, store, launched, _ = _scheduler(tmp_path, entry_variants=ENTRY_VARIANTS[:2])
     old_plan = build_daily_plan(MONDAY, timeframes=(0, 60, 180, 300))
     old_plan.slots[0].status = "LAUNCHED"
     old_plan.slots[0].runner_id = "existing-runner"
@@ -150,15 +149,13 @@ def test_a_started_saved_plan_is_preserved_as_history(tmp_path) -> None:
 
     scheduler.tick(_at(MONDAY, 9, 16))
 
-    assert [slot.entry_timeframe_seconds for slot in launched] == [60, 180, 300]
+    assert [slot.entry_mode for slot in launched] == ["MOMENTUM_REVERSAL"] * 3
     saved = store.schedule_plan(MONDAY)
     assert len(saved["slots"]) == 4
 
 
 def test_arms_missed_past_the_grace_window_are_skipped(tmp_path) -> None:
-    scheduler, store, launched, _ = _scheduler(
-        tmp_path, catch_up_grace_seconds=1800
-    )
+    scheduler, store, launched, _ = _scheduler(tmp_path, catch_up_grace_seconds=1800)
     scheduler.tick(_at(MONDAY, 11, 0))  # over an hour after open
     assert launched == []
     plan = store.schedule_plan(MONDAY)
@@ -175,10 +172,31 @@ def test_no_launch_without_market_data(tmp_path) -> None:
         SchedulerConfig(enabled=True),
         market_ready=lambda: False,
     )
-    scheduler.tick(_at(MONDAY, 9, 16))
+    actions = scheduler.tick(_at(MONDAY, 9, 16))
     assert launched == []
     plan = store.schedule_plan(MONDAY)
-    assert all(slot["detail"] == "market data unavailable" for slot in plan["slots"])
+    assert {slot["status"] for slot in plan["slots"]} == {"PENDING"}
+    assert {action["action"] for action in actions} == {"WAITING_FOR_MARKET"}
+
+
+def test_pending_arms_launch_when_market_data_recovers(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "sched.db"))
+    launched = []
+    readiness = iter([False, False, False, True, True, True])
+    scheduler = DailyScheduler(
+        store,
+        lambda slot, cfg: launched.append(slot) or f"runner-{slot.index}",
+        lambda date: {},
+        SchedulerConfig(enabled=True),
+        market_ready=lambda: next(readiness),
+    )
+
+    scheduler.tick(_at(MONDAY, 9, 15))
+    scheduler.tick(_at(MONDAY, 9, 16))
+
+    assert len(launched) == len(ENTRY_VARIANTS)
+    plan = store.schedule_plan(MONDAY)
+    assert {slot["status"] for slot in plan["slots"]} == {"LAUNCHED"}
 
 
 def test_a_disabled_scheduler_does_nothing(tmp_path) -> None:
@@ -221,13 +239,11 @@ def test_one_failing_arm_does_not_stop_the_others(tmp_path) -> None:
         launched.append(slot)
         return f"runner-{slot.index}"
 
-    scheduler = DailyScheduler(
-        store, launch, lambda date: {}, SchedulerConfig(enabled=True)
-    )
+    scheduler = DailyScheduler(store, launch, lambda date: {}, SchedulerConfig(enabled=True))
     scheduler.tick(_at(MONDAY, 9, 16))
     plan = store.schedule_plan(MONDAY)
     assert plan["slots"][0]["status"] == "FAILED"
-    assert len(launched) == len(ENTRY_TIMEFRAMES) - 1
+    assert len(launched) == len(ENTRY_VARIANTS) - 1
 
 
 def test_initial_cash_must_cover_the_positions() -> None:

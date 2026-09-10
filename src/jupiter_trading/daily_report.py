@@ -17,7 +17,9 @@ def _config_key(config: dict) -> str:
     minutes = int(config.get("duration_seconds", 0)) // 60
     timeframe = int(config.get("entry_timeframe_seconds", 0) or 0)
     frame = {0: "5s", 60: "1m", 180: "3m", 300: "5m"}.get(timeframe, f"{timeframe}s")
-    return f"{minutes}m-{config.get('max_positions', '?')}pos-{frame}"
+    strategy = config.get("signal_strategy", "MOMENTUM_REVERSAL")
+    strategy_label = strategy.lower().replace("_", "-")
+    return f"{strategy_label}-{minutes}m-{config.get('max_positions', '?')}pos-{frame}"
 
 
 def _run_summary(run: dict) -> dict:
@@ -42,6 +44,9 @@ def _run_summary(run: dict) -> dict:
     )
     return {
         "run_id": run.get("id"),
+        "experiment_id": run.get("experiment_id") or config.get("experiment_id"),
+        "variant_label": run.get("variant_label") or config.get("variant_label"),
+        "shared_config_hash": run.get("shared_config_hash") or config.get("shared_config_hash"),
         "account_id": config.get("account_id"),
         "config_key": _config_key(config),
         "status": run.get("status"),
@@ -50,6 +55,7 @@ def _run_summary(run: dict) -> dict:
         "duration_seconds": config.get("duration_seconds"),
         "max_positions": config.get("max_positions"),
         "entry_timeframe_seconds": config.get("entry_timeframe_seconds", 0),
+        "signal_strategy": config.get("signal_strategy", "MOMENTUM_REVERSAL"),
         "net_pnl": run.get("session_pnl", metrics.get("net_pnl", 0.0)),
         "gross_pnl": metrics.get("gross_pnl", 0.0),
         "fees": metrics.get("fees", 0.0),
@@ -168,6 +174,7 @@ class DailyReportBuilder:
             "by_duration": _by_config(summaries, "duration_seconds"),
             "by_positions": _by_config(summaries, "max_positions"),
             "by_timeframe": _by_config(summaries, "entry_timeframe_seconds"),
+            "by_strategy": _by_config(summaries, "signal_strategy"),
             "decision_totals": _decision_totals(runs),
             "coverage": (plan or {}).get("coverage"),
             "plan_slots": len((plan or {}).get("slots", [])),

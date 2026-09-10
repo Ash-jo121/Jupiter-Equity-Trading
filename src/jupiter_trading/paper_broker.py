@@ -66,10 +66,14 @@ class FeeSchedule:
         elif product == Product.DELIVERY:
             brokerage = self.delivery_brokerage_flat
         else:
-            brokerage = min(self.intraday_brokerage_cap, notional * self.intraday_brokerage_bps / 10_000)
+            brokerage = min(
+                self.intraday_brokerage_cap, notional * self.intraday_brokerage_bps / 10_000
+            )
 
-        stt_bps = self.delivery_stt_bps if product == Product.DELIVERY else (
-            self.intraday_sell_stt_bps if side == Side.SELL else 0.0
+        stt_bps = (
+            self.delivery_stt_bps
+            if product == Product.DELIVERY
+            else (self.intraday_sell_stt_bps if side == Side.SELL else 0.0)
         )
         stamp_bps = 0.0
         if side == Side.BUY:
@@ -150,7 +154,9 @@ class PaperBroker:
             self.fills.append(fill)
             cash_delta = fill.gross_value if fill.side == Side.SELL else -fill.gross_value
             self.cash += cash_delta - fill.fees
-            self.positions.setdefault(fill.instrument_key, Position(fill.instrument_key)).apply(fill)
+            self.positions.setdefault(fill.instrument_key, Position(fill.instrument_key)).apply(
+                fill
+            )
             if fill.product == Product.DELIVERY and fill.side == Side.SELL and fill.charges.dp:
                 self._dp_charged.add((fill.instrument_key, fill.timestamp.date()))
 
@@ -162,6 +168,10 @@ class PaperBroker:
                 return self._reject(order, "kill switch is active")
             self.orders[order.id] = order
             self.repository.save_order(order)
+            blocked = self._execution_block_reason(order.instrument_key)
+            if blocked and order.validity == Validity.IOC:
+                self._expire(order, reason=blocked)
+                return order
             quote = self.quotes.get(order.instrument_key)
             if quote and self._is_execution_allowed(order.instrument_key):
                 self._try_fill(order, quote)
@@ -223,10 +233,21 @@ class PaperBroker:
             self.quotes[quote.instrument_key] = quote
             self._books[quote.instrument_key] = self._book_from_quote(quote)
             if not self._is_execution_allowed(quote.instrument_key):
+                reason = self._execution_block_reason(quote.instrument_key)
+                for order in self.orders.values():
+                    if (
+                        order.instrument_key == quote.instrument_key
+                        and order.status in ACTIVE_ORDER_STATUSES
+                        and order.validity == Validity.IOC
+                    ):
+                        self._expire(order, quote, reason)
                 return []
             created: List[Fill] = []
             for order in list(self.orders.values()):
-                if order.status not in ACTIVE_ORDER_STATUSES or order.instrument_key != quote.instrument_key:
+                if (
+                    order.status not in ACTIVE_ORDER_STATUSES
+                    or order.instrument_key != quote.instrument_key
+                ):
                     continue
                 created.extend(self._try_fill(order, quote))
             return created
@@ -236,7 +257,14 @@ class PaperBroker:
             previous = dict(self.market_statuses)
             self.market_statuses.update(statuses)
             for segment, status in statuses.items():
-                if previous.get(segment) in EXECUTABLE_MARKET_STATUSES and status not in EXECUTABLE_MARKET_STATUSES:
+                # IOC orders must never survive until a later session. Any IOC
+                # still active when status is refreshed is stale and is expired
+                # before a new opening quote can accidentally fill it.
+                self._expire_ioc_orders(segment, status)
+                if (
+                    previous.get(segment) in EXECUTABLE_MARKET_STATUSES
+                    and status not in EXECUTABLE_MARKET_STATUSES
+                ):
                     self._expire_day_orders(segment)
 
     def set_kill_switch(self, active: bool) -> None:
@@ -302,6 +330,13 @@ class PaperBroker:
         status = self.market_statuses.get(segment)
         return status is None or status in EXECUTABLE_MARKET_STATUSES
 
+    def _execution_block_reason(self, instrument_key: str) -> Optional[str]:
+        segment = instrument_key.partition("|")[0]
+        status = self.market_statuses.get(segment)
+        if status is None or status in EXECUTABLE_MARKET_STATUSES:
+            return None
+        return f"market status {status} does not allow execution"
+
     def _try_fill(self, order: Order, quote: Quote) -> List[Fill]:
         if order.order_type == OrderType.STOP_MARKET and order.triggered_at is None:
             triggered = (
@@ -359,8 +394,10 @@ class PaperBroker:
         bids, asks = self._books.get(quote.instrument_key, ([], []))
         levels = asks if order.side == Side.BUY else bids
         if not levels:
-            fallback = (quote.ask or quote.last_price) if order.side == Side.BUY else (
-                quote.bid or quote.last_price
+            fallback = (
+                (quote.ask or quote.last_price)
+                if order.side == Side.BUY
+                else (quote.bid or quote.last_price)
             )
             levels = [[fallback, float("inf")]]
         if order.order_type == OrderType.LIMIT:
@@ -459,11 +496,28 @@ class PaperBroker:
         self.repository.save_order(order)
         return order
 
-    def _expire(self, order: Order, quote: Optional[Quote] = None) -> None:
+    def _expire(
+        self,
+        order: Order,
+        quote: Optional[Quote] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         order.status = OrderStatus.EXPIRED
+        if reason:
+            order.rejection_reason = reason
         order.expired_at = quote.timestamp if quote else utc_now()
         order.updated_at = order.expired_at
         self.repository.save_order(order)
+
+    def _expire_ioc_orders(self, segment: str, status: str) -> None:
+        reason = f"market status {status} refreshed before IOC execution"
+        for order in self.orders.values():
+            if (
+                order.status in ACTIVE_ORDER_STATUSES
+                and order.validity == Validity.IOC
+                and order.instrument_key.partition("|")[0] == segment
+            ):
+                self._expire(order, reason=reason)
 
     def _expire_day_orders(self, segment: str) -> None:
         for order in self.orders.values():
@@ -480,8 +534,7 @@ class PaperBroker:
     def _aggregate_charges(self) -> dict:
         keys = ("brokerage", "stt", "exchange_transaction", "sebi", "stamp_duty", "gst", "dp")
         result = {
-            key: round(sum(getattr(fill.charges, key) for fill in self.fills), 2)
-            for key in keys
+            key: round(sum(getattr(fill.charges, key) for fill in self.fills), 2) for key in keys
         }
         result["total"] = round(sum(fill.fees for fill in self.fills), 2)
         return result

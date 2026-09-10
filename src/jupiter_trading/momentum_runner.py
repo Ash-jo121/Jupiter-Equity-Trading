@@ -6,12 +6,25 @@ from datetime import datetime, timedelta, timezone
 from math import floor
 from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Optional
 from uuid import uuid4
 
 from .accounts import PaperAccountManager
-from .domain import Order, OrderType, Product, Quote, Side, Validity
-from .market_data import SharedQuoteCache, UpstoxMarketData
+from .candle_signals import (
+    EXPERIMENT_ENTRY_MODES,
+    MACD_EARLY_PRICE_CONFIRM,
+    PriceConfirmationSetup,
+    SetupState,
+    SignalConfig,
+    admitted_candles,
+    build_features,
+    evaluate_shared_exit,
+)
+from .candle_signals import (
+    evaluate_entry as evaluate_candle_entry,
+)
+from .domain import Order, OrderStatus, OrderType, Product, Quote, Side, Validity
+from .market_data import SharedCandleCache, SharedQuoteCache, UpstoxMarketData
 from .research_store import ResearchStore
 from .strategy_engine import MarketCoordinator
 from .survey import MarketSurvey, SharedSurveyCache, SurveyInstrument
@@ -29,11 +42,13 @@ NIFTY50_INDEX_KEY = "NSE_INDEX|Nifty 50"
 ENTRY_MODES = frozenset({"THREE_BAR", "ROLLING_WINDOW"})
 ACTIVE_RUN_STATUSES = frozenset({"RUNNING", "STOPPING"})
 EXIT_MODES = frozenset({"RATCHET", "REVERSAL"})
+SIGNAL_STRATEGIES = frozenset({"MOMENTUM_REVERSAL", *EXPERIMENT_ENTRY_MODES})
 
 
 @dataclass(frozen=True)
 class MomentumRunnerConfig:
     account_id: str
+    signal_strategy: str = "MOMENTUM_REVERSAL"
     duration_seconds: int = 300
     poll_interval_seconds: float = 5.0
     rescan_interval_seconds: float = 60.0
@@ -65,6 +80,11 @@ class MomentumRunnerConfig:
     volume_decay_ratio: float = 1.0
     confirmation_samples: int = 2
     time_stop_seconds: float = 240.0
+    experiment_id: Optional[str] = None
+    session_id: Optional[str] = None
+    variant_label: Optional[str] = None
+    shared_config_hash: Optional[str] = None
+    instrument_tick_size: float = 0.05
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -81,12 +101,15 @@ class MomentumRunnerConfig:
             raise ValueError("universe name and size are required")
         if self.minimum_relative_volume < 1:
             raise ValueError("minimum_relative_volume must be at least 1x")
-        if min(
-            self.minimum_relative_volume,
-            self.entry_momentum_pct,
-            self.reversal_pct,
-            self.hard_stop_pct,
-        ) <= 0:
+        if (
+            min(
+                self.minimum_relative_volume,
+                self.entry_momentum_pct,
+                self.reversal_pct,
+                self.hard_stop_pct,
+            )
+            <= 0
+        ):
             raise ValueError("momentum and exit thresholds must be positive")
         if self.minimum_cost_floor_pct <= 0:
             raise ValueError("minimum_cost_floor_pct must be positive")
@@ -98,6 +121,17 @@ class MomentumRunnerConfig:
             raise ValueError(f"entry_mode must be one of {sorted(ENTRY_MODES)}")
         if self.exit_mode not in EXIT_MODES:
             raise ValueError(f"exit_mode must be one of {sorted(EXIT_MODES)}")
+        if self.signal_strategy not in SIGNAL_STRATEGIES:
+            raise ValueError(f"signal_strategy must be one of {sorted(SIGNAL_STRATEGIES)}")
+        if self.signal_strategy in EXPERIMENT_ENTRY_MODES:
+            if self.exit_mode != "RATCHET":
+                raise ValueError("the three-entry experiment requires RATCHET exits")
+            if self.entry_timeframe_seconds != 60:
+                raise ValueError("the three-entry experiment requires completed 1-minute candles")
+            if self.reentry_cooldown_seconds != 0:
+                raise ValueError("the V1 experiment permits one filled trade per instrument")
+            if self.instrument_tick_size <= 0:
+                raise ValueError("a positive instrument tick size is required")
         self.entry_policy()
         self.exit_policy()
 
@@ -137,6 +171,9 @@ class MomentumReversalRunner:
         store: Optional[ResearchStore] = None,
         survey_cache: Optional[SharedSurveyCache] = None,
         quote_cache: Optional[SharedQuoteCache] = None,
+        candle_cache: Optional[SharedCandleCache] = None,
+        market_status_refresh: Optional[Callable[[], str]] = None,
+        start_barrier: Optional[Event] = None,
     ) -> None:
         self.id = runner_id or str(uuid4())
         self.config = config
@@ -147,6 +184,9 @@ class MomentumReversalRunner:
         self.store = store
         self.survey_cache = survey_cache
         self.quote_cache = quote_cache
+        self.candle_cache = candle_cache
+        self.market_status_refresh = market_status_refresh
+        self.start_barrier = start_barrier
         self._symbols = {item.instrument_key: item.symbol for item in self.instruments}
         self._lock = RLock()
         self._stop = Event()
@@ -161,6 +201,14 @@ class MomentumReversalRunner:
         self._candidates: Dict[str, dict] = {}
         self._history: Dict[str, deque[float]] = {}
         self._bar_aggregators: Dict[str, BarAggregator] = {}
+        self._last_recorded_candle_signal: Dict[str, str] = {}
+        self._last_admitted_candle_bar: Dict[str, str] = {}
+        self._signal_state: Dict[str, dict] = {}
+        self._signal_candles: Dict[str, list] = {}
+        self._entry_intents: Dict[str, dict] = {}
+        self._price_setups: Dict[str, PriceConfirmationSetup] = {}
+        self._pending_signal_exits: Dict[str, dict] = {}
+        self._signal_config = SignalConfig()
         self._market_history: deque[float] = deque(maxlen=13)
         self._market_bases: dict[str, Optional[float]] = {
             "session_open": None,
@@ -183,6 +231,7 @@ class MomentumReversalRunner:
             "cache_hit": False,
             "cache_age_seconds": None,
         }
+        self._market_status: Optional[str] = None
         self._dirty = False
         self._flushed_observations = 0
         self._history_size = max(13, config.entry_bars)
@@ -255,6 +304,10 @@ class MomentumReversalRunner:
             run_fees = sum(fill["fees"] for fill in fills)
             return {
                 "id": self.id,
+                "experiment_id": self.config.experiment_id,
+                "session_id": self.config.session_id,
+                "variant_label": self.config.variant_label,
+                "shared_config_hash": self.config.shared_config_hash,
                 "status": self._status,
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
@@ -267,10 +320,18 @@ class MomentumReversalRunner:
                 "candidates": list(self._candidates.values()),
                 "open_positions": list(self._open.values()),
                 "completed_instruments": sorted(self._completed),
+                "pending_setups": [setup.to_dict() for setup in self._price_setups.values()],
+                "pending_entry_intents": list(self._entry_intents.values()),
+                "pending_signal_exits": list(self._pending_signal_exits.values()),
+                "ratchet_states": {
+                    key: rule.to_dict() for key, rule in self._exits.items()
+                },
                 "events": list(self._events),
                 "monitoring": list(self._monitoring),
                 "errors": list(self._errors),
                 "data_health": dict(self._data_health),
+                "candle_cache": self.candle_cache.stats() if self.candle_cache else None,
+                "market_status": self._market_status,
                 "fills": fills,
                 "metrics": {
                     "gross_pnl": round(gross_pnl, 2),
@@ -282,6 +343,8 @@ class MomentumReversalRunner:
             }
 
     def _run(self) -> None:
+        if self.start_barrier is not None:
+            self.start_barrier.wait()
         deadline = monotonic() + self.config.duration_seconds
         next_scan = 0.0
         try:
@@ -300,7 +363,9 @@ class MomentumReversalRunner:
                 self._accept_background_scans = False
             self._liquidate()
             with self._lock:
-                self._status = "FAILED" if self._errors else "COMPLETED"
+                self._status = (
+                    "FAILED" if self._errors else "INCOMPLETE" if self._open else "COMPLETED"
+                )
                 self._finished_at = self._now()
                 self._record("FINISHED", {"session_pnl": self.snapshot()["session_pnl"]})
                 self._persist()
@@ -323,6 +388,7 @@ class MomentumReversalRunner:
 
     def _scan(self, background: bool = False) -> None:
         try:
+            self._refresh_market_status()
             result = (
                 self.survey_cache.run(
                     self.market_data,
@@ -331,9 +397,9 @@ class MomentumReversalRunner:
                     context_instrument_key=NIFTY50_INDEX_KEY,
                 )
                 if self.survey_cache
-                else MarketSurvey(
-                    self.market_data, self.config.minimum_relative_volume
-                ).run(self.instruments)
+                else MarketSurvey(self.market_data, self.config.minimum_relative_volume).run(
+                    self.instruments
+                )
             )
             candidates = [
                 row
@@ -375,9 +441,7 @@ class MomentumReversalRunner:
                 for failure in result["failures"]
             )
             data_status = (
-                "UNAVAILABLE"
-                if analyzed == 0
-                else "DEGRADED" if analyzed < requested else "OK"
+                "UNAVAILABLE" if analyzed == 0 else "DEGRADED" if analyzed < requested else "OK"
             )
             cache = result.get("shared_cache", {})
             with self._lock:
@@ -390,6 +454,10 @@ class MomentumReversalRunner:
                         "recent_15m": market_context.get("recent_15m"),
                     }
                 self._candidates = {row["instrument_key"]: row for row in candidates}
+                for key, setup in list(self._price_setups.items()):
+                    if key not in self._candidates and setup.state == SetupState.ARMED:
+                        setup.cancel(SetupState.CANCELLED, "NOT_SHORTLISTED")
+                        self._record("SETUP_CANCELLED", setup.to_dict())
                 # Held positions drop out of the candidate list, but the trailing
                 # stop still wants their latest participation reading.
                 self._volume_state = {
@@ -404,7 +472,9 @@ class MomentumReversalRunner:
                             "session_change_pct",
                             "recent_15m_change_pct",
                             "range_position_pct",
+                            "candle_signal",
                         )
+                        if key in row
                     }
                     for row in result["results"]
                 }
@@ -427,6 +497,7 @@ class MomentumReversalRunner:
                         "shared_cache": cache,
                         "failures": result["failures"],
                         "candidates": [row["symbol"] for row in candidates],
+                        "signal_strategy": self.config.signal_strategy,
                         "low_volume_rejections": [
                             {
                                 "symbol": row["symbol"],
@@ -447,12 +518,192 @@ class MomentumReversalRunner:
             if should_record:
                 self._error(error)
 
+    def _refresh_market_status(self) -> None:
+        if self.market_status_refresh is None:
+            return
+        try:
+            status = self.market_status_refresh()
+            with self._lock:
+                if status != self._market_status:
+                    self._market_status = status
+                    self._record("MARKET_STATUS", {"status": status})
+        except Exception as error:  # noqa: BLE001 - block fills, but keep surveying
+            self.coordinator.update_market_status({"NSE_EQ": "UNKNOWN"})
+            with self._lock:
+                self._market_status = "UNKNOWN"
+                self._record(
+                    "MARKET_STATUS_UNAVAILABLE",
+                    {"message": str(error)[:200]},
+                )
+
+    def _refresh_experiment_signals(self, keys: Iterable[str]) -> None:
+        """Admit each completed provider bar once and fan its decision into this arm."""
+
+        clock = datetime.now(timezone.utc)
+        for key in keys:
+            try:
+                snapshot = (
+                    self.candle_cache.get(self.market_data, key, clock)
+                    if self.candle_cache
+                    else {
+                        "candles": self.market_data.intraday_candles(key, "minutes", 1),
+                        "received_at": clock,
+                        "cache_hit": False,
+                    }
+                )
+                candles = admitted_candles(
+                    snapshot["candles"],
+                    clock,
+                    self._signal_config.candle_finalization_grace_seconds,
+                )
+                if not candles:
+                    continue
+                features = build_features(candles, self._signal_config)
+                if self._last_admitted_candle_bar.get(key) == features.bar_id:
+                    continue
+                self._last_admitted_candle_bar[key] = features.bar_id
+                available_at = max(
+                    features.bar_end
+                    + timedelta(seconds=self._signal_config.candle_finalization_grace_seconds),
+                    snapshot["received_at"],
+                )
+                stale = (available_at - features.bar_end).total_seconds() > (
+                    self._signal_config.max_signal_bar_age_seconds
+                )
+                entry = evaluate_candle_entry(
+                    self.config.signal_strategy,
+                    features,
+                    self._signal_config,
+                )
+                if stale:
+                    entry["actionable"] = False
+                    entry["reason"] = "STALE_BAR"
+                entry.update(
+                    {
+                        "available_at": available_at.isoformat(),
+                        "received_at": snapshot["received_at"].isoformat(),
+                        "cache_hit": snapshot.get("cache_hit", False),
+                        "candidate_snapshot_eligible": key in self._candidates,
+                    }
+                )
+                self._signal_candles[key] = candles
+                self._signal_state[key] = {"candle_signal": entry}
+                self._record(
+                    "ENTRY_SIGNAL_EVALUATED",
+                    {
+                        "symbol": self._symbols.get(key, key),
+                        "instrument_key": key,
+                        "signal": entry,
+                    },
+                )
+
+                setup = self._price_setups.get(key)
+                if setup and setup.state == SetupState.ARMED:
+                    previous_state = setup.state
+                    setup.on_bar(features)
+                    if setup.state != previous_state:
+                        self._record("SETUP_TRANSITION", setup.to_dict())
+
+                if key in self._open:
+                    exit_signal = evaluate_shared_exit(features, self._signal_config)
+                    entered_at = datetime.fromisoformat(self._open[key]["entered_at"])
+                    post_entry = entered_at < features.bar_end
+                    exit_signal["post_entry_bar"] = post_entry
+                    exit_signal["available_at"] = available_at.isoformat()
+                    self._record(
+                        "EXIT_SIGNAL_EVALUATED",
+                        {
+                            "symbol": self._symbols.get(key, key),
+                            "instrument_key": key,
+                            "signal": exit_signal,
+                        },
+                    )
+                    if exit_signal["actionable"] and post_entry and not stale:
+                        decision_id = f"{self.id}:{key}:{features.bar_id}:BEARISH_MACD_V1"
+                        self._pending_signal_exits.setdefault(
+                            key,
+                            {
+                                "decision_id": decision_id,
+                                "reason": exit_signal["reason"],
+                                "decision_at": available_at.isoformat(),
+                                "signal_bar_id": features.bar_id,
+                                "evidence": exit_signal,
+                                "status": "LATCHED",
+                                "filled_quantity": 0,
+                            },
+                        )
+                        self._record(
+                            "MOMENTUM_EXIT_LATCHED",
+                            self._pending_signal_exits[key],
+                        )
+
+                if key not in self._candidates or not entry["actionable"]:
+                    continue
+                structural_stop = min(item.low for item in candles[-3:])
+                if self.config.signal_strategy == MACD_EARLY_PRICE_CONFIRM:
+                    active = self._price_setups.get(key)
+                    if not active or active.state != SetupState.ARMED:
+                        armed = PriceConfirmationSetup.arm(
+                            f"{self.id}:{key}:{features.bar_id}",
+                            key,
+                            features,
+                            available_at,
+                            self.config.instrument_tick_size,
+                            self._signal_config,
+                        )
+                        self._price_setups[key] = armed
+                        self._record(
+                            "SETUP_ARMED",
+                            {
+                                **armed.to_dict(),
+                                "symbol": self._symbols.get(key, key),
+                                "signal": entry,
+                                "structural_stop": structural_stop,
+                            },
+                        )
+                else:
+                    expiry = min(
+                        available_at
+                        + timedelta(seconds=self._signal_config.market_intent_ttl_seconds),
+                        features.bar_end + timedelta(minutes=1),
+                    )
+                    self._entry_intents[key] = {
+                        "intent_id": f"{self.id}:{key}:{features.bar_id}",
+                        "decision_at": available_at.isoformat(),
+                        "expires_at": expiry.isoformat(),
+                        "signal": entry,
+                        "structural_stop": structural_stop,
+                    }
+                    self._record(
+                        "ENTRY_INTENT_LATCHED",
+                        {
+                            "symbol": self._symbols.get(key, key),
+                            **self._entry_intents[key],
+                        },
+                    )
+            except Exception as error:  # noqa: BLE001 - isolate one instrument feed
+                self._record(
+                    "ONE_MINUTE_DATA_ERROR",
+                    {
+                        "instrument_key": key,
+                        "symbol": self._symbols.get(key, key),
+                        "message": str(error)[:200],
+                    },
+                )
+
+    def _eligible_signal_quote(self, quote: Quote, intent: dict) -> bool:
+        decision_at = datetime.fromisoformat(intent["decision_at"])
+        age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()
+        return quote.timestamp > decision_at and 0 <= age <= self._signal_config.max_quote_age_seconds
+
     def _poll(self) -> None:
         with self._lock:
             stock_keys = list(dict.fromkeys([*self._candidates, *self._open]))
             keys = [*stock_keys, NIFTY50_INDEX_KEY]
         if not keys:
             return
+        if self.config.signal_strategy in EXPERIMENT_ENTRY_MODES:
+            self._refresh_experiment_signals(stock_keys)
         try:
             quotes = (
                 self.quote_cache.get(
@@ -475,7 +726,8 @@ class MomentumReversalRunner:
             quote = quotes.get(key)
             if not quote:
                 continue
-            self.coordinator.on_quote(quote)
+            # A shared quote is applied exactly once to this run's isolated account.
+            self.accounts.get(self.config.account_id).on_quote(quote)
             history = self._history.setdefault(
                 quote.instrument_key, deque(maxlen=self._history_size)
             )
@@ -485,7 +737,11 @@ class MomentumReversalRunner:
                 self._bar_aggregators.setdefault(
                     key, BarAggregator(self.config.entry_timeframe_seconds, self._bar_capacity)
                 ).add(quote.last_price, quote.timestamp)
-            stats = {**self._volume_state.get(key, {}), **self._candidates.get(key, {})}
+            stats = {
+                **self._volume_state.get(key, {}),
+                **self._candidates.get(key, {}),
+                **self._signal_state.get(key, {}),
+            }
             entry_closes, entry_lows = self._entry_series(key)
             entry_check = evaluate_entry(
                 entry_closes,
@@ -501,9 +757,7 @@ class MomentumReversalRunner:
                 "previous_price": round(previous, 4) if previous else None,
                 "sample_change_pct": round(_percent_change(quote.last_price, previous), 4),
                 "window_start_price": round(history[0], 4),
-                "window_change_pct": round(
-                    _percent_change(quote.last_price, history[0]), 4
-                ),
+                "window_change_pct": round(_percent_change(quote.last_price, history[0]), 4),
                 "session_change_pct": stats.get("session_change_pct"),
                 "recent_15m_change_pct": stats.get("recent_15m_change_pct"),
                 "momentum_score": stats.get("momentum_score"),
@@ -518,7 +772,17 @@ class MomentumReversalRunner:
                 **market_context,
                 "decision": "WATCHING",
             }
-            exit_result = self._consider_exit(quote, previous, stats.get("relative_volume"))
+            candle_signal = stats.get("candle_signal")
+            if self.config.signal_strategy in EXPERIMENT_ENTRY_MODES and candle_signal:
+                signal_timestamp = candle_signal.get("features", {}).get("bar_id")
+                if signal_timestamp and self._last_recorded_candle_signal.get(key) != signal_timestamp:
+                    observation["candle_signal"] = candle_signal
+                    self._last_recorded_candle_signal[key] = signal_timestamp
+            exit_result = self._consider_exit(
+                quote,
+                previous,
+                stats.get("relative_volume"),
+            )
             if exit_result:
                 observation["exit"] = exit_result["state"]
                 if exit_result["reason"]:
@@ -548,9 +812,7 @@ class MomentumReversalRunner:
     def _expected_cost_floor_pct(self) -> float:
         """Cost of a round trip at the configured size, before a fill is known."""
 
-        return max(
-            self._cost_model["breakeven_pct"], self.config.minimum_cost_floor_pct
-        )
+        return max(self._cost_model["breakeven_pct"], self.config.minimum_cost_floor_pct)
 
     def _market_context(self, quote: Optional[Quote]) -> dict:
         if not quote:
@@ -565,9 +827,7 @@ class MomentumReversalRunner:
         self._market_history.append(quote.last_price)
         return {
             "nifty_price": round(quote.last_price, 4),
-            "nifty_sample_change_pct": round(
-                _percent_change(quote.last_price, previous), 4
-            ),
+            "nifty_sample_change_pct": round(_percent_change(quote.last_price, previous), 4),
             "nifty_window_change_pct": round(
                 _percent_change(quote.last_price, self._market_history[0]), 4
             ),
@@ -613,11 +873,17 @@ class MomentumReversalRunner:
         )
         if result["reason"]:
             self._exit(quote, state, result["reason"], result["state"])
+        elif self.config.signal_strategy in EXPERIMENT_ENTRY_MODES:
+            pending = self._pending_signal_exits.get(quote.instrument_key)
+            if pending and self._eligible_signal_quote(quote, pending):
+                result = {
+                    "reason": pending["reason"],
+                    "state": {**result["state"], "momentum_exit": pending},
+                }
+                self._exit(quote, state, pending["reason"], result["state"])
         return result
 
-    def _ratchet_exit(
-        self, quote: Quote, state: dict, relative_volume: Optional[float]
-    ) -> dict:
+    def _ratchet_exit(self, quote: Quote, state: dict, relative_volume: Optional[float]) -> dict:
         rule = self._exits.get(quote.instrument_key)
         if not rule:
             return self._reversal_exit(quote, state, None)
@@ -686,6 +952,9 @@ class MomentumReversalRunner:
         return True
 
     def _consider_entries(self, quotes: Dict[str, Quote], observations: dict) -> None:
+        if self.config.signal_strategy in EXPERIMENT_ENTRY_MODES:
+            self._consider_experiment_entries(quotes, observations)
+            return
         broker = self.accounts.get(self.config.account_id)
         open_count = sum(1 for position in broker.positions.values() if position.quantity > 0)
         slots = self.config.max_positions - open_count
@@ -772,7 +1041,8 @@ class MomentumReversalRunner:
                     observation["decision"] = "ALLOCATION_TOO_SMALL"
                 continue
             entry_signal = {
-                "reason": evaluation.reason if self.config.entry_mode == "THREE_BAR"
+                "reason": evaluation.reason
+                if self.config.entry_mode == "THREE_BAR"
                 else "UPWARD_MOVEMENT_CONFIRMED",
                 "entry_mode": self.config.entry_mode,
                 "entry_check": evaluation.to_dict(),
@@ -784,9 +1054,7 @@ class MomentumReversalRunner:
                 "entry_threshold_source": evaluation.threshold_source,
                 "stock_noise_pct": evaluation.noise_pct,
                 "previous_price": round(history[-2], 4),
-                "sample_change_pct": round(
-                    _percent_change(history[-1], history[-2]), 4
-                ),
+                "sample_change_pct": round(_percent_change(history[-1], history[-2]), 4),
                 "session_change_pct": candidate["session_change_pct"],
                 "recent_15m_change_pct": candidate["recent_15m_change_pct"],
                 "momentum_score": candidate["momentum_score"],
@@ -800,28 +1068,18 @@ class MomentumReversalRunner:
                     observation.get("nifty_session_change_pct") if observation else None
                 ),
                 "nifty_recent_15m_change_pct": (
-                    observation.get("nifty_recent_15m_change_pct")
-                    if observation
-                    else None
+                    observation.get("nifty_recent_15m_change_pct") if observation else None
                 ),
                 "market_alignment": _market_alignment(observation),
             }
             order = self._submit(key, Side.BUY, quantity, quote)
             position = broker.positions.get(key)
             if order.filled_quantity <= 0 or not position or position.quantity <= 0:
-                self._record(
-                    "ENTRY_REJECTED",
-                    {"symbol": candidate["symbol"], "order": order.to_dict()},
-                )
-                if observation:
-                    observation["decision"] = "ENTRY_REJECTED"
-                self._lock_out(key, quote)
+                self._record_unfilled_entry(candidate, order, quote, observation)
                 continue
             notional = position.quantity * position.average_price
             cost_floor_pct = max(
-                breakeven_pct(
-                    notional, broker.fee_schedule, broker.slippage_bps, Product.INTRADAY
-                ),
+                breakeven_pct(notional, broker.fee_schedule, broker.slippage_bps, Product.INTRADAY),
                 self.config.minimum_cost_floor_pct,
             )
             rule = RatchetExit(
@@ -854,13 +1112,176 @@ class MomentumReversalRunner:
                     "cost_floor_pct": round(cost_floor_pct, 4),
                     "initial_stop": round(rule.stop_price, 4),
                     "initial_stop_source": rule.stop_source,
-                    "risk_pct": round(
-                        (position.average_price / rule.stop_price - 1) * 100, 4
-                    ),
+                    "risk_pct": round((position.average_price / rule.stop_price - 1) * 100, 4),
                     "lock_at_pct": round(cost_floor_pct * self.config.lock_multiple, 4),
                     "ride_at_pct": round(cost_floor_pct * self.config.ride_multiple, 4),
                 }
             )
+            self._record(
+                "ENTRY_FILLED",
+                {
+                    "symbol": candidate["symbol"],
+                    "observed_price": quote.last_price,
+                    "entry_signal": entry_signal,
+                    "order": order.to_dict(),
+                },
+            )
+            if observation:
+                observation["decision"] = "ENTRY_FILLED"
+                observation["entry_signal"] = entry_signal
+            slots -= 1
+
+    def _consider_experiment_entries(self, quotes: Dict[str, Quote], observations: dict) -> None:
+        """Execute A/C intents or B breakouts on a strictly later fresh quote."""
+
+        broker = self.accounts.get(self.config.account_id)
+        open_count = sum(1 for position in broker.positions.values() if position.quantity > 0)
+        slots = self.config.max_positions - open_count
+        candidates = sorted(
+            self._candidates.values(),
+            key=lambda row: (-row.get("momentum_score", 0), row["instrument_key"]),
+        )
+        for candidate in candidates:
+            key = candidate["instrument_key"]
+            observation = observations.get(key)
+            quote = quotes.get(key)
+            if quote is None:
+                continue
+            if key in self._open or key in self._pending_signal_exits:
+                if observation:
+                    observation["decision"] = "HOLDING_POSITION"
+                continue
+            if key in self._completed:
+                if observation:
+                    observation["decision"] = "ALREADY_TRADED"
+                continue
+            if slots <= 0:
+                if observation:
+                    observation["decision"] = "MAX_POSITIONS"
+                continue
+
+            intent = None
+            setup = self._price_setups.get(key)
+            if self.config.signal_strategy == MACD_EARLY_PRICE_CONFIRM:
+                if setup is None or setup.state != SetupState.ARMED:
+                    if observation:
+                        observation["decision"] = "WAITING_FOR_SETUP"
+                    continue
+                previous_state = setup.state
+                setup.on_quote(quote.last_price, quote.timestamp)
+                if setup.state != previous_state:
+                    self._record("SETUP_TRANSITION", setup.to_dict())
+                if setup.state != SetupState.TRIGGERED:
+                    if observation:
+                        observation["decision"] = f"SETUP_{setup.state.value}"
+                    continue
+                candles = self._signal_candles.get(key, [])
+                if len(candles) < 3:
+                    setup.cancel(SetupState.REJECTED, "STRUCTURAL_STOP_UNAVAILABLE")
+                    continue
+                intent = {
+                    "intent_id": setup.setup_id,
+                    "decision_at": setup.available_at.isoformat(),
+                    "signal": self._signal_state.get(key, {}).get("candle_signal"),
+                    "setup": setup.to_dict(),
+                    "structural_stop": min(item.low for item in candles[-3:]),
+                }
+            else:
+                candidate_intent = self._entry_intents.get(key)
+                if not candidate_intent:
+                    if observation:
+                        observation["decision"] = self._signal_state.get(key, {}).get(
+                            "candle_signal", {}
+                        ).get("reason", "WAITING_FOR_SIGNAL")
+                    continue
+                expires_at = datetime.fromisoformat(candidate_intent["expires_at"])
+                if quote.timestamp >= expires_at:
+                    self._entry_intents.pop(key, None)
+                    if observation:
+                        observation["decision"] = "ENTRY_INTENT_EXPIRED"
+                    continue
+                if not self._eligible_signal_quote(quote, candidate_intent):
+                    if observation:
+                        observation["decision"] = "WAITING_FOR_FRESH_QUOTE"
+                    continue
+                intent = candidate_intent
+
+            if self.config.require_nifty_confirmation and (
+                not observation
+                or observation.get("nifty_recent_15m_change_pct") is None
+                or observation["nifty_recent_15m_change_pct"] <= 0
+            ):
+                if setup and setup.state == SetupState.TRIGGERED:
+                    setup.cancel(SetupState.REJECTED, "NIFTY_SHORT_TERM_NOT_POSITIVE")
+                if observation:
+                    observation["decision"] = "NIFTY_SHORT_TERM_NOT_POSITIVE"
+                continue
+            quantity = floor(self.config.allocation_per_position / quote.last_price)
+            structural_stop = float(intent["structural_stop"])
+            if quantity <= 0 or structural_stop >= quote.last_price:
+                if setup and setup.state == SetupState.TRIGGERED:
+                    setup.cancel(SetupState.REJECTED, "INVALID_ENTRY_RISK")
+                if observation:
+                    observation["decision"] = "INVALID_ENTRY_RISK"
+                continue
+            order = self._submit(key, Side.BUY, quantity, quote)
+            position = broker.positions.get(key)
+            if order.filled_quantity <= 0 or not position or position.quantity <= 0:
+                self._record_unfilled_entry(candidate, order, quote, observation)
+                if setup and setup.state == SetupState.TRIGGERED:
+                    setup.cancel(SetupState.REJECTED, order.rejection_reason or "NO_FILL")
+                self._entry_intents.pop(key, None)
+                continue
+            notional = position.quantity * position.average_price
+            cost_floor_pct = max(
+                breakeven_pct(notional, broker.fee_schedule, broker.slippage_bps, Product.INTRADAY),
+                self.config.minimum_cost_floor_pct,
+            )
+            rule = RatchetExit(
+                position.average_price,
+                cost_floor_pct,
+                quote.timestamp,
+                self.config.exit_policy(),
+                structural_stop,
+            )
+            self._exits[key] = rule
+            self._open[key] = {
+                "instrument_key": key,
+                "symbol": candidate["symbol"],
+                "quantity": position.quantity,
+                "entry_price": position.average_price,
+                "entered_at": quote.timestamp.isoformat(),
+                "peak_price": quote.last_price,
+                "last_price": quote.last_price,
+                "entry_momentum_pct": intent.get("signal", {}).get("features", {}).get(
+                    "delta_bps", 0
+                ),
+                "notional": round(notional, 2),
+                "cost_floor_pct": round(cost_floor_pct, 4),
+                "structural_stop": structural_stop,
+                "stop_price": round(rule.stop_price, 4),
+                "stop_source": rule.stop_source,
+                "phase": rule.phase.value,
+                "unrealized_pct": 0.0,
+            }
+            if setup:
+                setup.state = (
+                    SetupState.FILLED
+                    if order.filled_quantity == order.quantity
+                    else SetupState.PARTIAL
+                )
+                self._record("SETUP_TRANSITION", setup.to_dict())
+            self._entry_intents.pop(key, None)
+            entry_signal = {
+                "reason": self.config.signal_strategy,
+                "signal_strategy": self.config.signal_strategy,
+                "variant_label": self.config.variant_label,
+                "intent": intent,
+                "observed_price": quote.last_price,
+                "structural_stop": structural_stop,
+                "effective_stop": rule.stop_price,
+                "cost_floor_pct": cost_floor_pct,
+            }
             self._record(
                 "ENTRY_FILLED",
                 {
@@ -889,8 +1310,16 @@ class MomentumReversalRunner:
             self._exits.pop(quote.instrument_key, None)
             return
         order = self._submit(quote.instrument_key, Side.SELL, position.quantity, quote)
+        remaining = broker.positions.get(quote.instrument_key)
+        residual_quantity = remaining.quantity if remaining and remaining.quantity > 0 else 0
         self._record(
-            "EXIT_FILLED" if order.filled_quantity else "EXIT_REJECTED",
+            (
+                "EXIT_FILLED"
+                if order.filled_quantity and residual_quantity == 0
+                else "EXIT_PARTIAL"
+                if order.filled_quantity
+                else "EXIT_REJECTED"
+            ),
             {
                 "symbol": state["symbol"],
                 "reason": reason,
@@ -898,15 +1327,41 @@ class MomentumReversalRunner:
                 "entry_price": state["entry_price"],
                 "exit_state": diagnostics,
                 "order": order.to_dict(),
+                "residual_quantity": residual_quantity,
             },
         )
-        if order.filled_quantity:
+        if residual_quantity == 0:
             self._open.pop(quote.instrument_key, None)
             self._exits.pop(quote.instrument_key, None)
+            pending = self._pending_signal_exits.pop(quote.instrument_key, None)
+            if pending:
+                pending["status"] = "FILLED"
+                pending["filled_quantity"] = pending.get("filled_quantity", 0) + order.filled_quantity
             self._lock_out(quote.instrument_key, quote)
+        else:
+            state["quantity"] = residual_quantity
+            pending = self._pending_signal_exits.setdefault(
+                quote.instrument_key,
+                {
+                    "decision_id": f"{self.id}:{quote.instrument_key}:risk-liquidation",
+                    "reason": reason,
+                    "decision_at": quote.timestamp.isoformat(),
+                    "signal_bar_id": None,
+                    "evidence": diagnostics,
+                    "status": "PENDING_RESIDUAL",
+                    "filled_quantity": 0,
+                },
+            )
+            pending["status"] = "PENDING_RESIDUAL"
+            pending["residual_quantity"] = residual_quantity
+            pending["filled_quantity"] = pending.get("filled_quantity", 0) + order.filled_quantity
 
     def _liquidate(self) -> None:
         with self._lock:
+            self._entry_intents.clear()
+            for setup in self._price_setups.values():
+                if setup.state == SetupState.ARMED:
+                    setup.cancel(SetupState.CANCELLED, "SESSION_END")
             keys = list(self._open)
         if not keys:
             return
@@ -920,13 +1375,15 @@ class MomentumReversalRunner:
             if not state:
                 continue
             quote = quotes.get(key) or Quote(key, state["last_price"])
-            self.coordinator.on_quote(quote)
+            self.accounts.get(self.config.account_id).on_quote(quote)
             rule = self._exits.get(key)
             self._exit(quote, state, "SESSION_END", rule.to_dict() if rule else None)
 
     def _submit(self, key: str, side: Side, quantity: int, quote: Quote) -> Order:
         broker = self.accounts.get(self.config.account_id)
-        self.coordinator.on_quote(quote)
+        current = broker.quotes.get(key)
+        if current is None or current.timestamp != quote.timestamp:
+            broker.on_quote(quote)
         return broker.submit(
             Order(
                 instrument_key=key,
@@ -939,6 +1396,37 @@ class MomentumReversalRunner:
                 account_id=self.config.account_id,
             )
         )
+
+    def _record_unfilled_entry(
+        self,
+        candidate: dict,
+        order: Order,
+        quote: Quote,
+        observation: Optional[dict],
+    ) -> None:
+        reason = order.rejection_reason or ""
+        if "market status UNKNOWN" in reason:
+            decision = "MARKET_STATUS_UNAVAILABLE"
+        elif "market status" in reason:
+            decision = "MARKET_CLOSED"
+        elif order.status == OrderStatus.EXPIRED:
+            decision = "ENTRY_EXPIRED"
+        elif order.status == OrderStatus.REJECTED:
+            decision = "ENTRY_REJECTED"
+        else:
+            decision = "ENTRY_NOT_FILLED"
+        self._record(
+            decision,
+            {
+                "symbol": candidate["symbol"],
+                "reason": reason or None,
+                "order": order.to_dict(),
+            },
+        )
+        if observation:
+            observation["decision"] = decision
+        if decision not in {"MARKET_CLOSED", "MARKET_STATUS_UNAVAILABLE"}:
+            self._lock_out(candidate["instrument_key"], quote)
 
     def _record(self, event_type: str, payload: dict) -> None:
         self._events.append({"timestamp": self._now(), "type": event_type, **payload})
@@ -1052,8 +1540,7 @@ class MomentumRunnerService:
 
         with self._lock:
             live = {
-                runner.id: _without_trace(runner.snapshot())
-                for runner in self._runners.values()
+                runner.id: _without_trace(runner.snapshot()) for runner in self._runners.values()
             }
         persisted = self._store.momentum_runs() if self._store else []
         combined = list(live.values()) + [

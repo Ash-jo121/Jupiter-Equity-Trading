@@ -332,3 +332,13 @@ def test_with_lows_the_stop_seed_reflects_the_real_intrabar_wick() -> None:
 def test_a_short_lows_series_is_treated_as_still_building_history() -> None:
     evaluation = evaluate_entry([100.0, 101.0, 102.0], EntryPolicy(), lows=[99.0, 98.0])
     assert evaluation.reason == "BUILDING_PRICE_HISTORY"
+
+
+def test_ratchet_state_round_trips_for_restart_recovery() -> None:
+    rule = exit_rule()
+    rule.update(1_002.0, ts(5), 1.8)
+    rule.update(1_004.0, ts(10), 0.8)
+
+    restored = RatchetExit.from_dict(rule.to_dict(), rule.policy)
+
+    assert restored.to_dict() == rule.to_dict()

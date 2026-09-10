@@ -35,15 +35,15 @@ type Fill = {
 };
 type EntrySignal = {
   reason: string;
-  window_start_price: number;
+  window_start_price?: number;
   observed_price: number;
-  window_change_pct: number;
+  window_change_pct?: number;
   entry_threshold_pct?: number;
-  previous_price: number;
-  sample_change_pct: number;
-  session_change_pct: number;
-  recent_15m_change_pct: number;
-  momentum_score: number;
+  previous_price?: number;
+  sample_change_pct?: number;
+  session_change_pct?: number;
+  recent_15m_change_pct?: number;
+  momentum_score?: number;
   recent_volume?: number;
   baseline_volume?: number;
   relative_volume?: number;
@@ -65,6 +65,71 @@ type EntrySignal = {
   risk_pct?: number;
   lock_at_pct?: number;
   ride_at_pct?: number;
+  signal_strategy?: SignalStrategy;
+  signal_candle_timestamp?: string;
+  candlestick_signal?: CandlestickSignal;
+  variant_label?: string;
+  effective_stop?: number;
+  intent?: {
+    signal?: {
+      reason?: string;
+      rejection_checks?: Record<string, boolean>;
+      mode_checks?: Record<string, boolean>;
+      features?: {
+        bar_id?: string;
+        bar?: { open: number; high: number; low: number; close: number; volume: number };
+        body_ratio?: number;
+        lower_ratio?: number;
+        upper_ratio?: number;
+        rvol_1m?: number | null;
+        histogram?: number | null;
+        h1?: number | null;
+        h2?: number | null;
+        delta_bps?: number | null;
+        latest_cross_age?: number | null;
+      };
+    };
+    setup?: { trigger_price?: number; setup_low?: number; expiry?: string };
+  };
+};
+type SignalStrategy =
+  | "MOMENTUM_REVERSAL"
+  | "CANDLESTICK_MACD"
+  | "MACD_EARLY"
+  | "MACD_EARLY_PRICE_CONFIRM"
+  | "MACD_FRESH_CONFIRMED";
+type CandlestickSignal = {
+  candle_timestamp?: string;
+  candle?: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  };
+  shape?: {
+    colour: string;
+    upper_wick: number;
+    lower_wick: number;
+    doji: boolean;
+  };
+  volume?: {
+    bias: string;
+    relative_volume?: number | null;
+    minimum_relative_volume?: number;
+  };
+  macd?: {
+    line?: number;
+    signal?: number;
+    histogram?: number;
+    previous_histogram?: number;
+    spread_pct_of_price?: number;
+    widening?: boolean;
+    bearish_intersection?: boolean;
+    sufficient_convergence?: boolean;
+  };
+  entry_checks?: Record<string, boolean>;
+  exit_checks?: Record<string, boolean>;
 };
 type EntryCheck = {
   triggered: boolean;
@@ -103,6 +168,7 @@ type ExitState = {
   seconds_held?: number;
   time_stop_seconds?: number;
   drawdown_from_peak_pct?: number;
+  candlestick_signal?: CandlestickSignal;
 };
 type MonitoringObservation = {
   timestamp: string;
@@ -209,6 +275,9 @@ type ReplayReport = {
 };
 type MomentumRun = {
   id: string;
+  experiment_id?: string | null;
+  variant_label?: string | null;
+  shared_config_hash?: string | null;
   status: string;
   started_at?: string;
   finished_at?: string;
@@ -238,6 +307,7 @@ type MomentumRun = {
   }>;
   config: {
     account_id?: string;
+    signal_strategy?: SignalStrategy;
     duration_seconds: number;
     max_positions: number;
     allocation_per_position: number;
@@ -298,9 +368,10 @@ type Summary = {
     last_error?: string;
   };
 };
-type BatchResult = {
-  started: Array<{ label: string; run: MomentumRun }>;
-  failed: Array<{ label: string; error: string }>;
+type EntryExperimentResult = {
+  experiment_id: string;
+  shared_config_hash: string;
+  variants: Array<{ label: string; entry_mode: SignalStrategy; run: MomentumRun }>;
 };
 type ScheduleSlot = {
   index: number;
@@ -311,6 +382,7 @@ type ScheduleSlot = {
   duration_seconds: number;
   max_positions: number;
   entry_timeframe_seconds: number;
+  entry_mode?: string;
   status: string;
   runner_id?: string | null;
   detail?: string | null;
@@ -341,7 +413,8 @@ type ScheduleStatus = {
   running: boolean;
   session_date: string;
   is_trading_day: boolean;
-  entry_timeframes: number[];
+  entry_timeframes?: number[];
+  entry_variants?: Array<{ label: string; entry_mode: string }>;
   max_positions: number;
   reentry_cooldown_seconds: number;
   plan: SchedulePlan | null;
@@ -358,6 +431,7 @@ type ReportRun = {
   duration_seconds?: number;
   max_positions?: number;
   entry_timeframe_seconds?: number;
+  signal_strategy?: SignalStrategy;
   net_pnl: number;
   gross_pnl: number;
   fees: number;
@@ -398,6 +472,7 @@ type DailyReport = {
   by_duration: ConfigRollup[];
   by_positions: ConfigRollup[];
   by_timeframe: ConfigRollup[];
+  by_strategy?: ConfigRollup[];
   decision_totals: Array<{
     decision: string;
     count: number;
@@ -438,6 +513,14 @@ const signedPct = (value: number) =>
   `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 const universeName = (run: MomentumRun) =>
   run.config.universe_name || "NIFTY 50";
+const strategyName = (run: MomentumRun) => {
+  const mode = run.config.signal_strategy;
+  if (mode === "MACD_EARLY") return "A · Early MACD convergence";
+  if (mode === "MACD_EARLY_PRICE_CONFIRM") return "B · Price-confirmed early MACD";
+  if (mode === "MACD_FRESH_CONFIRMED") return "C · Fresh MACD confirmation";
+  if (mode === "CANDLESTICK_MACD") return "Legacy candlestick + MACD";
+  return "Legacy momentum reversal";
+};
 
 async function request<T = unknown>(
   path: string,
@@ -492,7 +575,7 @@ export default function Home() {
   const [busy, setBusy] = useState(""),
     [notice, setNotice] = useState("Connecting to the paper engine…");
   const [duration, setDuration] = useState(600),
-    [allocation, setAllocation] = useState(100000),
+    [allocation, setAllocation] = useState(25000),
     [maxPositions, setMaxPositions] = useState(2);
   const [exitMode, setExitMode] = useState<"RATCHET" | "REVERSAL">("RATCHET"),
     [trailWindow, setTrailWindow] = useState(24);
@@ -585,36 +668,44 @@ export default function Home() {
   }, [selectedRunId, runs]);
   const marketStatus =
       summary?.stream.market_statuses.NSE_EQ || "NOT CONNECTED",
-    initialCash = summary?.portfolio.initial_cash || 100000,
-    totalPnl = (summary?.portfolio.equity || initialCash) - initialCash;
+    displayedExperimentRuns = activeRuns.length
+      ? activeRuns
+      : latestRun?.experiment_id
+        ? runs.filter((run) => run.experiment_id === latestRun.experiment_id)
+        : latestRun
+          ? [latestRun]
+          : [],
+    initialCash = displayedExperimentRuns.length
+      ? displayedExperimentRuns.reduce(
+          (sum, run) => sum + (run.initial_equity || run.portfolio.initial_cash),
+          0,
+        )
+      : summary?.portfolio.initial_cash || 100000,
+    totalPnl = displayedExperimentRuns.length
+      ? displayedExperimentRuns.reduce((sum, run) => sum + run.session_pnl, 0)
+      : (summary?.portfolio.equity || initialCash) - initialCash;
   const startRun = async () => {
     setBusy("start");
     try {
-      const run = await request<MomentumRun>("/momentum-runners", {
+      const experiment = await request<EntryExperimentResult>("/entry-experiments", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          account_id: "momentum",
           duration_seconds: duration,
+          initial_cash: 1000000,
           max_positions: maxPositions,
           allocation_per_position: allocation,
           candidate_limit: 10,
           minimum_score: 0.15,
           minimum_relative_volume: 1.2,
-          entry_momentum_pct: 0.1,
-          reversal_pct: 0.1,
-          hard_stop_pct: 0.35,
-          entry_mode: "THREE_BAR",
-          exit_mode: exitMode,
-          entry_bars: 3,
           require_nifty_confirmation: false,
-          entry_timeframe_seconds: entryTimeframe,
-          trail_window: trailWindow,
-          fast_trail_window: Math.min(6, trailWindow),
         }),
       });
-      setNotice("New momentum run started");
-      setRuns((current) => [run, ...current]);
+      setNotice("Three-entry MACD experiment started");
+      setRuns((current) => [
+        ...experiment.variants.map((variant) => variant.run),
+        ...current,
+      ]);
       await refresh();
     } catch (error) {
       setNotice(
@@ -625,13 +716,15 @@ export default function Home() {
     }
   };
   const stopRun = async () => {
-    if (!activeRun) return;
+    if (!activeRuns.length) return;
     setBusy("stop");
     try {
-      await request(`/momentum-runners/${activeRun.id}/stop`, {
-        method: "POST",
-      });
-      setNotice("Stopping run and closing paper positions…");
+      await Promise.all(
+        activeRuns.map((run) =>
+          request(`/momentum-runners/${run.id}/stop`, { method: "POST" }),
+        ),
+      );
+      setNotice("Stopping all experiment runs and closing paper positions…");
       await refresh();
     } catch (error) {
       setNotice(
@@ -660,7 +753,7 @@ export default function Home() {
           <span className="brand-mark">J</span>
           <span>
             <strong>Jupiter</strong>
-            <small>Momentum paper lab</small>
+            <small>Paper strategy lab</small>
           </span>
         </button>
         <nav className="tabs" aria-label="Primary navigation">
@@ -723,7 +816,6 @@ export default function Home() {
           startRun={startRun}
           stopRun={stopRun}
           openRun={openRun}
-          onLaunched={refresh}
         />
       ) : selectedRunId ? (
         selectedRun ? (
@@ -777,7 +869,6 @@ function HomeView({
   startRun,
   stopRun,
   openRun,
-  onLaunched,
 }: {
   summary: Summary | null;
   runs: MomentumRun[];
@@ -803,24 +894,36 @@ function HomeView({
   startRun: () => void;
   stopRun: () => void;
   openRun: (id: string) => void;
-  onLaunched: () => void;
 }) {
   const recentFills = latestRun?.fills.slice(-6).reverse() || [];
+  const candlestick = true;
+  const equityRuns = activeRuns.length
+    ? activeRuns
+    : latestRun?.experiment_id
+      ? runs.filter((run) => run.experiment_id === latestRun.experiment_id)
+      : latestRun
+        ? [latestRun]
+        : [];
+  const availableCash = equityRuns.length
+    ? equityRuns.reduce((sum, run) => sum + run.portfolio.cash, 0)
+    : summary?.portfolio.cash || initialCash;
+  const executionCosts = equityRuns.length
+    ? equityRuns.reduce((sum, run) => sum + (run.metrics?.fees || 0), 0)
+    : summary?.portfolio.fees_paid || 0;
   return (
     <>
       <section className="hero home-hero">
         <div>
-          <p className="eyebrow">NIFTY 100 momentum research</p>
+          <p className="eyebrow">NIFTY 100 strategy research</p>
           <h1>
             Track the move.
             <br />
             <em>Study the turn.</em>
           </h1>
           <p className="hero-copy">
-            A focused paper account that surveys continuously, enters on three
-            rising prints only when the move is larger than what the round trip
-            costs, then manages the position with a stop that only ever moves
-            up.
+            Compare three entry timings on the same completed one-minute candles:
+            early MACD improvement, a later price-confirmed break, and a fresh
+            bullish crossover. All three use the same ratchet and bearish-MACD exit.
           </p>
         </div>
         <section className="new-run-card" aria-label="Start a new run">
@@ -831,6 +934,12 @@ function HomeView({
             </div>
             <span className="paper-chip">PAPER</span>
           </div>
+          <label>
+            Strategy
+            <select value="MACD_EARLY" disabled>
+              <option value="MACD_EARLY">Three-entry MACD comparison</option>
+            </select>
+          </label>
           <label>
             Duration
             <select
@@ -875,52 +984,76 @@ function HomeView({
             </label>
           </div>
           <div className="form-pair">
-            <label>
-              Exit rule
-              <select
-                value={exitMode}
-                onChange={(event) =>
-                  setExitMode(event.target.value as "RATCHET" | "REVERSAL")
-                }
-                disabled={!!activeRun}
-              >
-                <option value="RATCHET">Ratcheting stop</option>
-                <option value="REVERSAL">Fixed reversal</option>
-              </select>
-            </label>
-            <label>
-              Trail window
-              <input
-                type="number"
-                min="4"
-                max="120"
-                step="2"
-                value={trailWindow}
-                onChange={(event) => setTrailWindow(Number(event.target.value))}
-                disabled={!!activeRun || exitMode !== "RATCHET"}
-              />
-            </label>
+            {candlestick ? (
+              <>
+                <div className="fixed-rule">
+                  <span>Exit rule</span>
+                  <b>RATCHET + BEARISH MACD</b>
+                </div>
+                <div className="fixed-rule">
+                  <span>Signal volume</span>
+                  <b>ANNOTATION ONLY</b>
+                </div>
+              </>
+            ) : (
+              <>
+                <label>
+                  Exit rule
+                  <select
+                    value={exitMode}
+                    onChange={(event) =>
+                      setExitMode(event.target.value as "RATCHET" | "REVERSAL")
+                    }
+                    disabled={!!activeRun}
+                  >
+                    <option value="RATCHET">Ratcheting stop</option>
+                    <option value="REVERSAL">Fixed reversal</option>
+                  </select>
+                </label>
+                <label>
+                  Trail window
+                  <input
+                    type="number"
+                    min="4"
+                    max="120"
+                    step="2"
+                    value={trailWindow}
+                    onChange={(event) =>
+                      setTrailWindow(Number(event.target.value))
+                    }
+                    disabled={!!activeRun || exitMode !== "RATCHET"}
+                  />
+                </label>
+              </>
+            )}
           </div>
           <div className="form-pair">
             <div className="fixed-rule">
               <span>NIFTY 50 momentum</span>
               <b>Recorded as context only</b>
             </div>
-            <label>
-              Entry timeframe
-              <select
-                value={entryTimeframe}
-                onChange={(event) =>
-                  setEntryTimeframe(Number(event.target.value))
-                }
-                disabled={!!activeRun}
-              >
-                <option value={0}>5-second ticks</option>
-                <option value={60}>1-minute bars</option>
-              </select>
-            </label>
+            {candlestick ? (
+              <div className="fixed-rule">
+                <span>Signal timeframe</span>
+                <b>COMPLETED 1-MIN CANDLES</b>
+              </div>
+            ) : (
+              <label>
+                Entry timeframe
+                <select
+                  value={entryTimeframe}
+                  onChange={(event) =>
+                    setEntryTimeframe(Number(event.target.value))
+                  }
+                  disabled={!!activeRun}
+                >
+                  <option value={0}>5-second ticks</option>
+                  <option value={60}>1-minute bars</option>
+                </select>
+              </label>
+            )}
           </div>
-          {entryTimeframe > 0 && (
+          {!candlestick && entryTimeframe > 0 && (
             <div className="cost-hint">
               <span>Resampled entry</span>
               <b>{entryTimeframe / 60}-minute bars</b>
@@ -950,18 +1083,26 @@ function HomeView({
           <div className="rule-line">
             <span>Entry</span>
             <b>
-              3-BAR{entryTimeframe > 0 ? ` · ${entryTimeframe / 60}M` : " · 5S"}
+              {candlestick
+                ? "A / B / C MACD"
+                : `3-BAR${entryTimeframe > 0 ? ` · ${entryTimeframe / 60}M` : " · 5S"}`}
             </b>
             <span>Relative volume</span>
             <b>≥1.20×</b>
             <span>NIFTY short-term</span>
             <b>CONTEXT ONLY</b>
             <span>Exit</span>
-            <b>{exitMode === "RATCHET" ? "RATCHET" : "−0.10% REVERSAL"}</b>
+            <b>
+              {candlestick
+                ? "RATCHET + BEARISH MACD"
+                : exitMode === "RATCHET"
+                  ? "RATCHET"
+                  : "−0.10% REVERSAL"}
+            </b>
           </div>
           {activeRun ? (
             <button className="stop-run" onClick={stopRun} disabled={!!busy}>
-              {busy === "stop" ? "Closing positions…" : "Stop current run"}
+              {busy === "stop" ? "Closing positions…" : "Stop experiment"}
             </button>
           ) : (
             <button
@@ -969,7 +1110,7 @@ function HomeView({
               onClick={startRun}
               disabled={!!busy || allocation <= 0}
             >
-              {busy === "start" ? "Starting…" : "Start new run"}
+              {busy === "start" ? "Starting three runs…" : "Start A/B/C experiment"}
               <span>→</span>
             </button>
           )}
@@ -979,7 +1120,7 @@ function HomeView({
         <div>
           <p className="eyebrow">Total equity</p>
           <strong>
-            {money.format(summary?.portfolio.equity || initialCash)}
+            {money.format(initialCash + totalPnl)}
           </strong>
           <span className={totalPnl >= 0 ? "positive" : "negative"}>
             {signedMoney(totalPnl)} since reset
@@ -992,11 +1133,11 @@ function HomeView({
           </div>
           <div>
             <small>Available cash</small>
-            <b>{money.format(summary?.portfolio.cash || initialCash)}</b>
+            <b>{money.format(availableCash)}</b>
           </div>
           <div>
             <small>Execution costs</small>
-            <b>{money.format(summary?.portfolio.fees_paid || 0)}</b>
+            <b>{money.format(executionCosts)}</b>
           </div>
           <div>
             <small>Completed runs</small>
@@ -1013,13 +1154,6 @@ function HomeView({
       ) : (
         <LatestRun run={latestRun} openRun={openRun} />
       )}
-      <BatchLauncher
-        duration={duration}
-        allocation={allocation}
-        maxPositions={maxPositions}
-        disabled={false}
-        onLaunched={onLaunched}
-      />
       <section className="home-grid">
         <article className="panel process-panel">
           <div className="panel-head">
@@ -1240,7 +1374,7 @@ function RunsView({
                 </span>
                 <h2>{formatDate(run.started_at)}</h2>
                 <small>
-                  {Math.round(run.config.duration_seconds / 60)} min ·{" "}
+                  {strategyName(run)} · {Math.round(run.config.duration_seconds / 60)} min ·{" "}
                   {run.scan_count} scans ·{" "}
                   {new Set(run.fills.map((fill) => fill.symbol)).size} stocks
                 </small>
@@ -1313,6 +1447,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
     [entryOpen, setEntryOpen] = useState(false),
     [exitOpen, setExitOpen] = useState(false);
   const outcomes = useMemo(() => runOutcomes(run), [run]);
+  const candlestick = run.config.signal_strategy !== "MOMENTUM_REVERSAL";
   const duration =
     run.started_at && run.finished_at
       ? (new Date(run.finished_at).getTime() -
@@ -1334,7 +1469,10 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
           <span className={`status ${run.status.toLowerCase()}`}>
             {run.status}
           </span>
-          <p className="eyebrow">Momentum run · {run.id.slice(0, 8)}</p>
+          <p className="eyebrow">
+            {strategyName(run)} run ·{" "}
+            {run.id.slice(0, 8)}
+          </p>
           <h1>{formatDate(run.started_at)}</h1>
           <p>
             {number.format(duration)} minutes · {run.scan_count}{" "}
@@ -1527,8 +1665,8 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
               <dd>{run.config.max_positions}</dd>
             </div>
             <div>
-              <dt>Entry momentum</dt>
-              <dd>+{run.config.entry_momentum_pct}%</dd>
+              <dt>Strategy</dt>
+              <dd>{strategyName(run)}</dd>
             </div>
             <div>
               <dt>NIFTY momentum</dt>
@@ -1544,39 +1682,62 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
                 ≥{(run.config.minimum_relative_volume || 1.2).toFixed(2)}×
               </dd>
             </div>
-            <div>
-              <dt>Entry rule</dt>
-              <dd>
-                {(run.config.entry_mode || "ROLLING_WINDOW")
-                  .replaceAll("_", " ")
-                  .toLowerCase()}
-                {run.config.entry_bars
-                  ? ` · ${run.config.entry_bars} bars`
-                  : ""}
-              </dd>
-            </div>
-            <div>
-              <dt>Entry timeframe</dt>
-              <dd>
-                {run.config.entry_timeframe_seconds
-                  ? `${run.config.entry_timeframe_seconds / 60}-minute bars`
-                  : "5-second ticks"}
-              </dd>
-            </div>
-            <div>
-              <dt>Entry bar</dt>
-              <dd>
-                max of {run.config.entry_momentum_pct}%,{" "}
-                {run.config.entry_cost_multiple ?? 1}× cost,{" "}
-                {run.config.entry_noise_multiple ?? 2}× noise
-              </dd>
-            </div>
-            <div>
-              <dt>Exit rule</dt>
-              <dd>{(run.config.exit_mode || "REVERSAL").toLowerCase()}</dd>
-            </div>
-            {run.config.exit_mode === "RATCHET" ? (
+            {candlestick ? (
               <>
+                <div>
+                  <dt>Signal timeframe</dt>
+                  <dd>completed 1-minute candles</dd>
+                </div>
+                <div>
+                  <dt>Entry rule</dt>
+                  <dd>{strategyName(run)}</dd>
+                </div>
+                <div>
+                  <dt>Exit rule</dt>
+                  <dd>ratchet plus bearish candle and MACD contraction/cross</dd>
+                </div>
+                <div>
+                  <dt>Exit volume</dt>
+                  <dd>annotated only; it never blocks an exit</dd>
+                </div>
+              </>
+            ) : run.config.exit_mode === "RATCHET" ? (
+              <>
+                <div>
+                  <dt>Entry momentum</dt>
+                  <dd>+{run.config.entry_momentum_pct}%</dd>
+                </div>
+                <div>
+                  <dt>Entry rule</dt>
+                  <dd>
+                    {(run.config.entry_mode || "ROLLING_WINDOW")
+                      .replaceAll("_", " ")
+                      .toLowerCase()}
+                    {run.config.entry_bars
+                      ? ` · ${run.config.entry_bars} bars`
+                      : ""}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Entry timeframe</dt>
+                  <dd>
+                    {run.config.entry_timeframe_seconds
+                      ? `${run.config.entry_timeframe_seconds / 60}-minute bars`
+                      : "5-second ticks"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Entry bar</dt>
+                  <dd>
+                    max of {run.config.entry_momentum_pct}%,{" "}
+                    {run.config.entry_cost_multiple ?? 1}× cost,{" "}
+                    {run.config.entry_noise_multiple ?? 2}× noise
+                  </dd>
+                </div>
+                <div>
+                  <dt>Exit rule</dt>
+                  <dd>ratcheting stop</dd>
+                </div>
                 <div>
                   <dt>Survive stop</dt>
                   <dd>{run.config.survive_stop_multiple}× floor</dd>
@@ -1609,6 +1770,26 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
             ) : (
               <>
                 <div>
+                  <dt>Entry momentum</dt>
+                  <dd>+{run.config.entry_momentum_pct}%</dd>
+                </div>
+                <div>
+                  <dt>Entry rule</dt>
+                  <dd>rolling-window momentum</dd>
+                </div>
+                <div>
+                  <dt>Entry bar</dt>
+                  <dd>
+                    max of {run.config.entry_momentum_pct}%,{" "}
+                    {run.config.entry_cost_multiple ?? 1}× cost,{" "}
+                    {run.config.entry_noise_multiple ?? 2}× noise
+                  </dd>
+                </div>
+                <div>
+                  <dt>Exit rule</dt>
+                  <dd>fixed reversal</dd>
+                </div>
+                <div>
                   <dt>Trailing reversal</dt>
                   <dd>−{run.config.reversal_pct}%</dd>
                 </div>
@@ -1631,6 +1812,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
 function EntryEvidence({ run }: { run: MomentumRun }) {
   const entries = run.events.filter((event) => event.type === "ENTRY_FILLED");
   if (!entries.length) return null;
+  const candlestick = run.config.signal_strategy !== "MOMENTUM_REVERSAL";
   const captured = entries.filter((event) => event.entry_signal);
   return (
     <section className="panel evidence-panel">
@@ -1639,12 +1821,19 @@ function EntryEvidence({ run }: { run: MomentumRun }) {
           <p className="eyebrow">Why we bought</p>
           <h2>Entry evidence</h2>
         </div>
-        <span className="count">Stock momentum + volume confirmation</span>
+        <span className="count">
+          {candlestick
+            ? "Completed candle + RVOL + MACD timing"
+            : "Stock momentum + volume confirmation"}
+        </span>
       </div>
       {captured.length ? (
         <div className="signal-grid">
           {captured.map((event) => {
             const signal = event.entry_signal!;
+            const candle = signal.candlestick_signal;
+            const experimentSignal = signal.intent?.signal;
+            const features = experimentSignal?.features;
             const against = signal.market_alignment === "AGAINST_BROAD_MARKET";
             return (
               <article
@@ -1660,34 +1849,151 @@ function EntryEvidence({ run }: { run: MomentumRun }) {
                     {against ? "AGAINST NIFTY" : "WITH NIFTY"}
                   </span>
                 </div>
-                <p>
-                  Bought because the monitored price rose{" "}
-                  <b>{signedPct(signal.window_change_pct)}</b> and relative
-                  volume was <b>{optionalRatio(signal.relative_volume)}</b>.
-                  NIFTY direction is shown as context and did not gate this
-                  entry.
-                </p>
+                {experimentSignal ? (
+                  <p>
+                    Bought for <b>{strategyName(run)}</b> after the completed
+                    one-minute rejection candle passed at{" "}
+                    <b>{optionalRatio(features?.rvol_1m)}</b> RVOL. Histogram moved{" "}
+                    from <b>{number.format(features?.h1 || 0)}</b> to{" "}
+                    <b>{number.format(features?.histogram || 0)}</b>.
+                  </p>
+                ) : candle ? (
+                  <p>
+                    Bought after a completed one-minute{" "}
+                    <b>{candle.shape?.colour.toLowerCase()}</b> candle showed{" "}
+                    <b>upper-wick buy pressure</b>, volume reached{" "}
+                    <b>{optionalRatio(candle.volume?.relative_volume)}</b>, and
+                    the MACD histogram was positive and widening.
+                  </p>
+                ) : (
+                  <p>
+                    Bought because the monitored price rose{" "}
+                    <b>{signedPct(signal.window_change_pct || 0)}</b> and relative
+                    volume was <b>{optionalRatio(signal.relative_volume)}</b>.
+                    NIFTY direction is shown as context and did not gate this
+                    entry.
+                  </p>
+                )}
                 <dl>
-                  <div>
-                    <dt>Latest 5-sec change</dt>
-                    <dd
-                      className={
-                        signal.sample_change_pct >= 0 ? "positive" : "negative"
-                      }
-                    >
-                      {signedPct(signal.sample_change_pct)}
-                    </dd>
-                  </div>
+                  {experimentSignal ? (
+                    <>
+                      <div>
+                        <dt>Candle O → C</dt>
+                        <dd>
+                          {money.format(features?.bar?.open || 0)} →{" "}
+                          {money.format(features?.bar?.close || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Lower / upper wick</dt>
+                        <dd>
+                          {optionalPct((features?.lower_ratio || 0) * 100)} /{" "}
+                          {optionalPct((features?.upper_ratio || 0) * 100)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>1-minute RVOL</dt>
+                        <dd className="positive">
+                          {optionalRatio(features?.rvol_1m)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>MACD histogram h2 / h1 / h0</dt>
+                        <dd>
+                          {number.format(features?.h2 || 0)} /{" "}
+                          {number.format(features?.h1 || 0)} /{" "}
+                          {number.format(features?.histogram || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Normalized slope</dt>
+                        <dd>{number.format(features?.delta_bps || 0)} bps</dd>
+                      </div>
+                      {signal.intent?.setup?.trigger_price !== undefined && (
+                        <div>
+                          <dt>Price confirmation</dt>
+                          <dd>{money.format(signal.intent.setup.trigger_price)}</dd>
+                        </div>
+                      )}
+                    </>
+                  ) : candle ? (
+                    <>
+                      <div>
+                        <dt>Candle O → C</dt>
+                        <dd>
+                          {money.format(candle.candle?.open || 0)} →{" "}
+                          {money.format(candle.candle?.close || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Upper / lower wick</dt>
+                        <dd>
+                          {number.format(candle.shape?.upper_wick || 0)} /{" "}
+                          {number.format(candle.shape?.lower_wick || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Volume pressure</dt>
+                        <dd className="positive">
+                          {candle.volume?.bias} ·{" "}
+                          {optionalRatio(candle.volume?.relative_volume)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>MACD / signal</dt>
+                        <dd>
+                          {number.format(candle.macd?.line || 0)} /{" "}
+                          {number.format(candle.macd?.signal || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>MACD histogram</dt>
+                        <dd className="positive">
+                          {number.format(candle.macd?.histogram || 0)} · widening
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Signal candle</dt>
+                        <dd>
+                          {signal.signal_candle_timestamp
+                            ? formatTime(signal.signal_candle_timestamp)
+                            : "—"}
+                        </dd>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <dt>Latest 5-sec change</dt>
+                        <dd
+                          className={
+                            (signal.sample_change_pct || 0) >= 0
+                              ? "positive"
+                              : "negative"
+                          }
+                        >
+                          {signedPct(signal.sample_change_pct || 0)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Price window</dt>
+                        <dd>
+                          {money.format(signal.window_start_price || 0)} →{" "}
+                          {money.format(signal.observed_price)}
+                        </dd>
+                      </div>
+                    </>
+                  )}
                   <div>
                     <dt>Stock · 15 min</dt>
                     <dd
                       className={
-                        signal.recent_15m_change_pct >= 0
+                        (signal.recent_15m_change_pct || 0) >= 0
                           ? "positive"
                           : "negative"
                       }
                     >
-                      {signedPct(signal.recent_15m_change_pct)}
+                      {optionalPct(signal.recent_15m_change_pct)}
                     </dd>
                   </div>
                   <div>
@@ -1702,34 +2008,31 @@ function EntryEvidence({ run }: { run: MomentumRun }) {
                       {optionalPct(signal.nifty_recent_15m_change_pct)}
                     </dd>
                   </div>
-                  <div>
-                    <dt>Relative volume</dt>
-                    <dd
-                      className={
-                        (signal.relative_volume || 0) >= 1.2
-                          ? "positive"
-                          : "negative"
-                      }
-                    >
-                      {optionalRatio(signal.relative_volume)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Price window</dt>
-                    <dd>
-                      {money.format(signal.window_start_price)} →{" "}
-                      {money.format(signal.observed_price)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Volume threshold</dt>
-                    <dd>
-                      ≥{(signal.minimum_relative_volume || 1.2).toFixed(2)}×
-                    </dd>
-                  </div>
+                  {!candle && !experimentSignal && (
+                    <>
+                      <div>
+                        <dt>Relative volume</dt>
+                        <dd
+                          className={
+                            (signal.relative_volume || 0) >= 1.2
+                              ? "positive"
+                              : "negative"
+                          }
+                        >
+                          {optionalRatio(signal.relative_volume)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Volume threshold</dt>
+                        <dd>
+                          ≥{(signal.minimum_relative_volume || 1.2).toFixed(2)}×
+                        </dd>
+                      </div>
+                    </>
+                  )}
                   {signal.structural_stop !== undefined && (
                     <div>
-                      <dt>Three-bar trigger</dt>
+                      <dt>Structural stop seed</dt>
                       <dd>{money.format(signal.structural_stop)}</dd>
                     </div>
                   )}
@@ -1795,134 +2098,6 @@ function EntryEvidence({ run }: { run: MomentumRun }) {
   );
 }
 
-const BATCH_ARMS = [
-  {
-    label: "5s-ticks",
-    note: "Three 5-second prints",
-    overrides: { entry_timeframe_seconds: 0 },
-  },
-  {
-    label: "1m-bars",
-    note: "Three 1-minute bars",
-    overrides: { entry_timeframe_seconds: 60 },
-  },
-];
-
-function BatchLauncher({
-  duration,
-  allocation,
-  maxPositions,
-  disabled,
-  onLaunched,
-}: {
-  duration: number;
-  allocation: number;
-  maxPositions: number;
-  disabled: boolean;
-  onLaunched: () => void;
-}) {
-  const [picked, setPicked] = useState<string[]>(["5s-ticks", "1m-bars"]);
-  const [busy, setBusy] = useState(false),
-    [result, setResult] = useState<BatchResult | null>(null),
-    [error, setError] = useState("");
-  const toggle = (label: string) =>
-    setPicked((current) =>
-      current.includes(label)
-        ? current.filter((item) => item !== label)
-        : [...current, label],
-    );
-  const launch = async () => {
-    setBusy(true);
-    setError("");
-    setResult(null);
-    try {
-      const body = {
-        base: {
-          duration_seconds: duration,
-          allocation_per_position: allocation,
-          max_positions: maxPositions,
-          entry_mode: "THREE_BAR",
-          exit_mode: "RATCHET",
-          require_nifty_confirmation: false,
-        },
-        account_prefix: "fwd",
-        variants: BATCH_ARMS.filter((arm) => picked.includes(arm.label)).map(
-          (arm) => ({ label: arm.label, overrides: arm.overrides }),
-        ),
-      };
-      setResult(
-        await request<BatchResult>("/momentum-runners/batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }),
-      );
-      onLaunched();
-    } catch (problem) {
-      setError(
-        problem instanceof Error
-          ? problem.message
-          : "Batch could not be started",
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <section className="panel batch-panel">
-      <div className="panel-head">
-        <div>
-          <p className="eyebrow">Run several configurations at once</p>
-          <h2>Comparison batch</h2>
-        </div>
-        <span className="count">{picked.length} selected</span>
-      </div>
-      <p className="trace-help">
-        The 5-second and 1-minute arms keep separate paper accounts but share
-        one cached NIFTY 100 survey, avoiding duplicate market-data requests
-        while preserving a fair comparison.
-      </p>
-      <div className="arm-grid">
-        {BATCH_ARMS.map((arm) => (
-          <button
-            key={arm.label}
-            className={`arm ${picked.includes(arm.label) ? "on" : ""}`}
-            onClick={() => toggle(arm.label)}
-            disabled={disabled || busy}
-          >
-            <strong>{arm.label}</strong>
-            <small>{arm.note}</small>
-          </button>
-        ))}
-      </div>
-      <button
-        className="secondary batch-go"
-        onClick={launch}
-        disabled={disabled || busy || !picked.length}
-      >
-        {busy
-          ? "Starting…"
-          : `Start ${picked.length} run${picked.length === 1 ? "" : "s"}`}
-      </button>
-      {error && <div className="error-box">{error}</div>}
-      {result && (
-        <div className="batch-result">
-          {result.started.map((item) => (
-            <span className="reason good" key={item.label}>
-              {item.label} started
-            </span>
-          ))}
-          {result.failed.map((item) => (
-            <span className="reason" key={item.label}>
-              {item.label}: {item.error}
-            </span>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
 function DataHealthNotice({ run }: { run: MomentumRun }) {
   const health = run.data_health;
   if (!health || health.status === "OK") return null;
@@ -1962,7 +2137,8 @@ function CostFloorPanel({ run }: { run: MomentumRun }) {
   const cost = run.cost_model;
   if (!cost) return <DataHealthNotice run={run} />;
   const floor = cost.breakeven_pct,
-    ratchet = run.config.exit_mode !== "REVERSAL";
+    candlestick = run.config.signal_strategy === "CANDLESTICK_MACD",
+    ratchet = !candlestick && run.config.exit_mode !== "REVERSAL";
   const risk = (run.config.survive_stop_multiple ?? 2) * floor,
     lock = (run.config.lock_multiple ?? 1.5) * floor,
     ride = (run.config.ride_multiple ?? 3) * floor;
@@ -2008,7 +2184,18 @@ function CostFloorPanel({ run }: { run: MomentumRun }) {
             </div>
           </dl>
         </div>
-        {ratchet ? (
+        {candlestick ? (
+          <div className="legacy-note">
+            <strong>Pattern exit with an emergency hard stop</strong>
+            <p>
+              A normal exit waits for red or sell-pressure doji structure,
+              elevated volume, and MACD convergence or intersection to agree.
+              The fixed −{run.config.hard_stop_pct}% stop remains active even
+              before that pattern appears. A profitable signal must still clear
+              the {floor.toFixed(3)}% execution-cost floor.
+            </p>
+          </div>
+        ) : ratchet ? (
           <div className="ladder">
             <div className="ladder-step survive">
               <small>1 · Survive</small>
@@ -2144,6 +2331,7 @@ function StopChart({
 
 function PositionLedger({ run }: { run: MomentumRun }) {
   const monitoring = useMemo(() => run.monitoring || [], [run.monitoring]);
+  const candlestick = run.config.signal_strategy === "CANDLESTICK_MACD";
   const positions = useMemo(
     () =>
       run.events
@@ -2173,8 +2361,9 @@ function PositionLedger({ run }: { run: MomentumRun }) {
         </span>
       </div>
       <p className="trace-help">
-        The stop only ever moves up. The chart shows the last price against the
-        stop it was ratcheting behind, with the entry price flat across.
+        {candlestick
+          ? "The chart shows price against the emergency hard stop. Normal exits wait for candle shape, directional volume pressure, and MACD convergence to agree."
+          : "The stop only ever moves up. The chart shows the last price against the stop it was ratcheting behind, with the entry price flat across."}
       </p>
       <div className="ledger">
         {positions.map(({ entry, exit, path }) => {
@@ -2209,16 +2398,18 @@ function PositionLedger({ run }: { run: MomentumRun }) {
                 path={path}
                 entry={signal?.observed_price || entry.observed_price || 0}
               />
-              <div className="phase-track">
-                {["SURVIVE", "LOCK", "RIDE"].map((phase, index) => (
-                  <span
-                    key={phase}
-                    className={index <= reached ? "reached" : ""}
-                  >
-                    {phase}
-                  </span>
-                ))}
-              </div>
+              {!candlestick && (
+                <div className="phase-track">
+                  {["SURVIVE", "LOCK", "RIDE"].map((phase, index) => (
+                    <span
+                      key={phase}
+                      className={index <= reached ? "reached" : ""}
+                    >
+                      {phase}
+                    </span>
+                  ))}
+                </div>
+              )}
               <dl className="ledger-facts">
                 <div>
                   <dt>Entry</dt>
@@ -2236,7 +2427,7 @@ function PositionLedger({ run }: { run: MomentumRun }) {
                   </dd>
                 </div>
                 <div>
-                  <dt>Three-bar trigger</dt>
+                  <dt>{candlestick ? "Signal candle low" : "Three-bar trigger"}</dt>
                   <dd>
                     {signal?.structural_stop
                       ? money.format(signal.structural_stop)
@@ -2280,6 +2471,45 @@ function PositionLedger({ run }: { run: MomentumRun }) {
                       : "—"}
                   </dd>
                 </div>
+                {candlestick && final?.candlestick_signal && (
+                  <>
+                    <div>
+                      <dt>Exit candle</dt>
+                      <dd>{final.candlestick_signal.shape?.colour || "—"}</dd>
+                    </div>
+                    <div>
+                      <dt>Upper / lower wick</dt>
+                      <dd>
+                        {number.format(
+                          final.candlestick_signal.shape?.upper_wick || 0,
+                        )} {" "}
+                        /{" "}
+                        {number.format(
+                          final.candlestick_signal.shape?.lower_wick || 0,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Exit volume</dt>
+                      <dd>
+                        {final.candlestick_signal.volume?.bias || "—"} ·{" "}
+                        {optionalRatio(
+                          final.candlestick_signal.volume?.relative_volume,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>MACD exit</dt>
+                      <dd>
+                        {final.candlestick_signal.macd?.bearish_intersection
+                          ? "intersection"
+                          : final.candlestick_signal.macd?.sufficient_convergence
+                            ? "convergence threshold"
+                            : "hard stop"}
+                      </dd>
+                    </div>
+                  </>
+                )}
                 <div>
                   <dt>Move net of cost</dt>
                   <dd
@@ -3432,6 +3662,8 @@ function decisionTone(decision: string): string {
   return "block";
 }
 function armLabel(run: MomentumRun): string {
+  if (run.config.signal_strategy !== "MOMENTUM_REVERSAL")
+    return `${strategyName(run)} · ${money.format(run.config.allocation_per_position)}`;
   const bars = run.config.entry_timeframe_seconds
     ? `${run.config.entry_timeframe_seconds / 60}m bars`
     : "5s ticks";
@@ -3652,7 +3884,10 @@ function ScheduleStrip({ status }: { status: ScheduleStatus | null }) {
           <span>
             <small>Runs today</small>
             <b>
-              {done}/{plan ? plan.slots.length : status.entry_timeframes.length}
+              {done}/
+              {plan
+                ? plan.slots.length
+                : status.entry_variants?.length || status.entry_timeframes?.length || 3}
             </b>
           </span>
           <span>
@@ -3984,12 +4219,12 @@ function formatTime(value: string) {
     second: "2-digit",
   }).format(new Date(value));
 }
-function optionalPct(value?: number) {
+function optionalPct(value?: number | null) {
   return value === undefined || value === null
     ? "Unavailable"
     : signedPct(value);
 }
-function optionalRatio(value?: number) {
+function optionalRatio(value?: number | null) {
   return value === undefined || value === null
     ? "Unavailable"
     : `${value.toFixed(2)}×`;

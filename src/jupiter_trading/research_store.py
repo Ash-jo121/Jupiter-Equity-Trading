@@ -64,6 +64,13 @@ class ResearchStore:
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS entry_experiments (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    shared_config_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS market_observations (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL,
@@ -95,6 +102,8 @@ class ResearchStore:
                     ON strategy_events(strategy_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_momentum_runs_account_updated
                     ON momentum_runs(account_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_entry_experiments_updated
+                    ON entry_experiments(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_observations_run
                     ON market_observations(run_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_observations_instrument_time
@@ -301,6 +310,40 @@ class ResearchStore:
         with self._lock:
             row = self._connection.execute(
                 "SELECT payload FROM momentum_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_experiment(self, payload: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO entry_experiments (id, status, shared_config_hash, payload)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    shared_config_hash = excluded.shared_config_hash,
+                    payload = excluded.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    payload["experiment_id"],
+                    payload["status"],
+                    payload["shared_config_hash"],
+                    json.dumps(payload),
+                ),
+            )
+
+    def experiments(self) -> List[dict]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT payload FROM entry_experiments ORDER BY updated_at DESC, rowid DESC"
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def experiment(self, experiment_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM entry_experiments WHERE id = ?", (experiment_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
 

@@ -20,9 +20,7 @@ class SurveyInstrument:
 class MarketSurvey:
     """Transparent intraday ranking used to shortlist, not predict, paper trades."""
 
-    def __init__(
-        self, market_data: UpstoxMarketData, minimum_relative_volume: float = 1.2
-    ) -> None:
+    def __init__(self, market_data: UpstoxMarketData, minimum_relative_volume: float = 1.2) -> None:
         if minimum_relative_volume <= 0:
             raise ValueError("minimum_relative_volume must be positive")
         self.market_data = market_data
@@ -60,32 +58,36 @@ class MarketSurvey:
                 and volume["relative_volume"] >= self.minimum_relative_volume
             )
             return {
-                    "symbol": instrument.symbol,
-                    "instrument_key": instrument.instrument_key,
-                    "last_price": round(last_price, 4),
-                    "session_open": round(session_open, 4),
-                    "session_change_pct": round(session_change, 4),
-                    "recent_15m_change_pct": round(recent_change, 4),
-                    "session_high": round(session_high, 4),
-                    "session_low": round(session_low, 4),
-                    "range_position_pct": round(range_position, 2),
-                    "momentum_score": round(score, 4),
-                    **volume,
-                    "minimum_relative_volume": self.minimum_relative_volume,
-                    "volume_signal": (
-                        "UNAVAILABLE"
-                        if volume["relative_volume"] is None
-                        else "HIGH" if volume_confirmed else "LOW"
-                    ),
-                    "volume_confirmed": volume_confirmed,
-                    "suggested_entry_price": round(last_price, 2),
+                "symbol": instrument.symbol,
+                "instrument_key": instrument.instrument_key,
+                "last_price": round(last_price, 4),
+                "session_open": round(session_open, 4),
+                "session_change_pct": round(session_change, 4),
+                "recent_15m_change_pct": round(recent_change, 4),
+                "session_high": round(session_high, 4),
+                "session_low": round(session_low, 4),
+                "range_position_pct": round(range_position, 2),
+                "momentum_score": round(score, 4),
+                **volume,
+                "minimum_relative_volume": self.minimum_relative_volume,
+                "volume_signal": (
+                    "UNAVAILABLE"
+                    if volume["relative_volume"] is None
+                    else "HIGH"
+                    if volume_confirmed
+                    else "LOW"
+                ),
+                "volume_confirmed": volume_confirmed,
+                "suggested_entry_price": round(last_price, 2),
                 "suggested_profit_target_pct": 1.0,
                 "suggested_stop_loss_pct": 0.5,
-                    "eligible": score > 0 and range_position < 95 and volume_confirmed,
-                }
+                "eligible": score > 0 and range_position < 95 and volume_confirmed,
+            }
 
         with ThreadPoolExecutor(max_workers=min(5, len(instruments))) as executor:
-            futures = {executor.submit(analyze, instrument): instrument for instrument in instruments}
+            futures = {
+                executor.submit(analyze, instrument): instrument for instrument in instruments
+            }
             for future in as_completed(futures):
                 instrument = futures[future]
                 try:
@@ -153,9 +155,7 @@ class SharedSurveyCache:
         try:
             result = MarketSurvey(market_data, minimum_relative_volume).run(instruments)
             if context_instrument_key:
-                result["market_context"] = _candle_context(
-                    market_data, context_instrument_key
-                )
+                result["market_context"] = _candle_context(market_data, context_instrument_key)
             built_at = monotonic()
             healthy = result["analyzed"] == result["requested"]
             ttl = self.ttl_seconds if healthy else self.failure_ttl_seconds
@@ -179,9 +179,7 @@ class SharedSurveyCache:
         return payload
 
 
-def _candle_context(
-    market_data: UpstoxMarketData, instrument_key: str
-) -> dict:
+def _candle_context(market_data: UpstoxMarketData, instrument_key: str) -> dict:
     """Capture shared session and trailing-15-minute reference prices."""
 
     try:
@@ -190,9 +188,7 @@ def _candle_context(
             raise ValueError("intraday candles were not returned")
         return {
             "session_open": candles[0].open,
-            "recent_15m": (
-                candles[-4].close if len(candles) >= 4 else candles[0].close
-            ),
+            "recent_15m": (candles[-4].close if len(candles) >= 4 else candles[0].close),
             "error": None,
         }
     except Exception as error:  # noqa: BLE001 - context is descriptive, not a gate
