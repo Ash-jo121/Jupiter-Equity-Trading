@@ -328,6 +328,11 @@ type MomentumRun = {
     lock_multiple?: number;
     ride_multiple?: number;
     min_gap_multiple?: number;
+    market_code?: "NSE" | "US";
+    market_timezone?: string;
+    currency?: "INR" | "USD";
+    broker_provider?: "INTERNAL_PAPER" | "ALPACA_PAPER";
+    benchmark_symbol?: string;
     trail_window?: number;
     fast_trail_window?: number;
     volume_decay_ratio?: number;
@@ -347,6 +352,26 @@ type MomentumRun = {
     fees_paid: number;
     realized_pnl: number;
     positions: Position[];
+  };
+};
+type MarketAutomation = {
+  NSE: {
+    enabled: boolean;
+    running: boolean;
+    timezone: string;
+    regular_session: string;
+    is_trading_day?: boolean;
+    plan?: { slots?: Array<{ status: string }> } | null;
+  };
+  US: {
+    enabled: boolean;
+    configured: boolean;
+    running: boolean;
+    timezone: string;
+    regular_session: string;
+    strategy: string;
+    clock?: { is_open?: boolean; next_open?: string; next_close?: string } | null;
+    last_action?: { action?: string; detail?: string } | null;
   };
 };
 type Summary = {
@@ -509,6 +534,17 @@ const money = new Intl.NumberFormat("en-IN", {
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const signedMoney = (value: number) =>
   `${value >= 0 ? "+" : "−"}${money.format(Math.abs(value))}`;
+const moneyFor = (currency: "INR" | "USD" = "INR") =>
+  new Intl.NumberFormat(currency === "USD" ? "en-US" : "en-IN", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: 2,
+  });
+const runMoney = (run: MomentumRun, value: number) =>
+  moneyFor(run.config.currency || "INR").format(value);
+const signedRunMoney = (run: MomentumRun, value: number) =>
+  `${value >= 0 ? "+" : "−"}${runMoney(run, Math.abs(value))}`;
+const marketName = (run: MomentumRun) => run.config.market_code || "NSE";
 const signedPct = (value: number) =>
   `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 const universeName = (run: MomentumRun) =>
@@ -568,6 +604,7 @@ function runOutcomes(run: MomentumRun): Outcome[] {
 export default function Home() {
   const [summary, setSummary] = useState<Summary | null>(null),
     [runs, setRuns] = useState<MomentumRun[]>([]);
+  const [automation, setAutomation] = useState<MarketAutomation | null>(null);
   const [tab, setTab] = useState<"home" | "runs" | "reports">("home"),
     [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MomentumRun | null>(null),
@@ -583,12 +620,14 @@ export default function Home() {
   const [cost, setCost] = useState<CostModel | null>(null);
   const refresh = useCallback(async () => {
     try {
-      const [nextSummary, nextRuns] = await Promise.all([
+      const [nextSummary, nextRuns, nextAutomation] = await Promise.all([
         request<Summary>("/dashboard/summary?account_id=momentum"),
         request<MomentumRun[]>("/momentum-runners"),
+        request<MarketAutomation>("/markets/automation").catch(() => null),
       ]);
       setSummary(nextSummary);
       setRuns(nextRuns);
+      setAutomation(nextAutomation);
       setNotice("Paper engine connected");
     } catch (error) {
       setNotice(
@@ -621,12 +660,16 @@ export default function Home() {
       window.clearTimeout(timer);
     };
   }, [allocation]);
-  const activeRuns = useMemo(
-    () => runs.filter((run) => ["RUNNING", "STOPPING"].includes(run.status)),
+  const nseRuns = useMemo(
+    () => runs.filter((run) => marketName(run) === "NSE"),
     [runs],
   );
+  const activeRuns = useMemo(
+    () => nseRuns.filter((run) => ["RUNNING", "STOPPING"].includes(run.status)),
+    [nseRuns],
+  );
   const activeRun = activeRuns[0],
-    latestRun = runs[0];
+    latestRun = nseRuns[0];
   const selectedRun = detail && detail.id === selectedRunId ? detail : null;
   // A stale detail object is filtered by the id guard above, so the effect
   // never needs to clear state synchronously - it only fetches.
@@ -671,7 +714,7 @@ export default function Home() {
     displayedExperimentRuns = activeRuns.length
       ? activeRuns
       : latestRun?.experiment_id
-        ? runs.filter((run) => run.experiment_id === latestRun.experiment_id)
+        ? nseRuns.filter((run) => run.experiment_id === latestRun.experiment_id)
         : latestRun
           ? [latestRun]
           : [],
@@ -788,12 +831,16 @@ export default function Home() {
         <div className="market-pill" data-open={marketStatus === "NORMAL_OPEN"}>
           <span />
           NSE · {marketStatus.replaceAll("_", " ")}
+          {automation?.US.configured
+            ? ` · US ${automation.US.clock?.is_open ? "OPEN" : "SCHEDULED"}`
+            : ""}
         </div>
       </header>
       {tab === "home" ? (
         <HomeView
           summary={summary}
-          runs={runs}
+          automation={automation}
+          runs={nseRuns}
           latestRun={latestRun}
           activeRun={activeRun}
           activeRuns={activeRuns}
@@ -846,6 +893,7 @@ export default function Home() {
 
 function HomeView({
   summary,
+  automation,
   runs,
   latestRun,
   activeRun,
@@ -871,6 +919,7 @@ function HomeView({
   openRun,
 }: {
   summary: Summary | null;
+  automation: MarketAutomation | null;
   runs: MomentumRun[];
   latestRun?: MomentumRun;
   activeRun?: MomentumRun;
@@ -1116,6 +1165,7 @@ function HomeView({
           )}
         </section>
       </section>
+      <MarketAutomationPanel automation={automation} />
       <section className="equity-banner">
         <div>
           <p className="eyebrow">Total equity</p>
@@ -1270,7 +1320,7 @@ function ActiveRun({
         <span>
           <small>Live P&L</small>
           <b className={run.session_pnl >= 0 ? "positive" : "negative"}>
-            {signedMoney(run.session_pnl)}
+            {signedRunMoney(run, run.session_pnl)}
           </b>
         </span>
       </div>
@@ -1280,6 +1330,53 @@ function ActiveRun({
     </section>
   );
 }
+
+function MarketAutomationPanel({
+  automation,
+}: {
+  automation: MarketAutomation | null;
+}) {
+  const usOpen = !!automation?.US.clock?.is_open;
+  return (
+    <section className="market-lanes" aria-label="Automated market sessions">
+      <article>
+        <div className="lane-head">
+          <span className={`lane-dot ${automation?.NSE.running ? "on" : ""}`} />
+          <div>
+            <small>India · local paper execution</small>
+            <strong>NIFTY 100</strong>
+          </div>
+          <b>
+            {!automation ? "CONNECTING" : automation.NSE.enabled ? "AUTOMATED" : "OFF"}
+          </b>
+        </div>
+        <p>09:15–15:30 IST · NSE holidays skipped · A/B/C isolated accounts</p>
+      </article>
+      <article>
+        <div className="lane-head">
+          <span className={`lane-dot ${usOpen ? "on" : ""}`} />
+          <div>
+            <small>United States · Alpaca paper execution</small>
+            <strong>NASDAQ 100</strong>
+          </div>
+          <b>
+            {!automation
+              ? "CONNECTING"
+              : !automation.US.configured
+              ? "NEEDS KEYS"
+              : automation.US.enabled
+                ? usOpen
+                  ? "OPEN"
+                  : "AUTOMATED"
+                : "OFF"}
+          </b>
+        </div>
+        <p>09:30–16:00 ET · Alpaca calendar and DST · confirmed MACD strategy</p>
+      </article>
+    </section>
+  );
+}
+
 function LatestRun({
   run,
   openRun,
@@ -1311,7 +1408,7 @@ function LatestRun({
         <span>
           <small>Net result</small>
           <b className={run.session_pnl >= 0 ? "positive" : "negative"}>
-            {signedMoney(run.session_pnl)}
+            {signedRunMoney(run, run.session_pnl)}
           </b>
         </span>
         <span>
@@ -1320,7 +1417,7 @@ function LatestRun({
         </span>
         <span>
           <small>Final equity</small>
-          <b>{money.format(run.portfolio.equity)}</b>
+          <b>{runMoney(run, run.portfolio.equity)}</b>
         </span>
       </div>
       <button className="secondary" onClick={() => openRun(run.id)}>
@@ -1375,7 +1472,7 @@ function RunsView({
                 <h2>{formatDate(run.started_at)}</h2>
                 <small>
                   {strategyName(run)} · {Math.round(run.config.duration_seconds / 60)} min ·{" "}
-                  {run.scan_count} scans ·{" "}
+                  {marketName(run)} · {run.scan_count} scans ·{" "}
                   {new Set(run.fills.map((fill) => fill.symbol)).size} stocks
                 </small>
               </div>
@@ -1391,9 +1488,9 @@ function RunsView({
                 <strong
                   className={run.session_pnl >= 0 ? "positive" : "negative"}
                 >
-                  {signedMoney(run.session_pnl)}
+                  {signedRunMoney(run, run.session_pnl)}
                 </strong>
-                <span>{money.format(run.portfolio.equity)} final equity</span>
+                <span>{runMoney(run, run.portfolio.equity)} final equity</span>
               </div>
               <span className="row-arrow">→</span>
             </button>
@@ -1417,9 +1514,11 @@ type RunReportSection = keyof typeof RUN_REPORT_SECTIONS;
 function RunReportTabs({
   value,
   onChange,
+  allowReplay = true,
 }: {
   value: RunReportSection;
   onChange: (value: RunReportSection) => void;
+  allowReplay?: boolean;
 }) {
   return (
     <nav
@@ -1427,7 +1526,9 @@ function RunReportTabs({
       role="tablist"
       aria-label="Run report sections"
     >
-      {Object.entries(RUN_REPORT_SECTIONS).map(([key, label]) => (
+      {Object.entries(RUN_REPORT_SECTIONS)
+        .filter(([key]) => allowReplay || key !== "replay")
+        .map(([key, label]) => (
         <button
           key={key}
           role="tab"
@@ -1437,7 +1538,7 @@ function RunReportTabs({
         >
           {label}
         </button>
-      ))}
+        ))}
     </nav>
   );
 }
@@ -1481,7 +1582,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
         </div>
         <div className={`result-orb ${run.session_pnl >= 0 ? "gain" : "loss"}`}>
           <span>Net result</span>
-          <strong>{signedMoney(run.session_pnl)}</strong>
+          <strong>{signedRunMoney(run, run.session_pnl)}</strong>
           <small>
             {signedPct(
               (run.session_pnl /
@@ -1494,20 +1595,24 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
       <section className="detail-kpis">
         <Metric
           label="Starting equity"
-          value={money.format(run.initial_equity || run.portfolio.initial_cash)}
+          value={runMoney(run, run.initial_equity || run.portfolio.initial_cash)}
         />
         <Metric
           label="Final equity"
-          value={money.format(run.portfolio.equity)}
+          value={runMoney(run, run.portfolio.equity)}
         />
         <Metric
           label="Gross trading P&L"
-          value={signedMoney(gross)}
+          value={signedRunMoney(run, gross)}
           tone={gross >= 0 ? "positive" : "negative"}
         />
-        <Metric label="Execution costs" value={money.format(fees)} />
+        <Metric label="Execution costs" value={runMoney(run, fees)} />
       </section>
-      <RunReportTabs value={section} onChange={setSection} />
+      <RunReportTabs
+        value={section}
+        onChange={setSection}
+        allowReplay={marketName(run) === "NSE"}
+      />
       <CostFloorPanel run={run} />
       <div className="accordion-stack">
         <section className="analysis-accordion">
@@ -1553,7 +1658,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
       </div>
       <DecisionFunnel run={run} />
       <MonitoringTrace run={run} />
-      <ReplayPanel run={run} />
+      {marketName(run) === "NSE" && <ReplayPanel run={run} />}
       <section className="panel outcome-panel">
         <div className="panel-head">
           <div>
@@ -1582,19 +1687,19 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
                   <tr key={row.symbol}>
                     <td className="stock-name">{row.symbol}</td>
                     <td>{row.quantity}</td>
-                    <td>{money.format(row.buyPrice)}</td>
+                    <td>{runMoney(run, row.buyPrice)}</td>
                     <td>
-                      {row.sellPrice ? money.format(row.sellPrice) : "Open"}
+                      {row.sellPrice ? runMoney(run, row.sellPrice) : "Open"}
                     </td>
                     <td>
                       <span className="reason">{row.exitReason}</span>
                     </td>
                     <td className={row.grossPnl >= 0 ? "positive" : "negative"}>
-                      {signedMoney(row.grossPnl)}
+                      {signedRunMoney(run, row.grossPnl)}
                     </td>
-                    <td>{money.format(row.fees)}</td>
+                    <td>{runMoney(run, row.fees)}</td>
                     <td className={row.netPnl >= 0 ? "positive" : "negative"}>
-                      <strong>{signedMoney(row.netPnl)}</strong>
+                      <strong>{signedRunMoney(run, row.netPnl)}</strong>
                     </td>
                   </tr>
                 ))}
@@ -1636,7 +1741,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
                   </div>
                   <b>
                     {event.observed_price
-                      ? money.format(event.observed_price)
+                      ? runMoney(run, event.observed_price)
                       : "—"}
                   </b>
                   <time>{formatTime(event.timestamp)}</time>
@@ -1658,7 +1763,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
             </div>
             <div>
               <dt>Capital per position</dt>
-              <dd>{money.format(run.config.allocation_per_position)}</dd>
+              <dd>{runMoney(run, run.config.allocation_per_position)}</dd>
             </div>
             <div>
               <dt>Maximum positions</dt>
@@ -1669,7 +1774,7 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
               <dd>{strategyName(run)}</dd>
             </div>
             <div>
-              <dt>NIFTY momentum</dt>
+              <dt>{run.config.benchmark_symbol || "NIFTY 50"} momentum</dt>
               <dd>
                 {run.config.require_nifty_confirmation
                   ? "Required positive"

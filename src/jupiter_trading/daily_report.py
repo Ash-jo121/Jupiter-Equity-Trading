@@ -8,7 +8,8 @@ from .research_store import IST, ResearchStore, _session_date
 
 def _run_session_date(run: dict) -> Optional[str]:
     started = run.get("started_at")
-    return _session_date(started) if started else None
+    timezone_name = run.get("config", {}).get("market_timezone", "Asia/Kolkata")
+    return _session_date(started, timezone_name) if started else None
 
 
 def _config_key(config: dict) -> str:
@@ -48,6 +49,8 @@ def _run_summary(run: dict) -> dict:
         "variant_label": run.get("variant_label") or config.get("variant_label"),
         "shared_config_hash": run.get("shared_config_hash") or config.get("shared_config_hash"),
         "account_id": config.get("account_id"),
+        "market_code": config.get("market_code", "NSE"),
+        "currency": config.get("currency", "INR"),
         "config_key": _config_key(config),
         "status": run.get("status"),
         "started_at": run.get("started_at"),
@@ -126,6 +129,7 @@ class DailyReportBuilder:
             run
             for run in self.store.momentum_runs()
             if _run_session_date(run) == session_date
+            and run.get("config", {}).get("market_code", "NSE") == "NSE"
         ]
         summaries = [_run_summary(run) for run in runs]
         summaries.sort(key=lambda row: row.get("started_at") or "")

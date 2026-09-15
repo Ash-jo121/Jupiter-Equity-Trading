@@ -29,6 +29,12 @@ class MarketSurvey:
     def run(self, instruments: List[SurveyInstrument]) -> dict:
         keys = [item.instrument_key for item in instruments]
         quotes = self.market_data.ltp(keys)
+        # Alpaca can return the complete multi-symbol bar set in one request.
+        # Upstox has no equivalent method, so its adapter simply skips this
+        # optional optimization and keeps the existing per-instrument reads.
+        prefetch = getattr(self.market_data, "prefetch_intraday", None)
+        if prefetch:
+            prefetch(keys, "minutes", 5)
         rows = []
         failures = []
 

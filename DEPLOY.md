@@ -67,10 +67,15 @@ The repo ships a `Dockerfile` and `railway.json`.
    | `UPSTOX_REDIRECT_URI` | optional OAuth fallback callback: `https://<app>.up.railway.app/auth/upstox/callback` |
    | `UPSTOX_ACCESS_TOKEN` | optional daily OAuth seed token |
    | `SCHEDULER_ENABLED` | `true` |
-   | `SCHEDULER_MAX_POSITIONS` | `5` |
-   | `SCHEDULER_ALLOCATION` | `100000` (per position) |
-   | `SCHEDULER_INITIAL_CASH` | `600000` (>= max_positions x allocation) |
-   | `SCHEDULER_COOLDOWN_SECONDS` | `900` (15-min re-entry cooldown) |
+   | `SCHEDULER_MAX_POSITIONS` | `2` |
+   | `SCHEDULER_ALLOCATION` | `25000` (per position) |
+   | `SCHEDULER_INITIAL_CASH` | `1000000` (>= max_positions x allocation) |
+   | `ALPACA_PAPER_API_KEY` | Alpaca paper-account key; never use the live key |
+   | `ALPACA_PAPER_SECRET_KEY` | Alpaca paper-account secret |
+   | `ALPACA_DATA_FEED` | `iex` for the free data plan, or `sip` when subscribed |
+   | `US_SCHEDULER_ENABLED` | `true` |
+   | `US_SCHEDULER_MAX_POSITIONS` | `2` |
+   | `US_SCHEDULER_ALLOCATION` | `2500` USD per position |
    | `CORS_ALLOW_ORIGINS` | your dashboard origin, e.g. `https://jupiter.pages.dev` |
    | `PAPER_INITIAL_CASH` | `100000` |
 
@@ -81,9 +86,12 @@ The repo ships a `Dockerfile` and `railway.json`.
    database. Scale by running more arms per day, not more replicas.
 5. Health check is `GET /health`.
 
-Once up, the scheduler launches two full-session runs (5-second ticks and
-1-minute bars) at 09:15 IST. They share one cached NIFTY 100 survey;
-`GET /schedule/status` shows them, and after they settle past the
+Once up, the NSE scheduler launches the A/B/C one-minute entry experiment at exactly
+09:15 IST and stops it at 15:30 IST. It uses the official NSE holiday calendar and is not
+affected by the server's own timezone. The US scheduler independently follows Alpaca's
+09:30-16:00 ET regular-session clock, including US holidays, early closes, and daylight-saving
+changes. It runs one confirmed-MACD strategy against the single Alpaca paper portfolio.
+`GET /markets/automation` shows both lanes. After NSE runs settle past the
 15:30 close the day's report appears at `GET /reports/daily/{date}` and in the
 dashboard's Reports tab. Each run needs its account funded to cover
 `max_positions x allocation`, which `SCHEDULER_INITIAL_CASH` provides.

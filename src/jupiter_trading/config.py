@@ -41,6 +41,19 @@ class Settings:
     upstox_redirect_uri: str = field(
         default_factory=lambda: os.getenv("UPSTOX_REDIRECT_URI", "")
     )
+    alpaca_paper_api_key: str = field(
+        default_factory=lambda: os.getenv(
+            "ALPACA_PAPER_API_KEY", os.getenv("APCA_API_KEY_ID", "")
+        )
+    )
+    alpaca_paper_secret_key: str = field(
+        default_factory=lambda: os.getenv(
+            "ALPACA_PAPER_SECRET_KEY", os.getenv("APCA_API_SECRET_KEY", "")
+        )
+    )
+    alpaca_data_feed: str = field(
+        default_factory=lambda: os.getenv("ALPACA_DATA_FEED", "iex").lower()
+    )
     scheduler_enabled: bool = field(default_factory=lambda: _bool("SCHEDULER_ENABLED", False))
     scheduler_max_positions: int = field(
         default_factory=lambda: int(_float("SCHEDULER_MAX_POSITIONS", 2))
@@ -56,6 +69,26 @@ class Settings:
     )
     scheduler_account_prefix: str = field(
         default_factory=lambda: os.getenv("SCHEDULER_ACCOUNT_PREFIX", "auto")
+    )
+    us_scheduler_enabled: bool = field(
+        default_factory=lambda: _bool("US_SCHEDULER_ENABLED", False)
+    )
+    us_scheduler_entry_mode: str = field(
+        default_factory=lambda: os.getenv(
+            "US_SCHEDULER_ENTRY_MODE", "MACD_FRESH_CONFIRMED"
+        )
+    )
+    us_scheduler_max_positions: int = field(
+        default_factory=lambda: int(_float("US_SCHEDULER_MAX_POSITIONS", 2))
+    )
+    us_scheduler_allocation: float = field(
+        default_factory=lambda: _float("US_SCHEDULER_ALLOCATION", 2_500)
+    )
+    us_scheduler_candidate_limit: int = field(
+        default_factory=lambda: int(_float("US_SCHEDULER_CANDIDATE_LIMIT", 10))
+    )
+    us_scheduler_minimum_relative_volume: float = field(
+        default_factory=lambda: _float("US_SCHEDULER_MINIMUM_RELATIVE_VOLUME", 1.2)
     )
     cors_allow_origins: tuple = field(default_factory=lambda: _csv("CORS_ALLOW_ORIGINS"))
     upstox_stream_auto_start: bool = field(

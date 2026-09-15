@@ -6,11 +6,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def _session_date(timestamp: str) -> str:
+def _session_date(timestamp: str, timezone_name: str = "Asia/Kolkata") -> str:
     """The NSE trading day a UTC timestamp belongs to.
 
     Quotes are stored in UTC but a session is an Indian calendar day, so the
@@ -24,7 +25,11 @@ def _session_date(timestamp: str) -> str:
         return timestamp[:10]
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(IST).date().isoformat()
+    try:
+        market_timezone = ZoneInfo(timezone_name)
+    except (KeyError, ValueError):
+        market_timezone = IST
+    return moment.astimezone(market_timezone).date().isoformat()
 
 
 class ResearchStore:
@@ -86,6 +91,13 @@ class ResearchStore:
                     session_date TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS market_schedule_plans (
+                    market_code TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (market_code, session_date)
                 );
                 CREATE TABLE IF NOT EXISTS daily_reports (
                     session_date TEXT PRIMARY KEY,
@@ -192,7 +204,10 @@ class ResearchStore:
         rows = [
             (
                 run_id,
-                _session_date(observation["timestamp"]),
+                _session_date(
+                    observation["timestamp"],
+                    observation.get("market_timezone", "Asia/Kolkata"),
+                ),
                 observation["instrument_key"],
                 observation["symbol"],
                 observation["timestamp"],
@@ -373,6 +388,28 @@ class ResearchStore:
                     payload = excluded.payload, updated_at = CURRENT_TIMESTAMP""",
                 (session_date, json.dumps(payload)),
             )
+
+    def save_market_schedule_plan(
+        self, market_code: str, session_date: str, payload: dict
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO market_schedule_plans (market_code, session_date, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(market_code, session_date) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = CURRENT_TIMESTAMP""",
+                (market_code, session_date, json.dumps(payload)),
+            )
+
+    def market_schedule_plan(self, market_code: str, session_date: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT payload FROM market_schedule_plans
+                WHERE market_code = ? AND session_date = ?""",
+                (market_code, session_date),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def schedule_plan(self, session_date: str) -> Optional[dict]:
         with self._lock:

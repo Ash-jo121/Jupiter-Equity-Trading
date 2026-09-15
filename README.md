@@ -1,8 +1,8 @@
 # Jupiter Equity Trading
 
-A private, paper-only Indian-equity research service. Jupiter consumes read-only Upstox market
-data and performs every order, fill, cash movement, position update, and risk check inside its
-own local simulator. It never sends an order to a real broker.
+A private, paper-only Indian and US equity research service. The NSE lane consumes read-only
+Upstox data and simulates execution locally. The US lane consumes Alpaca market data and sends
+orders only to Alpaca's paper endpoint; the live-trading host is not configurable.
 
 ## Implemented
 
@@ -23,6 +23,10 @@ own local simulator. It never sends an order to a real broker.
   stop losses, and start/pause/stop controls
 - Historical candle-close replay with net P&L, Indian costs, drawdown, fills, and equity curves
 - Local dashboard for surveys, accounts, strategies, positions, orders, and reports
+- A NASDAQ-100 lane using batched Alpaca data, Alpaca's exchange clock, and one real Alpaca
+  paper portfolio
+- Independent automation windows: NSE 09:15-15:30 Asia/Kolkata, and US 09:30-16:00
+  America/New_York with holidays, early closes, and DST supplied by Alpaca's clock
 
 This is an execution simulator, not a prediction system. Market depth is only a snapshot, so
 paper fills can approximate but cannot guarantee the queue position or latency of a real order.
@@ -63,6 +67,29 @@ npm run dev
 Open [http://localhost:3000](http://localhost:3000). The account selector switches every
 portfolio panel between persistent paper accounts. The dashboard remains local because it
 contains private strategy and account data.
+
+## Alpaca US paper lane
+
+Create an Alpaca paper account, copy its paper API key and secret, then set:
+
+```dotenv
+ALPACA_PAPER_API_KEY=your-paper-key
+ALPACA_PAPER_SECRET_KEY=your-paper-secret
+ALPACA_DATA_FEED=iex
+US_SCHEDULER_ENABLED=true
+```
+
+The scheduler starts one `MACD_FRESH_CONFIRMED` run over the current NASDAQ-100 during the
+regular US session. The NASDAQ-100 five-minute discovery bars are fetched in batches; five-second
+quotes and one-minute signal bars are then requested only for shortlisted candidates and open
+positions. Alpaca's clock determines open days, US holidays, early closes, and daylight-saving
+time. The Alpaca account must be flat with no open orders when the daily run starts, because the
+automated strategy will never close or adopt an unrelated manual position.
+
+This lane intentionally runs one strategy against one Alpaca paper portfolio. The NSE A/B/C
+comparison remains three isolated local accounts; one Alpaca retail paper account cannot provide
+three independent cash books. `GET /markets/automation` shows both schedulers, and
+`POST /schedule/us/tick` performs an operational check without bypassing the exchange clock.
 
 ## Survey and profit-target strategy
 

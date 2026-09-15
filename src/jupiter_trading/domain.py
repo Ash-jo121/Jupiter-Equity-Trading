@@ -85,6 +85,7 @@ class Order:
     limit_price: Optional[float] = None
     trigger_price: Optional[float] = None
     strategy_id: Optional[str] = None
+    provider_order_id: Optional[str] = None
     product: Product = Product.DELIVERY
     validity: Validity = Validity.DAY
     account_id: str = "default"

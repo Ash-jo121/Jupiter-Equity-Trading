@@ -85,6 +85,13 @@ class MomentumRunnerConfig:
     variant_label: Optional[str] = None
     shared_config_hash: Optional[str] = None
     instrument_tick_size: float = 0.05
+    market_code: str = "NSE"
+    market_timezone: str = "Asia/Kolkata"
+    currency: str = "INR"
+    broker_provider: str = "INTERNAL_PAPER"
+    benchmark_instrument_key: str = NIFTY50_INDEX_KEY
+    benchmark_symbol: str = "NIFTY 50"
+    execution_segment: str = "NSE_EQ"
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -99,6 +106,18 @@ class MomentumRunnerConfig:
             raise ValueError("allocation_per_position must be positive")
         if not self.universe_name or self.universe_size <= 0:
             raise ValueError("universe name and size are required")
+        if not all(
+            (
+                self.market_code,
+                self.market_timezone,
+                self.currency,
+                self.broker_provider,
+                self.benchmark_instrument_key,
+                self.benchmark_symbol,
+                self.execution_segment,
+            )
+        ):
+            raise ValueError("market identity, benchmark, and execution segment are required")
         if self.minimum_relative_volume < 1:
             raise ValueError("minimum_relative_volume must be at least 1x")
         if (
@@ -394,7 +413,7 @@ class MomentumReversalRunner:
                     self.market_data,
                     self.instruments,
                     self.config.minimum_relative_volume,
-                    context_instrument_key=NIFTY50_INDEX_KEY,
+                    context_instrument_key=self.config.benchmark_instrument_key,
                 )
                 if self.survey_cache
                 else MarketSurvey(self.market_data, self.config.minimum_relative_volume).run(
@@ -414,15 +433,15 @@ class MomentumReversalRunner:
                 # A runner without the application-wide cache keeps the same
                 # standalone behaviour used by tests and direct integrations.
                 try:
-                    nifty_candles = self.market_data.intraday_candles(
-                        NIFTY50_INDEX_KEY, "minutes", 5
+                    benchmark_candles = self.market_data.intraday_candles(
+                        self.config.benchmark_instrument_key, "minutes", 5
                     )
                     market_context = {
-                        "session_open": nifty_candles[0].open,
+                        "session_open": benchmark_candles[0].open,
                         "recent_15m": (
-                            nifty_candles[-4].close
-                            if len(nifty_candles) >= 4
-                            else nifty_candles[0].close
+                            benchmark_candles[-4].close
+                            if len(benchmark_candles) >= 4
+                            else benchmark_candles[0].close
                         ),
                         "error": None,
                     }
@@ -528,7 +547,7 @@ class MomentumReversalRunner:
                     self._market_status = status
                     self._record("MARKET_STATUS", {"status": status})
         except Exception as error:  # noqa: BLE001 - block fills, but keep surveying
-            self.coordinator.update_market_status({"NSE_EQ": "UNKNOWN"})
+            self.coordinator.update_market_status({self.config.execution_segment: "UNKNOWN"})
             with self._lock:
                 self._market_status = "UNKNOWN"
                 self._record(
@@ -540,7 +559,11 @@ class MomentumReversalRunner:
         """Admit each completed provider bar once and fan its decision into this arm."""
 
         clock = datetime.now(timezone.utc)
-        for key in keys:
+        signal_keys = list(keys)
+        prefetch = getattr(self.market_data, "prefetch_intraday", None)
+        if prefetch and signal_keys:
+            prefetch(signal_keys, "minutes", 1)
+        for key in signal_keys:
             try:
                 snapshot = (
                     self.candle_cache.get(self.market_data, key, clock)
@@ -699,7 +722,7 @@ class MomentumReversalRunner:
     def _poll(self) -> None:
         with self._lock:
             stock_keys = list(dict.fromkeys([*self._candidates, *self._open]))
-            keys = [*stock_keys, NIFTY50_INDEX_KEY]
+            keys = [*stock_keys, self.config.benchmark_instrument_key]
         if not keys:
             return
         if self.config.signal_strategy in EXPERIMENT_ENTRY_MODES:
@@ -719,7 +742,7 @@ class MomentumReversalRunner:
             return
         with self._lock:
             self._poll_count += 1
-        market_quote = quotes.get(NIFTY50_INDEX_KEY)
+        market_quote = quotes.get(self.config.benchmark_instrument_key)
         market_context = self._market_context(market_quote)
         observations = {}
         for key in stock_keys:
@@ -751,6 +774,9 @@ class MomentumReversalRunner:
             )
             observation = {
                 "timestamp": quote.timestamp.isoformat(),
+                "market_code": self.config.market_code,
+                "market_timezone": self.config.market_timezone,
+                "currency": self.config.currency,
                 "symbol": self._symbols.get(key, key),
                 "instrument_key": key,
                 "price": round(quote.last_price, 4),
@@ -817,6 +843,12 @@ class MomentumReversalRunner:
     def _market_context(self, quote: Optional[Quote]) -> dict:
         if not quote:
             return {
+                "benchmark_symbol": self.config.benchmark_symbol,
+                "benchmark_price": None,
+                "benchmark_sample_change_pct": None,
+                "benchmark_window_change_pct": None,
+                "benchmark_session_change_pct": None,
+                "benchmark_recent_15m_change_pct": None,
                 "nifty_price": None,
                 "nifty_sample_change_pct": None,
                 "nifty_window_change_pct": None,
@@ -825,13 +857,16 @@ class MomentumReversalRunner:
             }
         previous = self._market_history[-1] if self._market_history else None
         self._market_history.append(quote.last_price)
-        return {
-            "nifty_price": round(quote.last_price, 4),
-            "nifty_sample_change_pct": round(_percent_change(quote.last_price, previous), 4),
-            "nifty_window_change_pct": round(
+        values = {
+            "benchmark_symbol": self.config.benchmark_symbol,
+            "benchmark_price": round(quote.last_price, 4),
+            "benchmark_sample_change_pct": round(
+                _percent_change(quote.last_price, previous), 4
+            ),
+            "benchmark_window_change_pct": round(
                 _percent_change(quote.last_price, self._market_history[0]), 4
             ),
-            "nifty_session_change_pct": (
+            "benchmark_session_change_pct": (
                 round(
                     _percent_change(quote.last_price, self._market_bases["session_open"]),
                     4,
@@ -839,7 +874,7 @@ class MomentumReversalRunner:
                 if self._market_bases["session_open"]
                 else None
             ),
-            "nifty_recent_15m_change_pct": (
+            "benchmark_recent_15m_change_pct": (
                 round(
                     _percent_change(quote.last_price, self._market_bases["recent_15m"]),
                     4,
@@ -847,6 +882,15 @@ class MomentumReversalRunner:
                 if self._market_bases["recent_15m"]
                 else None
             ),
+        }
+        # Keep legacy report fields readable for older dashboard versions.
+        return {
+            **values,
+            "nifty_price": values["benchmark_price"],
+            "nifty_sample_change_pct": values["benchmark_sample_change_pct"],
+            "nifty_window_change_pct": values["benchmark_window_change_pct"],
+            "nifty_session_change_pct": values["benchmark_session_change_pct"],
+            "nifty_recent_15m_change_pct": values["benchmark_recent_15m_change_pct"],
         }
 
     def _consider_exit(

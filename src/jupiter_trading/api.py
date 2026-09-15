@@ -11,6 +11,15 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .accounts import PaperAccountManager
+from .alpaca import (
+    US_SEGMENT,
+    AlpacaAccountManager,
+    AlpacaCoordinator,
+    AlpacaError,
+    AlpacaMarketData,
+    AlpacaPaperBroker,
+    AlpacaRestClient,
+)
 from .automation import DailyScheduler, SchedulerConfig
 from .backtest import BacktestEngine, ExitReplayEngine, ReplayGates
 from .config import Settings
@@ -40,8 +49,9 @@ from .strategy_engine import (
 )
 from .survey import MarketSurvey, SharedSurveyCache, SurveyInstrument
 from .trade_rules import EntryPolicy, ExitPolicy, cost_model
-from .universe import Nifty50Universe, Nifty100Universe, UniverseError
+from .universe import Nasdaq100Universe, Nifty50Universe, Nifty100Universe, UniverseError
 from .upstox_auth import UpstoxAuthError, UpstoxTokenStore
+from .us_automation import UsDailyScheduler, UsSchedulerConfig
 
 
 class OrderRequest(BaseModel):
@@ -292,12 +302,26 @@ def create_app(
     exit_replays = ExitReplayEngine(research_store, settings.fee_schedule)
     nifty50 = Nifty50Universe()
     nifty100 = Nifty100Universe()
+    nasdaq100 = Nasdaq100Universe()
     momentum_runners = MomentumRunnerService(research_store)
     shared_survey_cache = SharedSurveyCache()
     shared_quote_cache = SharedQuoteCache()
     shared_candle_cache = SharedCandleCache()
     daily_reports_builder = DailyReportBuilder(research_store)
     nse_holidays = holiday_calendar or NseHolidayCalendar()
+    alpaca_client = (
+        AlpacaRestClient(
+            settings.alpaca_paper_api_key,
+            settings.alpaca_paper_secret_key,
+            settings.alpaca_data_feed,
+        )
+        if settings.alpaca_paper_api_key and settings.alpaca_paper_secret_key
+        else None
+    )
+    alpaca_market_data = AlpacaMarketData(alpaca_client) if alpaca_client else None
+    us_quote_cache = SharedQuoteCache()
+    us_survey_cache = SharedSurveyCache()
+    us_candle_cache = SharedCandleCache()
 
     def market_data() -> UpstoxMarketData:
         # Read the live token each call, so a morning re-auth reaches the next
@@ -406,13 +430,92 @@ def create_app(
         SchedulerConfig(
             enabled=settings.scheduler_enabled,
             max_positions=settings.scheduler_max_positions,
-            reentry_cooldown_seconds=settings.scheduler_cooldown_seconds,
+            # The frozen A/B/C experiment requires one trade per instrument;
+            # a stale Railway cooldown value must not invalidate every launch.
+            reentry_cooldown_seconds=0,
             account_prefix=settings.scheduler_account_prefix,
             allocation_per_position=settings.scheduler_allocation,
             initial_cash=settings.scheduler_initial_cash,
         ),
         market_ready=_scheduler_market_ready,
         trading_day_check=nse_holidays.is_trading_day,
+    )
+
+    def _launch_us_runner(
+        session_date: str, duration_seconds: int, sched_config: UsSchedulerConfig
+    ) -> str:
+        if alpaca_client is None or alpaca_market_data is None:
+            raise AlpacaError("Alpaca paper credentials are not configured")
+        status = alpaca_market_data.market_status("NASDAQ")
+        if status["status"] != "NORMAL_OPEN":
+            raise AlpacaError("US regular market session is not open")
+        if momentum_runners.has_active(sched_config.account_id):
+            raise AlpacaError("a US paper run is already active")
+        broker = AlpacaPaperBroker(alpaca_client, sched_config.account_id)
+        alpaca_accounts = AlpacaAccountManager(broker)
+        alpaca_coordinator = AlpacaCoordinator(alpaca_accounts)
+        broker = alpaca_accounts.get(sched_config.account_id)
+        broker.prepare_session()
+        broker.update_market_status({US_SEGMENT: "NORMAL_OPEN"})
+        constituents = nasdaq100.constituents()
+        runner = MomentumReversalRunner(
+            config=MomentumRunnerConfig(
+                account_id=sched_config.account_id,
+                signal_strategy=sched_config.entry_mode,
+                duration_seconds=duration_seconds,
+                poll_interval_seconds=sched_config.poll_interval_seconds,
+                rescan_interval_seconds=sched_config.rescan_interval_seconds,
+                max_positions=sched_config.max_positions,
+                allocation_per_position=sched_config.allocation_per_position,
+                candidate_limit=sched_config.candidate_limit,
+                minimum_relative_volume=sched_config.minimum_relative_volume,
+                entry_timeframe_seconds=60,
+                reentry_cooldown_seconds=0,
+                entry_mode="THREE_BAR",
+                exit_mode="RATCHET",
+                require_nifty_confirmation=False,
+                universe_name=Nasdaq100Universe.name,
+                universe_size=len(constituents),
+                session_id=f"US:{session_date}",
+                variant_label="US",
+                instrument_tick_size=0.01,
+                market_code="US",
+                market_timezone="America/New_York",
+                currency="USD",
+                broker_provider="ALPACA_PAPER",
+                benchmark_instrument_key="US_EQ|QQQ",
+                benchmark_symbol="QQQ",
+                execution_segment=US_SEGMENT,
+            ),
+            instruments=[
+                SurveyInstrument(item["symbol"], item["instrument_key"])
+                for item in constituents
+            ],
+            market_data=alpaca_market_data,
+            accounts=alpaca_accounts,
+            coordinator=alpaca_coordinator,
+            store=research_store,
+            survey_cache=us_survey_cache,
+            quote_cache=us_quote_cache,
+            candle_cache=us_candle_cache,
+            market_status_refresh=lambda: alpaca_market_data.market_status("NASDAQ")[
+                "status"
+            ],
+        )
+        return momentum_runners.add(runner)["id"]
+
+    us_scheduler = UsDailyScheduler(
+        research_store,
+        alpaca_client,
+        _launch_us_runner,
+        UsSchedulerConfig(
+            enabled=settings.us_scheduler_enabled,
+            entry_mode=settings.us_scheduler_entry_mode,
+            max_positions=settings.us_scheduler_max_positions,
+            allocation_per_position=settings.us_scheduler_allocation,
+            candidate_limit=settings.us_scheduler_candidate_limit,
+            minimum_relative_volume=settings.us_scheduler_minimum_relative_volume,
+        ),
     )
 
     @asynccontextmanager
@@ -433,17 +536,19 @@ def create_app(
                 "full" if strategy_keys else settings.upstox_stream_mode,
             )
         scheduler.start()
+        us_scheduler.start()
         try:
             yield
         finally:
             scheduler.stop()
+            us_scheduler.stop()
             momentum_runners.stop_all()
             market_stream.stop()
 
     app = FastAPI(
         title="Jupiter Paper Trading",
         version="0.2.0",
-        description="Private, paper-only Indian equity strategy research API.",
+        description="Private paper-trading research API for Indian and US equities.",
         lifespan=lifespan,
     )
     if settings.cors_allow_origins:
@@ -468,6 +573,8 @@ def create_app(
     app.state.momentum_runners = momentum_runners
     app.state.shared_quote_cache = shared_quote_cache
     app.state.scheduler = scheduler
+    app.state.us_scheduler = us_scheduler
+    app.state.alpaca_client = alpaca_client
     app.state.token_store = token_store
     app.state.daily_reports = daily_reports_builder
     app.state.nse_holidays = nse_holidays
@@ -479,6 +586,9 @@ def create_app(
             "mode": "paper",
             "upstox_configured": bool(token_store.current_token()),
             "upstox_token": token_store.status(),
+            "alpaca_paper_configured": alpaca_client is not None,
+            "nse_scheduler_enabled": settings.scheduler_enabled,
+            "us_scheduler_enabled": settings.us_scheduler_enabled,
             "paper_accounts": len(accounts.list()),
             "strategies": len(strategies.list()),
         }
@@ -648,6 +758,19 @@ def create_app(
             return {
                 "name": Nifty100Universe.name,
                 "source": Nifty100Universe.url,
+                "count": len(constituents),
+                "constituents": constituents,
+            }
+        except UniverseError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.get("/universes/nasdaq100")
+    def nasdaq100_universe() -> dict:
+        try:
+            constituents = nasdaq100.constituents()
+            return {
+                "name": Nasdaq100Universe.name,
+                "source": Nasdaq100Universe.url,
                 "count": len(constituents),
                 "constituents": constituents,
             }
@@ -1066,6 +1189,22 @@ def create_app(
     def schedule_status() -> dict:
         return scheduler.status()
 
+    @app.get("/markets/automation")
+    def markets_automation() -> dict:
+        """Both independent market clocks without exposing broker credentials."""
+
+        return {
+            "NSE": {
+                **scheduler.status(),
+                "market_code": "NSE",
+                "timezone": "Asia/Kolkata",
+                "regular_session": "09:15-15:30 IST",
+                "calendar": "NSE holiday calendar",
+                "provider": "UPSTOX_DATA_INTERNAL_PAPER",
+            },
+            "US": {**us_scheduler.status(), "provider": "ALPACA_PAPER"},
+        }
+
     @app.get("/schedule/calendar")
     def schedule_calendar(year: Optional[int] = Query(default=None, ge=2000, le=2100)) -> dict:
         target_year = year or schedule_now_ist().year
@@ -1106,6 +1245,15 @@ def create_app(
         """Advance the schedule now. Useful for ops and when a tick was missed."""
 
         return {"actions": scheduler.tick()}
+
+    @app.post("/schedule/us/tick")
+    def us_schedule_tick() -> dict:
+        """Advance the Alpaca schedule now; the regular-session clock remains authoritative."""
+
+        try:
+            return {"actions": us_scheduler.tick()}
+        except AlpacaError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     @app.get("/reports/daily")
     def daily_reports_list(limit: int = Query(default=60, ge=1, le=365)) -> list:
@@ -1154,6 +1302,11 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="momentum run not found") from error
         config = source.get("config") or {}
+        if config.get("market_code", "NSE") != "NSE":
+            raise HTTPException(
+                status_code=422,
+                detail="US replay is disabled until its cost model uses Alpaca account activities",
+            )
         try:
             return exit_replays.run(
                 source,
