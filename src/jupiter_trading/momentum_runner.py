@@ -8,6 +8,7 @@ from threading import Event, RLock, Thread
 from time import monotonic
 from typing import Callable, Dict, Iterable, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from .accounts import PaperAccountManager
 from .candle_signals import (
@@ -224,6 +225,8 @@ class MomentumReversalRunner:
         self._last_admitted_candle_bar: Dict[str, str] = {}
         self._signal_state: Dict[str, dict] = {}
         self._signal_candles: Dict[str, list] = {}
+        self._signal_warmup: Dict[str, list] = {}
+        self._warmup_attempted: set[str] = set()
         self._entry_intents: Dict[str, dict] = {}
         self._price_setups: Dict[str, PriceConfirmationSetup] = {}
         self._pending_signal_exits: Dict[str, dict] = {}
@@ -566,7 +569,12 @@ class MomentumReversalRunner:
         for key in signal_keys:
             try:
                 snapshot = (
-                    self.candle_cache.get(self.market_data, key, clock)
+                    self.candle_cache.get(
+                        self.market_data,
+                        key,
+                        clock,
+                        self._signal_config.candle_finalization_grace_seconds,
+                    )
                     if self.candle_cache
                     else {
                         "candles": self.market_data.intraday_candles(key, "minutes", 1),
@@ -581,7 +589,8 @@ class MomentumReversalRunner:
                 )
                 if not candles:
                     continue
-                features = build_features(candles, self._signal_config)
+                warmup = self._prior_session_warmup(key, clock)
+                features = build_features(candles, self._signal_config, warmup)
                 if self._last_admitted_candle_bar.get(key) == features.bar_id:
                     continue
                 self._last_admitted_candle_bar[key] = features.bar_id
@@ -713,6 +722,55 @@ class MomentumReversalRunner:
                         "message": str(error)[:200],
                     },
                 )
+
+    def _prior_session_warmup(self, key: str, clock: datetime) -> list:
+        """Seed MACD from prior sessions without using old bars for entry volume."""
+
+        if key in self._warmup_attempted:
+            return self._signal_warmup.get(key, [])
+        self._warmup_attempted.add(key)
+        session_date = clock.astimezone(ZoneInfo(self.config.market_timezone)).date()
+        try:
+            if self.candle_cache:
+                snapshot = self.candle_cache.warmup(
+                    self.market_data,
+                    key,
+                    session_date,
+                    self._signal_config.warmup_bars,
+                )
+                candles = snapshot["candles"]
+                cache_hit = snapshot.get("cache_hit", False)
+            else:
+                candles = self.market_data.historical_candles(
+                    key,
+                    "minutes",
+                    1,
+                    session_date - timedelta(days=1),
+                    session_date - timedelta(days=10),
+                )[-self._signal_config.warmup_bars :]
+                cache_hit = False
+            self._signal_warmup[key] = list(candles)
+            self._record(
+                "WARMUP_SEEDED",
+                {
+                    "symbol": self._symbols.get(key, key),
+                    "instrument_key": key,
+                    "bars": len(candles),
+                    "cache_hit": cache_hit,
+                    "session_date": session_date.isoformat(),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - current-session warm-up remains safe
+            self._signal_warmup[key] = []
+            self._record(
+                "WARMUP_SEED_UNAVAILABLE",
+                {
+                    "symbol": self._symbols.get(key, key),
+                    "instrument_key": key,
+                    "message": str(error)[:200],
+                },
+            )
+        return self._signal_warmup[key]
 
     def _eligible_signal_quote(self, quote: Quote, intent: dict) -> bool:
         decision_at = datetime.fromisoformat(intent["decision_at"])

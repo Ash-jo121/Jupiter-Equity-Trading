@@ -71,6 +71,20 @@ def test_early_entry_requires_negative_two_step_improvement() -> None:
     assert equal["raw_qualified"] is False
 
 
+def test_prior_session_bars_seed_macd_without_seeding_intraday_volume() -> None:
+    prior = [_candle(index - 120, 99 + index * 0.01) for index in range(100)]
+    current = [_candle(0, 101.0)]
+
+    features = build_features(current, warmup_candles=prior)
+
+    assert features.ready is True
+    assert features.warmup_seed_count == 100
+    assert features.session_bar_count == 1
+    assert features.warmup_count == 101
+    assert features.histogram is not None
+    assert features.rvol_1m is None
+
+
 def test_price_confirmation_arms_from_early_signal_and_uses_later_quote() -> None:
     features = _features([-0.30, -0.20, -0.09])
     assert evaluate_entry(MACD_EARLY_PRICE_CONFIRM, features)["raw_qualified"] is True

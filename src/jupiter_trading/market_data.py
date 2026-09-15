@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Condition, RLock
 from time import monotonic
 from typing import Dict, Iterable, List, Optional
@@ -145,39 +145,73 @@ class Candle:
         }
 
 
+@dataclass
+class _CandleCacheEntry:
+    generation: int
+    received_at: datetime
+    candles: List[Candle]
+    retry_after: datetime
+
+
 class SharedCandleCache:
-    """Coalesce A/B/C one-minute histories into one provider read per minute."""
+    """Share one-minute history while allowing a late provider bar to replace it.
+
+    A request made just after the minute boundary can legitimately return the
+    preceding bar.  Such a response is useful briefly, but must not be frozen
+    for the whole minute: once the new bar is expected, the next runner refreshes
+    it and the other experiment arms reuse that result.
+    """
 
     def __init__(self) -> None:
         self._condition = Condition(RLock())
-        self._entries: dict[tuple, tuple[int, datetime, List[Candle]]] = {}
+        self._entries: dict[tuple, _CandleCacheEntry] = {}
+        self._warmups: dict[tuple, tuple[datetime, List[Candle]]] = {}
         self._refreshing: set[tuple] = set()
         self._hits = 0
         self._misses = 0
+        self._late_refreshes = 0
+        self._warmup_hits = 0
+        self._warmup_misses = 0
 
     def get(
         self,
         market_data: UpstoxMarketData,
         instrument_key: str,
         clock: Optional[datetime] = None,
+        finalization_grace_seconds: float = 2.0,
+        retry_after_seconds: float = 2.0,
     ) -> dict:
         now = clock or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         generation = int(now.timestamp() // 60)
         key = (instrument_key, "minutes", 1)
+        expected_start = self._expected_latest_start(now, finalization_grace_seconds)
         with self._condition:
             while True:
                 cached = self._entries.get(key)
-                if cached and cached[0] == generation:
+                cached_latest = self._latest_start(cached.candles) if cached else None
+                cached_complete = bool(
+                    cached_latest is not None and cached_latest >= expected_start
+                )
+                if cached and cached.generation == generation and (
+                    cached_complete or now < cached.retry_after
+                ):
                     self._hits += 1
                     return {
-                        "candles": list(cached[2]),
-                        "received_at": cached[1],
+                        "candles": list(cached.candles),
+                        "received_at": cached.received_at,
                         "cache_hit": True,
                         "generation": generation,
+                        "complete": cached_complete,
+                        "expected_bar_start": expected_start.isoformat(),
+                        "latest_bar_start": (
+                            cached_latest.isoformat() if cached_latest else None
+                        ),
                     }
                 if key not in self._refreshing:
+                    if cached and cached.generation == generation:
+                        self._late_refreshes += 1
                     self._refreshing.add(key)
                     self._misses += 1
                     break
@@ -185,13 +219,75 @@ class SharedCandleCache:
         try:
             candles = market_data.intraday_candles(instrument_key, "minutes", 1)
             received_at = datetime.now(timezone.utc)
+            latest = self._latest_start(candles)
+            complete = bool(latest is not None and latest >= expected_start)
+            entry = _CandleCacheEntry(
+                generation=generation,
+                received_at=received_at,
+                candles=list(candles),
+                retry_after=now + timedelta(seconds=max(0.25, retry_after_seconds)),
+            )
             with self._condition:
-                self._entries[key] = (generation, received_at, list(candles))
+                self._entries[key] = entry
             return {
                 "candles": list(candles),
                 "received_at": received_at,
                 "cache_hit": False,
                 "generation": generation,
+                "complete": complete,
+                "expected_bar_start": expected_start.isoformat(),
+                "latest_bar_start": latest.isoformat() if latest else None,
+            }
+        finally:
+            with self._condition:
+                self._refreshing.discard(key)
+                self._condition.notify_all()
+
+    def warmup(
+        self,
+        market_data: UpstoxMarketData,
+        instrument_key: str,
+        session_date: date,
+        bars: int,
+        lookback_days: int = 10,
+    ) -> dict:
+        """Load prior-session bars once and share them across experiment arms."""
+
+        if bars <= 0:
+            return {"candles": [], "received_at": datetime.now(timezone.utc), "cache_hit": True}
+        key = ("warmup", instrument_key, session_date.isoformat(), bars)
+        with self._condition:
+            while True:
+                cached = self._warmups.get(key)
+                if cached:
+                    self._warmup_hits += 1
+                    return {
+                        "candles": list(cached[1]),
+                        "received_at": cached[0],
+                        "cache_hit": True,
+                    }
+                if key not in self._refreshing:
+                    self._refreshing.add(key)
+                    self._warmup_misses += 1
+                    break
+                self._condition.wait()
+        try:
+            previous_day = session_date - timedelta(days=1)
+            candles = market_data.historical_candles(
+                instrument_key,
+                "minutes",
+                1,
+                previous_day,
+                session_date - timedelta(days=max(2, lookback_days)),
+            )
+            selected = sorted(candles, key=lambda item: item.timestamp)[-bars:]
+            received_at = datetime.now(timezone.utc)
+            with self._condition:
+                self._warmups[key] = (received_at, list(selected))
+            return {
+                "candles": list(selected),
+                "received_at": received_at,
+                "cache_hit": False,
             }
         finally:
             with self._condition:
@@ -200,7 +296,33 @@ class SharedCandleCache:
 
     def stats(self) -> dict:
         with self._condition:
-            return {"hits": self._hits, "misses": self._misses, "entries": len(self._entries)}
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "entries": len(self._entries),
+                "late_refreshes": self._late_refreshes,
+                "warmup_hits": self._warmup_hits,
+                "warmup_misses": self._warmup_misses,
+                "warmup_entries": len(self._warmups),
+            }
+
+    @staticmethod
+    def _expected_latest_start(clock: datetime, grace_seconds: float) -> datetime:
+        minute = clock.replace(second=0, microsecond=0)
+        completed = minute - timedelta(minutes=1)
+        if clock < minute + timedelta(seconds=max(0.0, grace_seconds)):
+            completed -= timedelta(minutes=1)
+        return completed
+
+    @staticmethod
+    def _latest_start(candles: Iterable[Candle]) -> Optional[datetime]:
+        timestamps = []
+        for candle in candles:
+            value = candle.timestamp
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            timestamps.append(value.astimezone(timezone.utc))
+        return max(timestamps, default=None)
 
 
 class UpstoxMarketData:

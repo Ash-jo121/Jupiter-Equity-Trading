@@ -203,10 +203,26 @@ type RunEvent = {
   type: string;
   symbol?: string;
   reason?: string;
+  candidates?: string[];
   observed_price?: number;
   entry_price?: number;
   entry_signal?: EntrySignal;
   exit_state?: ExitState | null;
+  signal?: {
+    ready?: boolean;
+    raw_qualified?: boolean;
+    actionable?: boolean;
+    reason?: string;
+    rejection?: boolean;
+    rejection_checks?: Record<string, boolean>;
+    mode_checks?: Record<string, boolean>;
+    features?: {
+      ready?: boolean;
+      warmup_count?: number;
+      warmup_seed_count?: number;
+      session_bar_count?: number;
+    };
+  };
 };
 type CostModel = {
   notional: number;
@@ -550,12 +566,18 @@ const signedPct = (value: number) =>
 const universeName = (run: MomentumRun) =>
   run.config.universe_name || "NIFTY 50";
 const strategyName = (run: MomentumRun) => {
-  const mode = run.config.signal_strategy;
+  const mode =
+    run.config.signal_strategy ||
+    ({
+      A: "MACD_EARLY",
+      B: "MACD_EARLY_PRICE_CONFIRM",
+      C: "MACD_FRESH_CONFIRMED",
+    } as const)[run.variant_label as "A" | "B" | "C"];
   if (mode === "MACD_EARLY") return "A · Early MACD convergence";
   if (mode === "MACD_EARLY_PRICE_CONFIRM") return "B · Price-confirmed early MACD";
   if (mode === "MACD_FRESH_CONFIRMED") return "C · Fresh MACD confirmation";
   if (mode === "CANDLESTICK_MACD") return "Legacy candlestick + MACD";
-  return "Legacy momentum reversal";
+  return "Momentum reversal";
 };
 
 async function request<T = unknown>(
@@ -2346,6 +2368,84 @@ function CostFloorPanel({ run }: { run: MomentumRun }) {
 }
 
 function DecisionFunnel({ run }: { run: MomentumRun }) {
+  const evaluations = run.events.filter(
+    (event) => event.type === "ENTRY_SIGNAL_EVALUATED" && event.signal,
+  );
+  if (evaluations.length) {
+    const scans = run.events.filter((event) => event.type === "SCAN"),
+      shortlisted = new Set(scans.flatMap((event) => event.candidates || [])),
+      emptyScans = scans.filter((event) => !(event.candidates || []).length).length,
+      warmed = evaluations.filter(
+        (event) => event.signal?.features?.ready ?? event.signal?.ready,
+      ),
+      fresh = warmed.filter((event) => event.signal?.reason !== "STALE_BAR"),
+      volumePassed = fresh.filter(
+        (event) => event.signal?.rejection_checks?.rvol_1m,
+      ),
+      candlePassed = fresh.filter((event) => event.signal?.rejection),
+      strategyPassed = fresh.filter((event) => event.signal?.raw_qualified),
+      entries = run.events.filter((event) => event.type === "ENTRY_FILLED").length,
+      stages = [
+        { label: "1-minute bars evaluated", count: evaluations.length },
+        { label: "MACD warm-up complete", count: warmed.length },
+        { label: "Fresh provider candle", count: fresh.length },
+        { label: "1-minute volume passed", count: volumePassed.length },
+        { label: "Full candle pattern passed", count: candlePassed.length },
+        { label: "MACD strategy passed", count: strategyPassed.length },
+        { label: "Entry filled", count: entries },
+      ],
+      peak = stages[0].count || 1;
+    return (
+      <section className="panel funnel-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">From universe to execution</p>
+            <h2>Signal funnel</h2>
+          </div>
+          <span className="count">{entries} entries</span>
+        </div>
+        <div className="funnel-summary">
+          <div>
+            <small>Tradable universe</small>
+            <strong>{run.config.universe_size || 100}</strong>
+            <span>{universeName(run)} stocks</span>
+          </div>
+          <div>
+            <small>Unique stocks shortlisted</small>
+            <strong>{shortlisted.size}</strong>
+            <span>across {scans.length} surveys</span>
+          </div>
+          <div>
+            <small>Surveys with no candidates</small>
+            <strong>{emptyScans}</strong>
+            <span>nothing reached 1-minute monitoring</span>
+          </div>
+        </div>
+        <p className="trace-help">
+          Each row is the remaining number of completed 1-minute candle
+          evaluations after that gate. Unlike the five-second activity count,
+          this shows exactly where potential entries were filtered out.
+        </p>
+        <div className="funnel">
+          {stages.map((stage, index) => (
+            <div className="funnel-row" key={stage.label}>
+              <span className={`decision ${index === stages.length - 1 ? "entry" : "block"}`}>
+                {stage.label}
+              </span>
+              <div className="funnel-bar">
+                <i
+                  className={index === stages.length - 1 ? "entry" : "block"}
+                  style={{ width: `${Math.max((stage.count / peak) * 100, stage.count ? 1.5 : 0)}%` }}
+                />
+              </div>
+              <b>{stage.count}</b>
+              <small>{((stage.count / peak) * 100).toFixed(1)}%</small>
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  }
   const counts = run.decision_counts || [];
   if (!counts.length) return null;
   const peak = Math.max(...counts.map((row) => row.count)),

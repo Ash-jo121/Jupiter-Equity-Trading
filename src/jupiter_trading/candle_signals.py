@@ -89,6 +89,8 @@ class BarFeatures:
     delta_bps: Optional[float]
     latest_cross_age: Optional[int]
     warmup_count: int
+    warmup_seed_count: int
+    session_bar_count: int
     ready: bool
     quality_reasons: tuple
 
@@ -143,6 +145,7 @@ def admitted_candles(
 def build_features(
     completed_candles: Iterable[Candle],
     config: Optional[SignalConfig] = None,
+    warmup_candles: Optional[Iterable[Candle]] = None,
 ) -> BarFeatures:
     policy = config or SignalConfig()
     candles = list(completed_candles)
@@ -155,6 +158,16 @@ def build_features(
             break
     session_candles = candles[segment_start:]
     candle = session_candles[-1]
+    first_session_timestamp = session_candles[0].timestamp
+    seed = sorted(
+        (
+            item
+            for item in (warmup_candles or [])
+            if _valid_candle(item) and item.timestamp < first_session_timestamp
+        ),
+        key=lambda item: item.timestamp,
+    )[-policy.warmup_bars :]
+    indicator_candles = [*seed, *session_candles]
     quality = []
     if not _valid_candle(candle):
         quality.append("INVALID_OHLCV")
@@ -171,7 +184,7 @@ def build_features(
     baseline = median(prior_volumes) if len(prior_volumes) == policy.volume_lookback else None
     rvol = candle.volume / baseline if baseline is not None and baseline > 0 else None
     points = macd_series(
-        [item.close for item in session_candles],
+        [item.close for item in indicator_candles],
         policy.fast_period,
         policy.slow_period,
         policy.signal_period,
@@ -190,7 +203,7 @@ def build_features(
     cross_age = len(points) - 1 - latest_cross if latest_cross is not None else None
     if point.histogram is None or h1 is None or h2 is None:
         quality.append("INDICATOR_NOT_READY")
-    if len(session_candles) < policy.warmup_bars:
+    if len(indicator_candles) < policy.warmup_bars:
         quality.append("WARMUP")
     return BarFeatures(
         bar=candle,
@@ -212,7 +225,9 @@ def build_features(
         h2=h2,
         delta_bps=delta,
         latest_cross_age=cross_age,
-        warmup_count=len(session_candles),
+        warmup_count=len(indicator_candles),
+        warmup_seed_count=len(seed),
+        session_bar_count=len(session_candles),
         ready=not quality,
         quality_reasons=tuple(dict.fromkeys(quality)),
     )

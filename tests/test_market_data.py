@@ -85,4 +85,60 @@ def test_shared_candle_cache_fetches_once_for_all_arms_in_a_logical_minute() -> 
     assert market.calls == 1
     assert first["cache_hit"] is False
     assert second["cache_hit"] is True
-    assert cache.stats() == {"hits": 1, "misses": 1, "entries": 1}
+    assert cache.stats() == {
+        "hits": 1,
+        "misses": 1,
+        "entries": 1,
+        "late_refreshes": 0,
+        "warmup_hits": 0,
+        "warmup_misses": 0,
+        "warmup_entries": 0,
+    }
+
+
+def test_shared_candle_cache_refreshes_after_the_new_bar_becomes_expected() -> None:
+    class LateMarket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def intraday_candles(self, instrument_key, unit, interval):
+            self.calls += 1
+            latest = datetime(2026, 9, 10, 4, 58 + self.calls - 1, tzinfo=timezone.utc)
+            return [Candle(latest, 99, 101, 98, 100, 10, 0)]
+
+    market = LateMarket()
+    cache = SharedCandleCache()
+    minute = datetime(2026, 9, 10, 5, 0, 1, tzinfo=timezone.utc)
+
+    early = cache.get(market, "NSE_EQ|TEST", minute)
+    refreshed = cache.get(market, "NSE_EQ|TEST", minute + timedelta(seconds=5))
+    shared = cache.get(market, "NSE_EQ|TEST", minute + timedelta(seconds=8))
+
+    assert early["complete"] is True
+    assert refreshed["complete"] is True
+    assert refreshed["latest_bar_start"].startswith("2026-09-10T04:59:00")
+    assert shared["cache_hit"] is True
+    assert market.calls == 2
+    assert cache.stats()["late_refreshes"] == 1
+
+
+def test_shared_candle_cache_reuses_prior_session_warmup() -> None:
+    class HistoryMarket:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def historical_candles(self, instrument_key, unit, interval, to_date, from_date):
+            self.calls += 1
+            start = datetime(2026, 9, 9, 3, 45, tzinfo=timezone.utc)
+            return [Candle(start + timedelta(minutes=i), 99, 101, 98, 100, 10, 0) for i in range(120)]
+
+    market = HistoryMarket()
+    cache = SharedCandleCache()
+    session = date(2026, 9, 10)
+
+    first = cache.warmup(market, "NSE_EQ|TEST", session, 100)
+    second = cache.warmup(market, "NSE_EQ|TEST", session, 100)
+
+    assert len(first["candles"]) == 100
+    assert second["cache_hit"] is True
+    assert market.calls == 1
