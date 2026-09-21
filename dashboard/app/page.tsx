@@ -632,6 +632,7 @@ function runOutcomes(run: MomentumRun): Outcome[] {
 export default function Home() {
   const [summary, setSummary] = useState<Summary | null>(null),
     [runs, setRuns] = useState<MomentumRun[]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [automation, setAutomation] = useState<MarketAutomation | null>(null);
   const [tab, setTab] = useState<"home" | "runs" | "reports">("home"),
     [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -661,6 +662,8 @@ export default function Home() {
       setNotice(
         error instanceof Error ? error.message : "Dashboard connection failed",
       );
+    } finally {
+      setInitialLoading(false);
     }
   }, []);
   useEffect(() => {
@@ -746,7 +749,8 @@ export default function Home() {
     };
   }, [selectedRunId, selectedRunActive]);
   const marketStatus =
-      summary?.stream.market_statuses.NSE_EQ || "NOT CONNECTED",
+      summary?.stream.market_statuses.NSE_EQ ||
+      (initialLoading ? "LOADING" : "NOT CONNECTED"),
     displayedExperimentRuns = activeRuns.length
       ? activeRuns
       : latestRun?.experiment_id
@@ -814,12 +818,13 @@ export default function Home() {
     }
   };
   const openRun = (id: string) => {
+    setDetailError("");
     setSelectedRunId(id);
     setTab("runs");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   return (
-    <main>
+    <main aria-busy={initialLoading}>
       <header className="topbar">
         <button
           className="brand"
@@ -872,7 +877,14 @@ export default function Home() {
             : ""}
         </div>
       </header>
-      {tab === "home" ? (
+      {initialLoading ? (
+        <section className="loader-shell">
+          <Loader
+            label="Preparing your trading workspace"
+            detail="Loading market status, paper accounts, and run summaries."
+          />
+        </section>
+      ) : tab === "home" ? (
         <HomeView
           summary={summary}
           automation={automation}
@@ -915,7 +927,15 @@ export default function Home() {
             >
               ← All runs
             </button>
-            <Empty text={detailError || "Loading the recorded trace…"} />
+            {detailError ? (
+              <Empty text={detailError} />
+            ) : (
+              <Loader
+                compact
+                label="Opening this run"
+                detail="Loading its strategy evidence and execution summary."
+              />
+            )}
           </section>
         )
       ) : tab === "reports" ? (
@@ -1736,13 +1756,14 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
       </div>
       <DecisionFunnel run={run} />
       {traceLoading && needsTrace ? (
-        <section className={`panel ${section === "replay" ? "replay-panel" : "monitoring-panel"}`}>
-          <div className="panel-head">
-            <div>
-              <p className="eyebrow">Loaded only when requested</p>
-              <h2>Loading the recorded price trace…</h2>
-            </div>
-          </div>
+        <section
+          className={`panel ${section === "replay" ? "replay-panel" : "monitoring-panel"}`}
+        >
+          <Loader
+            compact
+            label="Drawing the price trace"
+            detail="Fetching recorded candles only for this run."
+          />
         </section>
       ) : (
         <>
@@ -3971,6 +3992,8 @@ function ReportsView({ openRun }: { openRun: (id: string) => void }) {
   const [dates, setDates] = useState<DailyReport[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [report, setReport] = useState<DailyReport | null>(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [reportLoading, setReportLoading] = useState(false);
   const [busy, setBusy] = useState(""),
     [notice, setNotice] = useState("");
   const refresh = useCallback(async () => {
@@ -3981,12 +4004,16 @@ function ReportsView({ openRun }: { openRun: (id: string) => void }) {
       ]);
       setStatus(st);
       setDates(list);
-      if (!selected && (list.length || st.session_date))
+      if (!selected && (list.length || st.session_date)) {
+        setReportLoading(true);
         setSelected(list[0]?.session_date || st.session_date);
+      }
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : "Could not load reports",
       );
+    } finally {
+      setInitialLoading(false);
     }
   }, [selected]);
   useEffect(() => {
@@ -4002,10 +4029,16 @@ function ReportsView({ openRun }: { openRun: (id: string) => void }) {
     let live = true;
     request<DailyReport>(`/reports/daily/${selected}`)
       .then((r) => {
-        if (live) setReport(r);
+        if (live) {
+          setReport(r);
+          setReportLoading(false);
+        }
       })
       .catch(() => {
-        if (live) setReport(null);
+        if (live) {
+          setReport(null);
+          setReportLoading(false);
+        }
       });
     return () => {
       live = false;
@@ -4049,47 +4082,67 @@ function ReportsView({ openRun }: { openRun: (id: string) => void }) {
         </div>
       </div>
 
-      <ScheduleStrip status={status} />
-
-      <div className="report-toolbar">
-        <label className="trace-select">
-          Session
-          <select
-            value={selected}
-            onChange={(e) => setSelected(e.target.value)}
-          >
-            {[
-              ...new Set(
-                [
-                  status?.session_date,
-                  ...dates.map((d) => d.session_date),
-                ].filter(Boolean) as string[],
-              ),
-            ].map((d) => (
-              <option key={d}>{d}</option>
-            ))}
-          </select>
-        </label>
-        <button
-          className="secondary"
-          onClick={buildReport}
-          disabled={!!busy || !selected}
-        >
-          {busy === "build"
-            ? "Building…"
-            : report
-              ? "Rebuild report"
-              : "Build report"}
-        </button>
-        {notice && <span className="report-notice">{notice}</span>}
-      </div>
-
-      {report ? (
-        <DailyReportView report={report} openRun={openRun} />
-      ) : (
-        <Empty
-          text={`No report for ${selected || "this day"} yet. Runs must finish first, or build it now.`}
+      {initialLoading ? (
+        <Loader
+          compact
+          label="Loading research reports"
+          detail="Checking the schedule and daily run summaries."
         />
+      ) : (
+        <>
+          <ScheduleStrip status={status} />
+
+          <div className="report-toolbar">
+            <label className="trace-select">
+              Session
+              <select
+                value={selected}
+                onChange={(e) => {
+                  setReport(null);
+                  setReportLoading(true);
+                  setSelected(e.target.value);
+                }}
+              >
+                {[
+                  ...new Set(
+                    [
+                      status?.session_date,
+                      ...dates.map((d) => d.session_date),
+                    ].filter(Boolean) as string[],
+                  ),
+                ].map((d) => (
+                  <option key={d}>{d}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="secondary"
+              onClick={buildReport}
+              disabled={!!busy || !selected}
+            >
+              {busy === "build"
+                ? "Building…"
+                : report
+                  ? "Rebuild report"
+                  : "Build report"}
+            </button>
+            {notice && <span className="report-notice">{notice}</span>}
+          </div>
+
+          {reportLoading ? (
+            <Loader
+              compact
+              label="Opening the daily report"
+              detail="Combining the completed runs for this session."
+            />
+          ) : report ? (
+            <DailyReportView report={report} openRun={openRun} />
+          ) : (
+            <Empty
+              text={`No report for ${selected || "this day"} yet. Runs must finish first, or build it now.`}
+            />
+          )}
+        </>
       )}
     </section>
   );
@@ -4478,6 +4531,32 @@ function Metric({
 }
 function Empty({ text }: { text: string }) {
   return <div className="empty">{text}</div>;
+}
+function Loader({
+  label,
+  detail,
+  compact = false,
+}: {
+  label: string;
+  detail?: string;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={`loader-state${compact ? " compact" : ""}`}
+      role="status"
+      aria-live="polite"
+    >
+      <div className="loader-mark" aria-hidden="true">
+        <span />
+      </div>
+      <div className="loader-copy">
+        <p className="eyebrow">One moment</p>
+        <strong>{label}</strong>
+        {detail && <span>{detail}</span>}
+      </div>
+    </div>
+  );
 }
 function formatDate(value?: string) {
   return value
