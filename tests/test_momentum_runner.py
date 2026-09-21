@@ -223,6 +223,30 @@ def test_completed_run_history_survives_service_restart(tmp_path) -> None:
     assert restored.list()[0]["session_pnl"] == -12.5
 
 
+def test_run_archive_summaries_do_not_include_heavy_evidence(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "research.db"))
+    store.save_momentum_run(
+        {
+            "id": "summary-run",
+            "status": "COMPLETED",
+            "started_at": "2026-09-21T03:45:00+00:00",
+            "events": [{"type": "ENTRY_SIGNAL_EVALUATED", "signal": {"large": "payload"}}],
+            "monitoring": [{"symbol": "TCS", "price": 100}],
+            "monitoring_count": 1,
+            "pending_setups": [{"id": "setup"}],
+            "session_pnl": 10,
+            "config": {"account_id": "summary"},
+        }
+    )
+
+    summary = MomentumRunnerService(store).list()[0]
+
+    assert summary["events"] == []
+    assert summary["monitoring"] == []
+    assert summary["monitoring_count"] == 1
+    assert summary["pending_setups"] == []
+
+
 def test_falling_nifty_blocks_an_entry_only_when_confirmation_is_required(tmp_path) -> None:
     accounts = PaperAccountManager(
         repository=InMemoryRepository(),

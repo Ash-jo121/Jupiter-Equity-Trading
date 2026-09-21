@@ -291,6 +291,16 @@ def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
 
     start = datetime(2026, 8, 28, 4, 30, tzinfo=timezone.utc)
     store = ResearchStore(str(tmp_path / "paper.db"))
+    store.save_momentum_run(
+        {
+            "id": "recorded",
+            "status": "COMPLETED",
+            "started_at": start.isoformat(),
+                "monitoring": [],
+                "events": [{"type": "FINISHED"}],
+                "config": {"account_id": "recorded"},
+            }
+    )
     store.add_observations(
         "recorded",
         [
@@ -318,6 +328,18 @@ def test_observation_endpoints_expose_the_recorded_trace(tmp_path) -> None:
             client.get("/observations", params={"session_date": "1999-01-01"}).json()["count"] == 0
         )
         assert client.get("/observations", params={"limit": 0}).status_code == 422
+
+        detail = client.get("/momentum-runners/recorded").json()
+        assert detail["monitoring"] == []
+        assert detail["events"] == [{"type": "FINISHED"}]
+
+        trace = client.get(
+            "/momentum-runners/recorded/observations", params={"limit": 5}
+        ).json()
+        assert trace["count"] == 5
+        assert trace["total"] == 12
+        assert trace["truncated"] is True
+        assert trace["observations"][0]["price"] == 2340.0
 
 
 def test_schedule_plan_endpoint_returns_the_three_entry_variants(tmp_path) -> None:

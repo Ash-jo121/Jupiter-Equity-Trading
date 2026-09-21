@@ -245,6 +245,12 @@ type DataHealth = {
   cache_hit: boolean;
   cache_age_seconds?: number | null;
 };
+type ObservationResponse = {
+  count: number;
+  total: number;
+  truncated: boolean;
+  observations: MonitoringObservation[];
+};
 type ReplayMetrics = {
   net_pnl: number;
   gross_pnl: number;
@@ -658,14 +664,6 @@ export default function Home() {
     }
   }, []);
   useEffect(() => {
-    const first = window.setTimeout(refresh, 0),
-      timer = window.setInterval(refresh, 4000);
-    return () => {
-      window.clearTimeout(first);
-      window.clearInterval(timer);
-    };
-  }, [refresh]);
-  useEffect(() => {
     if (allocation <= 0) return;
     let live = true;
     const timer = window.setTimeout(() => {
@@ -690,47 +688,63 @@ export default function Home() {
     () => nseRuns.filter((run) => ["RUNNING", "STOPPING"].includes(run.status)),
     [nseRuns],
   );
+  const hasActiveRuns = activeRuns.length > 0;
+  useEffect(() => {
+    let live = true,
+      timer: number | undefined;
+    const cycle = async () => {
+      if (!document.hidden) await refresh();
+      if (live)
+        timer = window.setTimeout(cycle, hasActiveRuns ? 10_000 : 30_000);
+    };
+    cycle();
+    return () => {
+      live = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [refresh, hasActiveRuns]);
   const activeRun = activeRuns[0],
     latestRun = nseRuns[0];
   const selectedRun = detail && detail.id === selectedRunId ? detail : null;
+  const selectedRunActive = runs.some(
+    (run) =>
+      run.id === selectedRunId && ["RUNNING", "STOPPING"].includes(run.status),
+  );
   // A stale detail object is filtered by the id guard above, so the effect
   // never needs to clear state synchronously - it only fetches.
   useEffect(() => {
     if (!selectedRunId) return;
-    let live = true;
-    const load = () =>
-      request<MomentumRun>(`/momentum-runners/${selectedRunId}`)
-        .then((result) => {
-          if (live) {
-            setDetail(result);
-            setDetailError("");
-          }
-        })
-        .catch((problem) => {
-          if (live)
-            setDetailError(
-              problem instanceof Error
-                ? problem.message
-                : "Run could not be loaded",
-            );
-        });
+    let live = true,
+      timer: number | undefined;
+    const controller = new AbortController();
+    const load = async () => {
+      try {
+        const result = await request<MomentumRun>(
+          `/momentum-runners/${selectedRunId}?include_monitoring=false`,
+          { signal: controller.signal },
+        );
+        if (live) {
+          setDetail(result);
+          setDetailError("");
+        }
+      } catch (problem) {
+        if (live && !controller.signal.aborted)
+          setDetailError(
+            problem instanceof Error
+              ? problem.message
+              : "Run could not be loaded",
+          );
+      }
+      if (live && selectedRunActive)
+        timer = window.setTimeout(load, 15_000);
+    };
     load();
-    // A live run keeps growing, so refresh its detail while it is still going.
-    const timer = window.setInterval(() => {
-      if (
-        runs.find(
-          (r) =>
-            r.id === selectedRunId &&
-            ["RUNNING", "STOPPING"].includes(r.status),
-        )
-      )
-        load();
-    }, 5000);
     return () => {
       live = false;
-      window.clearInterval(timer);
+      controller.abort();
+      if (timer) window.clearTimeout(timer);
     };
-  }, [selectedRunId, runs]);
+  }, [selectedRunId, selectedRunActive]);
   const marketStatus =
       summary?.stream.market_statuses.NSE_EQ || "NOT CONNECTED",
     displayedExperimentRuns = activeRuns.length
@@ -888,7 +902,11 @@ export default function Home() {
         />
       ) : selectedRunId ? (
         selectedRun ? (
-          <RunDetail run={selectedRun} back={() => setSelectedRunId(null)} />
+          <RunDetail
+            key={selectedRun.id}
+            run={selectedRun}
+            back={() => setSelectedRunId(null)}
+          />
         ) : (
           <section className="run-detail">
             <button
@@ -1569,6 +1587,44 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
   const [section, setSection] = useState<RunReportSection>("overview"),
     [entryOpen, setEntryOpen] = useState(false),
     [exitOpen, setExitOpen] = useState(false);
+  const [trace, setTrace] = useState<MonitoringObservation[]>([]),
+    [traceRunId, setTraceRunId] = useState(""),
+    [traceError, setTraceError] = useState("");
+  const needsTrace = section === "monitoring" || section === "replay";
+  const traceLoading = needsTrace && traceRunId !== run.id && !traceError;
+  useEffect(() => {
+    if (!needsTrace || traceRunId === run.id) return;
+    let live = true;
+    const controller = new AbortController();
+    request<ObservationResponse>(
+      `/momentum-runners/${run.id}/observations?limit=200000`,
+      { signal: controller.signal },
+    )
+      .then((response) => {
+        if (!live) return;
+        setTrace(response.observations);
+        setTraceRunId(run.id);
+        setTraceError(
+          response.truncated
+            ? `Showing ${number.format(response.count)} of ${number.format(response.total)} observations.`
+            : "",
+        );
+      })
+      .catch((problem) => {
+        if (live && !controller.signal.aborted)
+          setTraceError(
+            problem instanceof Error ? problem.message : "Trace could not be loaded",
+          );
+      });
+    return () => {
+      live = false;
+      controller.abort();
+    };
+  }, [needsTrace, run.id, traceRunId]);
+  const runWithTrace = useMemo(
+    () => ({ ...run, monitoring: traceRunId === run.id ? trace : [] }),
+    [run, trace, traceRunId],
+  );
   const outcomes = useMemo(() => runOutcomes(run), [run]);
   const candlestick = run.config.signal_strategy !== "MOMENTUM_REVERSAL";
   const duration =
@@ -1679,8 +1735,22 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
         </section>
       </div>
       <DecisionFunnel run={run} />
-      <MonitoringTrace run={run} />
-      {marketName(run) === "NSE" && <ReplayPanel run={run} />}
+      {traceLoading && needsTrace ? (
+        <section className={`panel ${section === "replay" ? "replay-panel" : "monitoring-panel"}`}>
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Loaded only when requested</p>
+              <h2>Loading the recorded price trace…</h2>
+            </div>
+          </div>
+        </section>
+      ) : (
+        <>
+          {traceError && needsTrace && <p className="trace-help">{traceError}</p>}
+          <MonitoringTrace run={runWithTrace} />
+          {marketName(run) === "NSE" && <ReplayPanel run={runWithTrace} />}
+        </>
+      )}
       <section className="panel outcome-panel">
         <div className="panel-head">
           <div>

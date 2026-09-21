@@ -1597,6 +1597,18 @@ def _without_trace(snapshot: dict) -> dict:
     }
 
 
+def _run_summary(snapshot: dict) -> dict:
+    """Small archive/live-card payload; detailed evidence belongs to one-run GETs."""
+
+    payload = _without_trace(snapshot)
+    payload["events"] = []
+    payload["pending_setups"] = []
+    payload["pending_entry_intents"] = []
+    payload["pending_signal_exits"] = []
+    payload["ratchet_states"] = {}
+    return payload
+
+
 def _decision_counts(monitoring: list[dict]) -> list[dict]:
     """Which gate each observation stopped at, so a run explains its own inaction."""
 
@@ -1637,16 +1649,15 @@ class MomentumRunnerService:
         return runner.start()
 
     def list(self) -> list[dict]:
-        """Run summaries only. A trace can run to thousands of rows, so callers
-        that want one ask for that run by id."""
+        """Compact run cards only; evidence and traces are fetched on demand."""
 
         with self._lock:
             live = {
-                runner.id: _without_trace(runner.snapshot()) for runner in self._runners.values()
+                runner.id: _run_summary(runner.snapshot()) for runner in self._runners.values()
             }
         persisted = self._store.momentum_runs() if self._store else []
         combined = list(live.values()) + [
-            _without_trace(item) for item in persisted if item["id"] not in live
+            _run_summary(item) for item in persisted if item["id"] not in live
         ]
         return sorted(combined, key=lambda item: item.get("started_at") or "", reverse=True)
 
@@ -1670,10 +1681,39 @@ class MomentumRunnerService:
     def active(self) -> list[dict]:
         with self._lock:
             return [
-                _without_trace(runner.snapshot())
+                _run_summary(runner.snapshot())
                 for runner in self._runners.values()
                 if runner.snapshot()["status"] in ACTIVE_RUN_STATUSES
             ]
+
+    def monitoring(self, runner_id: str, limit: int = 200_000) -> dict:
+        """Return a trace only when a report tab explicitly asks for it."""
+
+        with self._lock:
+            runner = self._runners.get(runner_id)
+        if runner:
+            rows = list(runner.snapshot().get("monitoring") or [])
+            return {
+                "count": min(len(rows), limit),
+                "total": len(rows),
+                "truncated": len(rows) > limit,
+                "observations": rows[:limit],
+            }
+        snapshot = self._store.momentum_run(runner_id) if self._store else None
+        if snapshot is None:
+            raise KeyError(runner_id)
+        if self._store and self._store.observation_count(runner_id):
+            total = self._store.observation_count(runner_id)
+            rows = self._store.observations(run_id=runner_id, limit=limit)
+        else:
+            stored = list(snapshot.get("monitoring") or [])
+            total, rows = len(stored), stored[:limit]
+        return {
+            "count": len(rows),
+            "total": total,
+            "truncated": total > len(rows),
+            "observations": rows,
+        }
 
     def stop(self, runner_id: str) -> dict:
         with self._lock:

@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.gzip import GZipMiddleware
 
 from .accounts import PaperAccountManager
 from .alpaca import (
@@ -551,6 +552,7 @@ def create_app(
         description="Private paper-trading research API for Indian and US equities.",
         lifespan=lifespan,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1_000, compresslevel=6)
     if settings.cors_allow_origins:
         # A split deploy (dashboard on one host, API on another) is cross-origin,
         # so the browser needs the API to name the dashboard's origin explicitly.
@@ -1063,9 +1065,19 @@ def create_app(
         return momentum_runners.list()
 
     @app.get("/momentum-runners/{runner_id}")
-    def get_momentum_runner(runner_id: str, include_monitoring: bool = True) -> dict:
+    def get_momentum_runner(runner_id: str, include_monitoring: bool = False) -> dict:
         try:
             return momentum_runners.get(runner_id, include_monitoring=include_monitoring)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="momentum runner not found") from error
+
+    @app.get("/momentum-runners/{runner_id}/observations")
+    def get_momentum_runner_observations(
+        runner_id: str,
+        limit: int = Query(default=200_000, ge=1, le=200_000),
+    ) -> dict:
+        try:
+            return momentum_runners.monitoring(runner_id, limit)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="momentum runner not found") from error
 
