@@ -37,6 +37,8 @@ class ScheduledSlot:
     entry_mode: str = "MACD_EARLY"
     status: str = "PENDING"  # PENDING -> LAUNCHED / FAILED / SKIPPED
     runner_id: Optional[str] = None
+    runner_ids: List[str] = field(default_factory=list)
+    continuation_count: int = 0
     detail: Optional[str] = None
 
     def to_dict(self) -> dict:

@@ -376,6 +376,16 @@ def create_app(
         )
         session_id = slot.start_ist[:10]
         experiment_id = f"{sched_config.account_prefix}-{session_id}"
+        if slot.continuation_count:
+            experiment_id = f"{experiment_id}-continuation-{slot.continuation_count}"
+            run = _launch_runner(
+                request,
+                label=slot.label.split(" · ", 1)[0],
+                experiment_id=experiment_id,
+                session_id=session_id,
+                shared_config_hash=experiment.shared_hash,
+            )
+            return run["id"]
         barrier_state = scheduler_barriers.setdefault(
             session_id,
             {
@@ -543,7 +553,7 @@ def create_app(
         finally:
             scheduler.stop()
             us_scheduler.stop()
-            momentum_runners.stop_all()
+            momentum_runners.stop_all("DEPLOYMENT")
             market_stream.stop()
 
     app = FastAPI(

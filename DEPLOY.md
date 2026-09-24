@@ -96,6 +96,12 @@ changes. It runs one confirmed-MACD strategy against the single Alpaca paper por
 dashboard's Reports tab. Each run needs its account funded to cover
 `max_positions x allocation`, which `SCHEDULER_INITIAL_CASH` provides.
 
+Deployments during an open NSE session close the old process's paper positions and preserve
+that run segment. After the replacement process sees the deployment-stopped segment, it starts
+a fresh continuation on the same paper account for only the time remaining until 15:30 IST.
+The plan retains every segment ID for auditability. A run stopped explicitly through the API or
+dashboard is marked `USER_REQUESTED` and is not automatically continued.
+
 ## Frontend
 
 **This dashboard is not a drop-in Vercel app.** It is built with `vinext` (the

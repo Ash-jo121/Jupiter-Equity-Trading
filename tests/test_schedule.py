@@ -126,6 +126,81 @@ def test_arms_are_not_relaunched_after_a_restart(tmp_path) -> None:
     assert relaunched == []
 
 
+def test_deployment_interrupted_arms_continue_for_the_remaining_session(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "sched.db"))
+    plan = build_daily_plan(MONDAY)
+    slot = plan.slots[0]
+    slot.status = "LAUNCHED"
+    slot.runner_id = "before-deploy"
+    slot.runner_ids = ["before-deploy"]
+    store.save_schedule_plan(MONDAY, plan.to_dict())
+    store.save_momentum_run(
+        {
+            "id": "before-deploy",
+            "status": "COMPLETED",
+            "stop_reason": "DEPLOYMENT",
+            "config": {"account_id": slot.account_id},
+        }
+    )
+    launched = []
+
+    def launch(continuation, _config):
+        launched.append(continuation)
+        store.save_momentum_run(
+            {
+                "id": "after-deploy",
+                "status": "RUNNING",
+                "config": {"account_id": continuation.account_id},
+            }
+        )
+        return "after-deploy"
+
+    scheduler = DailyScheduler(
+        store,
+        launch,
+        lambda date: {},
+        SchedulerConfig(enabled=True),
+    )
+    actions = scheduler.tick(_at(MONDAY, 11, 0))
+
+    assert len(launched) == 1
+    assert launched[0].duration_seconds == 4 * 3600 + 30 * 60
+    assert launched[0].continuation_count == 1
+    assert actions[0]["action"] == "CONTINUED"
+    saved = store.schedule_plan(MONDAY)["slots"][0]
+    assert saved["runner_id"] == "after-deploy"
+    assert saved["runner_ids"] == ["before-deploy", "after-deploy"]
+    assert saved["continuation_count"] == 1
+
+
+def test_a_user_stopped_arm_is_not_automatically_continued(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "sched.db"))
+    plan = build_daily_plan(MONDAY)
+    slot = plan.slots[0]
+    slot.status = "LAUNCHED"
+    slot.runner_id = "user-stopped"
+    store.save_schedule_plan(MONDAY, plan.to_dict())
+    store.save_momentum_run(
+        {
+            "id": "user-stopped",
+            "status": "COMPLETED",
+            "stop_reason": "USER_REQUESTED",
+            "config": {"account_id": slot.account_id},
+        }
+    )
+    launched = []
+    scheduler = DailyScheduler(
+        store,
+        lambda item, cfg: launched.append(item) or "unexpected",
+        lambda date: {},
+        SchedulerConfig(enabled=True),
+    )
+
+    scheduler.tick(_at(MONDAY, 11, 0))
+
+    assert launched == []
+
+
 def test_an_unlaunched_saved_plan_tracks_the_current_arms(tmp_path) -> None:
     scheduler, store, launched, _ = _scheduler(tmp_path, entry_variants=ENTRY_VARIANTS[:2])
     old_plan = build_daily_plan(MONDAY, timeframes=(0, 60, 180, 300))

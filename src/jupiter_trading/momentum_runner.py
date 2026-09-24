@@ -254,6 +254,7 @@ class MomentumReversalRunner:
             "cache_age_seconds": None,
         }
         self._market_status: Optional[str] = None
+        self._stop_reason: Optional[str] = None
         self._dirty = False
         self._flushed_observations = 0
         self._history_size = max(13, config.entry_bars)
@@ -284,11 +285,12 @@ class MomentumReversalRunner:
             self._persist()
             return self.snapshot()
 
-    def stop(self) -> dict:
+    def stop(self, reason: str = "USER_REQUESTED") -> dict:
         self._stop.set()
         with self._lock:
             if self._status == "RUNNING":
                 self._status = "STOPPING"
+                self._stop_reason = reason
         self._persist()
         return self.snapshot()
 
@@ -333,6 +335,7 @@ class MomentumReversalRunner:
                 "status": self._status,
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
+                "stop_reason": self._stop_reason,
                 "config": asdict(self.config),
                 "cost_model": self._cost_model,
                 "decision_counts": _decision_counts(self._monitoring),
@@ -1715,9 +1718,9 @@ class MomentumRunnerService:
             "observations": rows,
         }
 
-    def stop(self, runner_id: str) -> dict:
+    def stop(self, runner_id: str, reason: str = "USER_REQUESTED") -> dict:
         with self._lock:
-            return self._runners[runner_id].stop()
+            return self._runners[runner_id].stop(reason)
 
     def has_active(self, account_id: str) -> bool:
         """One run per paper account: concurrent runners would share cash and
@@ -1730,8 +1733,8 @@ class MomentumRunnerService:
                 for runner in self._runners.values()
             )
 
-    def stop_all(self) -> None:
+    def stop_all(self, reason: str = "USER_REQUESTED") -> None:
         with self._lock:
             runners = list(self._runners.values())
         for runner in runners:
-            runner.stop()
+            runner.stop(reason)

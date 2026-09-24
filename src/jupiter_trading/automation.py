@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from threading import Event, RLock, Thread
 from typing import Callable, List, Optional
@@ -19,6 +19,7 @@ from .schedule import (
 # How long after a slot's planned end we wait before compiling the day's report,
 # so the last run has finished writing its final snapshot.
 REPORT_DELAY_SECONDS = 180
+MIN_CONTINUATION_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,10 @@ class DailyScheduler:
                 return actions
             changed = False
             for slot in plan.slots:
+                if slot.status == "LAUNCHED":
+                    if self._continue_interrupted_slot(slot, moment, actions):
+                        changed = True
+                    continue
                 if slot.status != "PENDING":
                     continue
                 start = datetime.fromisoformat(slot.start_ist)
@@ -163,6 +168,7 @@ class DailyScheduler:
                     continue
                 try:
                     slot.runner_id = self._launch(slot, self.config)
+                    slot.runner_ids = [slot.runner_id]
                     slot.status = "LAUNCHED"
                     actions.append(
                         {"slot": slot.index, "action": "LAUNCHED", "runner_id": slot.runner_id}
@@ -181,6 +187,81 @@ class DailyScheduler:
 
         self._last_actions = actions
         return actions
+
+    def _continue_interrupted_slot(
+        self, slot: ScheduledSlot, moment: datetime, actions: List[dict]
+    ) -> bool:
+        """Start a new segment when a deployment ended today's live segment.
+
+        Runner indicator/candle state is intentionally not reconstructed. The
+        persisted segment remains immutable and a fresh runner uses the same
+        paper account, preserving cash and realised P&L while rebuilding its
+        signals from provider candles. This is a continuation in reporting,
+        not a claim that in-memory state survived the process restart.
+        """
+
+        if not slot.runner_id:
+            return False
+        previous = self.store.momentum_run(slot.runner_id)
+        if not previous:
+            return False
+        status = previous.get("status")
+        stop_reason = previous.get("stop_reason")
+        recoverable = stop_reason == "DEPLOYMENT" or (
+            stop_reason is None and status == "COMPLETED"
+        )
+        if status not in {"COMPLETED", "FAILED", "INCOMPLETE"} or not recoverable:
+            return False
+
+        end = datetime.fromisoformat(slot.end_ist)
+        remaining_seconds = int((end - moment).total_seconds())
+        if remaining_seconds < MIN_CONTINUATION_SECONDS:
+            return False
+        if not self._market_ready():
+            actions.append(
+                {"slot": slot.index, "action": "WAITING_TO_CONTINUE", "runner_id": slot.runner_id}
+            )
+            return False
+
+        prior_id = slot.runner_id
+        continuation_number = slot.continuation_count + 1
+        continuation = replace(
+            slot,
+            duration_seconds=remaining_seconds,
+            continuation_count=continuation_number,
+        )
+        try:
+            next_id = self._launch(continuation, self.config)
+        except Exception as error:  # noqa: BLE001 - retry on the next scheduler tick
+            slot.detail = f"continuation pending: {str(error)[:260]}"
+            actions.append(
+                {
+                    "slot": slot.index,
+                    "action": "CONTINUATION_FAILED",
+                    "runner_id": prior_id,
+                    "error": str(error)[:300],
+                }
+            )
+            return True
+
+        history = list(slot.runner_ids)
+        if prior_id not in history:
+            history.append(prior_id)
+        history.append(next_id)
+        slot.runner_ids = history
+        slot.runner_id = next_id
+        slot.continuation_count = continuation_number
+        slot.detail = f"continued after deployment with {remaining_seconds}s remaining"
+        actions.append(
+            {
+                "slot": slot.index,
+                "action": "CONTINUED",
+                "previous_runner_id": prior_id,
+                "runner_id": next_id,
+                "remaining_seconds": remaining_seconds,
+            }
+        )
+        return True
 
     def _maybe_report(self, plan: DailyPlan, moment: datetime) -> Optional[dict]:
         """Build the day's report once every slot has finished and settled."""

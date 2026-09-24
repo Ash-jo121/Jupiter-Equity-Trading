@@ -270,6 +270,11 @@ curl 'http://127.0.0.1:8000/observations?session_date=2026-08-28&symbol=TCS&limi
 from those rows: `GET /momentum-runners/{runner_id}` (add `?include_monitoring=false` for just the
 summary). Runs recorded before this split still carry their trace inline and read back unchanged.
 
+If the service is deployed while the NSE automation is running, shutdown records the stop as a
+deployment interruption and closes any paper positions. The new process keeps the completed
+segment and launches a fresh continuation on the same account for the remaining market session.
+It does not reconstruct in-memory candle state, and a deliberate Stop remains stopped.
+
 Start the default experiment on the dedicated `momentum` research account:
 
 ```bash
