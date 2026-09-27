@@ -310,6 +310,7 @@ type MomentumRun = {
   fills: Fill[];
   events: RunEvent[];
   errors: string[];
+  warnings?: string[];
   open_positions: Array<{
     symbol: string;
     quantity: number;
@@ -489,6 +490,7 @@ type ReportRun = {
   exit_reasons: Record<string, number>;
   monitoring_count: number;
   errors: string[];
+  warnings?: string[];
 };
 type ConfigRollup = {
   key: string | number;
@@ -1999,6 +2001,12 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
           </dl>
           {run.errors.length > 0 && (
             <div className="error-box">{run.errors.join(" · ")}</div>
+          )}
+          {!!run.warnings?.length && (
+            <div className="warning-box">
+              <strong>Recovered market-data warning</strong>
+              <span>{run.warnings.join(" · ")}</span>
+            </div>
           )}
         </article>
       </section>

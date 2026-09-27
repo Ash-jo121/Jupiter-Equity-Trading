@@ -150,6 +150,36 @@ def test_background_survey_does_not_block_live_quote_polling(tmp_path) -> None:
     assert runner.snapshot()["scan_count"] == 1
 
 
+def test_recoverable_provider_warning_does_not_fail_a_completed_run(tmp_path) -> None:
+    accounts = PaperAccountManager(
+        repository=InMemoryRepository(),
+        initial_cash=100_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    store = ResearchStore(str(tmp_path / "research.db"))
+    runner = MomentumReversalRunner(
+        config=MomentumRunnerConfig(account_id="default"),
+        instruments=[SurveyInstrument("TEST", "NSE_EQ|TEST")],
+        market_data=CountingSurveyMarket(),
+        accounts=accounts,
+        coordinator=MarketCoordinator(accounts, StrategyService(accounts, store)),
+        store=store,
+    )
+    runner._status = "STOPPING"
+    runner._stop.set()
+    runner._warning(RuntimeError("Unable to reach Upstox: timed out"))
+
+    runner._run()
+    snapshot = runner.snapshot()
+
+    assert snapshot["status"] == "COMPLETED"
+    assert snapshot["errors"] == []
+    assert snapshot["warnings"] == ["Unable to reach Upstox: timed out"]
+    assert any(event["type"] == "WARNING" for event in snapshot["events"])
+
+
 def test_legacy_reversal_mode_buys_momentum_and_sells_reversal(tmp_path) -> None:
     accounts = PaperAccountManager(
         repository=InMemoryRepository(),
@@ -221,6 +251,46 @@ def test_completed_run_history_survives_service_restart(tmp_path) -> None:
 
     assert restored.get("saved-run")["fills"][0]["symbol"] == "CIPLA"
     assert restored.list()[0]["session_pnl"] == -12.5
+
+
+def test_full_duration_legacy_failure_is_migrated_to_completed_with_warning(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "research.db"))
+    store.save_momentum_run(
+        {
+            "id": "recovered-timeout",
+            "status": "FAILED",
+            "started_at": "2026-09-25T03:45:21+00:00",
+            "finished_at": "2026-09-25T10:00:21+00:00",
+            "errors": ["Unable to reach Upstox: The read operation timed out"],
+            "config": {"account_id": "auto-C", "duration_seconds": 22_500},
+        }
+    )
+
+    restored = MomentumRunnerService(store)
+    run = restored.get("recovered-timeout", include_monitoring=False)
+
+    assert run["status"] == "COMPLETED"
+    assert run["errors"] == []
+    assert run["warnings"] == ["Unable to reach Upstox: The read operation timed out"]
+    assert run["status_correction"]["previous_status"] == "FAILED"
+
+
+def test_early_legacy_failure_remains_failed(tmp_path) -> None:
+    store = ResearchStore(str(tmp_path / "research.db"))
+    store.save_momentum_run(
+        {
+            "id": "genuine-failure",
+            "status": "FAILED",
+            "started_at": "2026-09-25T03:45:21+00:00",
+            "finished_at": "2026-09-25T04:00:21+00:00",
+            "errors": ["unrecoverable failure"],
+            "config": {"account_id": "auto-C", "duration_seconds": 22_500},
+        }
+    )
+
+    restored = MomentumRunnerService(store)
+
+    assert restored.get("genuine-failure", include_monitoring=False)["status"] == "FAILED"
 
 
 def test_run_archive_summaries_do_not_include_heavy_evidence(tmp_path) -> None:

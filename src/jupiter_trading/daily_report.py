@@ -71,6 +71,7 @@ def _run_summary(run: dict) -> dict:
         "scan_count": run.get("scan_count", 0),
         "poll_count": run.get("poll_count", 0),
         "errors": run.get("errors", []),
+        "warnings": run.get("warnings", []),
     }
 
 

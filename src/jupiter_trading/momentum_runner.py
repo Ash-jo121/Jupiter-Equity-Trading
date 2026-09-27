@@ -244,6 +244,7 @@ class MomentumReversalRunner:
         self._cooldown_until: Dict[str, datetime] = {}
         self._events: list[dict] = []
         self._errors: list[str] = []
+        self._warnings: list[str] = []
         self._data_health = {
             "status": "WAITING",
             "requested": len(self.instruments),
@@ -354,6 +355,7 @@ class MomentumReversalRunner:
                 "events": list(self._events),
                 "monitoring": list(self._monitoring),
                 "errors": list(self._errors),
+                "warnings": list(self._warnings),
                 "data_health": dict(self._data_health),
                 "candle_cache": self.candle_cache.stats() if self.candle_cache else None,
                 "market_status": self._market_status,
@@ -541,7 +543,7 @@ class MomentumReversalRunner:
             with self._lock:
                 should_record = not background or self._accept_background_scans
             if should_record:
-                self._error(error)
+                self._warning(error)
 
     def _refresh_market_status(self) -> None:
         if self.market_status_refresh is None:
@@ -799,7 +801,7 @@ class MomentumReversalRunner:
                 else self.market_data.ltp(keys)
             )
         except Exception as error:  # noqa: BLE001 - an individual poll may recover
-            self._error(error)
+            self._warning(error)
             return
         with self._lock:
             self._poll_count += 1
@@ -1473,7 +1475,7 @@ class MomentumReversalRunner:
         try:
             quotes = self.market_data.ltp(keys)
         except Exception as error:  # noqa: BLE001 - use last observed prices below
-            self._error(error)
+            self._warning(error)
             quotes = {}
         for key in keys:
             state = self._open.get(key)
@@ -1543,6 +1545,15 @@ class MomentumReversalRunner:
             self._errors.append(message)
             self._record("ERROR", {"message": message})
 
+    def _warning(self, error: Exception) -> None:
+        """Record a recoverable provider failure without failing the run."""
+
+        with self._lock:
+            message = str(error)[:500]
+            if message not in self._warnings:
+                self._warnings.append(message)
+            self._record("WARNING", {"message": message, "recoverable": True})
+
     def _flush_observations(self) -> None:
         """Append any monitoring rows not yet written, oldest first."""
 
@@ -1600,6 +1611,43 @@ def _without_trace(snapshot: dict) -> dict:
     }
 
 
+def normalize_legacy_run_health(snapshot: dict) -> dict:
+    """Correct old full-duration runs that treated a recovered timeout as fatal.
+
+    Before recoverable warnings were separated from fatal errors, any provider
+    timeout made the final status FAILED even when the runner stayed alive for
+    its complete configured duration. Only that objectively identifiable case
+    is migrated; an early FAILED run remains failed.
+    """
+
+    if snapshot.get("status") != "FAILED" or "warnings" in snapshot:
+        return snapshot
+    errors = list(snapshot.get("errors") or [])
+    started_at = snapshot.get("started_at")
+    finished_at = snapshot.get("finished_at")
+    duration = snapshot.get("config", {}).get("duration_seconds")
+    if not errors or not started_at or not finished_at or not duration:
+        return snapshot
+    try:
+        elapsed = (
+            datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return snapshot
+    if elapsed + 0.5 < float(duration):
+        return snapshot
+    return {
+        **snapshot,
+        "status": "COMPLETED",
+        "errors": [],
+        "warnings": errors,
+        "status_correction": {
+            "previous_status": "FAILED",
+            "reason": "legacy full-duration run contained only recoverable provider errors",
+        },
+    }
+
+
 def _run_summary(snapshot: dict) -> dict:
     """Small archive/live-card payload; detailed evidence belongs to one-run GETs."""
 
@@ -1645,6 +1693,11 @@ class MomentumRunnerService:
         self._runners: Dict[str, MomentumReversalRunner] = {}
         self._lock = RLock()
         self._store = store
+        if self._store:
+            for stored in self._store.momentum_runs():
+                corrected = normalize_legacy_run_health(stored)
+                if corrected is not stored:
+                    self._store.save_momentum_run(corrected)
 
     def add(self, runner: MomentumReversalRunner) -> dict:
         with self._lock:
