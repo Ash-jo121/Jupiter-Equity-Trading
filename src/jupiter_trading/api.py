@@ -37,6 +37,11 @@ from .momentum_runner import (
     MomentumRunnerConfig,
     MomentumRunnerService,
 )
+from .parallel_monitoring import (
+    ParallelMonitoringConfig,
+    ParallelMonitoringEngine,
+    ParallelMonitoringService,
+)
 from .repository import SQLiteRepository
 from .research_store import ResearchStore
 from .schedule import build_daily_plan
@@ -439,7 +444,7 @@ def create_app(
         _scheduler_launch,
         lambda session_date: daily_reports_builder.build(session_date),
         SchedulerConfig(
-            enabled=settings.scheduler_enabled,
+            enabled=settings.scheduler_enabled and not settings.parallel_monitoring_v2,
             max_positions=settings.scheduler_max_positions,
             # The frozen A/B/C experiment requires one trade per instrument;
             # a stale Railway cooldown value must not invalidate every launch.
@@ -529,6 +534,45 @@ def create_app(
         ),
     )
 
+    def _parallel_engine_factory(session_date: str) -> ParallelMonitoringEngine:
+        constituents = nifty100.constituents()
+        session_id = f"NSE:{session_date}:parallel-v2"
+        return ParallelMonitoringEngine(
+            ParallelMonitoringConfig(
+                session_id=session_id,
+                session_date=session_date,
+                account_prefix=f"{settings.scheduler_account_prefix}-v2",
+                slot_count=settings.parallel_slot_count,
+                candidate_pool_size=settings.parallel_candidate_pool_size,
+                lease_seconds=settings.parallel_lease_seconds,
+                cooldown_seconds=settings.parallel_cooldown_seconds,
+                poll_interval_seconds=settings.parallel_poll_interval_seconds,
+                survey_interval_seconds=settings.parallel_survey_interval_seconds,
+                minimum_relative_volume=1.2,
+                initial_cash=settings.scheduler_initial_cash,
+                allocation_per_position=settings.scheduler_allocation,
+                max_positions_per_strategy=settings.scheduler_max_positions,
+            ),
+            [
+                SurveyInstrument(item["symbol"], item["instrument_key"])
+                for item in constituents
+            ],
+            market_data(),
+            accounts,
+            research_store,
+            shared_survey_cache,
+            shared_quote_cache,
+            shared_candle_cache,
+            market_status_refresh=_refresh_nse_execution_status,
+        )
+
+    parallel_monitoring = ParallelMonitoringService(
+        enabled=settings.scheduler_enabled and settings.parallel_monitoring_v2,
+        engine_factory=_parallel_engine_factory,
+        trading_day_check=nse_holidays.is_trading_day,
+        market_ready=_scheduler_market_ready,
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         configured_keys = (
@@ -547,11 +591,13 @@ def create_app(
                 "full" if strategy_keys else settings.upstox_stream_mode,
             )
         scheduler.start()
+        parallel_monitoring.start()
         us_scheduler.start()
         try:
             yield
         finally:
             scheduler.stop()
+            parallel_monitoring.stop()
             us_scheduler.stop()
             momentum_runners.stop_all("DEPLOYMENT")
             market_stream.stop()
@@ -585,6 +631,7 @@ def create_app(
     app.state.momentum_runners = momentum_runners
     app.state.shared_quote_cache = shared_quote_cache
     app.state.scheduler = scheduler
+    app.state.parallel_monitoring = parallel_monitoring
     app.state.us_scheduler = us_scheduler
     app.state.alpaca_client = alpaca_client
     app.state.token_store = token_store
@@ -600,6 +647,7 @@ def create_app(
             "upstox_token": token_store.status(),
             "alpaca_paper_configured": alpaca_client is not None,
             "nse_scheduler_enabled": settings.scheduler_enabled,
+            "parallel_monitoring_v2": settings.parallel_monitoring_v2,
             "us_scheduler_enabled": settings.us_scheduler_enabled,
             "paper_accounts": len(accounts.list()),
             "strategies": len(strategies.list()),
@@ -1209,7 +1257,112 @@ def create_app(
 
     @app.get("/schedule/status")
     def schedule_status() -> dict:
+        if settings.parallel_monitoring_v2:
+            return parallel_monitoring.status()
         return scheduler.status()
+
+    def _parallel_engine() -> ParallelMonitoringEngine:
+        engine = parallel_monitoring.engine
+        if engine is None:
+            raise HTTPException(
+                status_code=404,
+                detail="parallel monitoring V2 has no active NSE session",
+            )
+        return engine
+
+    @app.get("/monitoring/slots")
+    def monitoring_slots() -> dict:
+        engine = _parallel_engine()
+        return {
+            "session_id": engine.config.session_id,
+            "status": engine.snapshot()["status"],
+            "slots": engine.slots(),
+        }
+
+    @app.get("/monitoring/slots/{slot_id}")
+    def monitoring_slot(slot_id: int) -> dict:
+        if not 1 <= slot_id <= 10:
+            raise HTTPException(status_code=404, detail="monitoring slot not found")
+        slot = _parallel_engine().slot(slot_id)
+        if slot is None:
+            raise HTTPException(status_code=404, detail="monitoring slot not found")
+        return slot
+
+    @app.get("/monitoring/candidates")
+    def monitoring_candidates(limit: int = Query(default=40, ge=1, le=100)) -> dict:
+        engine = _parallel_engine()
+        return {
+            "session_id": engine.config.session_id,
+            "ranking_version": engine.candidates.version,
+            "updated_at": (
+                engine.candidates.updated_at.isoformat()
+                if engine.candidates.updated_at
+                else None
+            ),
+            "candidates": engine.candidates.snapshot(limit),
+        }
+
+    @app.get("/monitoring/events")
+    def monitoring_events(
+        instrument_key: Optional[str] = None,
+        strategy: Optional[Literal["A", "B", "C"]] = None,
+        after_sequence: Optional[int] = Query(default=None, ge=0),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> dict:
+        engine = _parallel_engine()
+        events = research_store.monitoring_events(
+            engine.config.session_id,
+            instrument_key=instrument_key,
+            strategy=strategy,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+        return {
+            "session_id": engine.config.session_id,
+            "events": events,
+            "next_sequence": events[-1]["sequence"] if events else after_sequence,
+        }
+
+    @app.get("/monitoring/symbols/{symbol:path}")
+    def monitoring_symbol(symbol: str) -> dict:
+        return _parallel_engine().symbol(symbol)
+
+    @app.get("/execution/intents")
+    def monitoring_execution_intents(
+        status: Optional[str] = None,
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> dict:
+        engine = _parallel_engine()
+        return {
+            "session_id": engine.config.session_id,
+            "intents": research_store.execution_intents(
+                engine.config.session_id, status=status, limit=limit
+            ),
+        }
+
+    @app.get("/paper-portfolios")
+    def monitoring_paper_portfolios() -> dict:
+        engine = _parallel_engine()
+        return {
+            "session_id": engine.config.session_id,
+            "portfolios": engine.portfolios(),
+        }
+
+    @app.post("/monitoring/rebalance")
+    def monitoring_rebalance() -> dict:
+        engine = _parallel_engine()
+        engine.manager.rebalance()
+        return {"session_id": engine.config.session_id, "slots": engine.slots()}
+
+    @app.post("/monitoring/slots/{slot_id}/rotate")
+    def monitoring_rotate(slot_id: int) -> dict:
+        if not 1 <= slot_id <= 10:
+            raise HTTPException(status_code=404, detail="monitoring slot not found")
+        try:
+            slot = _parallel_engine().manager.rotate(slot_id)
+            return slot.to_dict()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/markets/automation")
     def markets_automation() -> dict:
@@ -1217,12 +1370,21 @@ def create_app(
 
         return {
             "NSE": {
-                **scheduler.status(),
+                **(
+                    parallel_monitoring.status()
+                    if settings.parallel_monitoring_v2
+                    else scheduler.status()
+                ),
                 "market_code": "NSE",
                 "timezone": "Asia/Kolkata",
                 "regular_session": "09:15-15:30 IST",
                 "calendar": "NSE holiday calendar",
                 "provider": "UPSTOX_DATA_INTERNAL_PAPER",
+                "architecture": (
+                    "PARALLEL_MONITORING_V2"
+                    if settings.parallel_monitoring_v2
+                    else "LEGACY_THREE_RUNS"
+                ),
             },
             "US": {**us_scheduler.status(), "provider": "ALPACA_PAPER"},
         }

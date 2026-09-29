@@ -110,6 +110,41 @@ class ResearchStore:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS monitoring_sessions (
+                    id TEXT PRIMARY KEY,
+                    session_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS monitoring_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    instrument_key TEXT,
+                    strategy TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS monitoring_rankings (
+                    session_id TEXT NOT NULL,
+                    ranking_version INTEGER NOT NULL,
+                    instrument_key TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_id, ranking_version, instrument_key)
+                );
+                CREATE TABLE IF NOT EXISTS execution_intents (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    instrument_key TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS idx_strategy_events
                     ON strategy_events(strategy_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_momentum_runs_account_updated
@@ -122,8 +157,222 @@ class ResearchStore:
                     ON market_observations(instrument_key, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_observations_session
                     ON market_observations(session_date, symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_monitoring_sessions_date
+                    ON monitoring_sessions(session_date, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitoring_events_session
+                    ON monitoring_events(session_id, sequence DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitoring_events_symbol
+                    ON monitoring_events(session_id, instrument_key, sequence DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitoring_rankings_session
+                    ON monitoring_rankings(session_id, ranking_version, rank);
+                CREATE INDEX IF NOT EXISTS idx_execution_intents_session
+                    ON execution_intents(session_id, updated_at DESC);
                 """
             )
+
+    def save_monitoring_session(self, payload: dict) -> None:
+        """Persist the compact recoverable state of the V2 monitoring engine."""
+
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO monitoring_sessions (id, session_date, status, payload)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    session_date = excluded.session_date,
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    payload["id"],
+                    payload["session_date"],
+                    payload["status"],
+                    json.dumps(payload),
+                ),
+            )
+
+    def monitoring_session(self, session_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM monitoring_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def monitoring_session_for_date(self, session_date: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT payload FROM monitoring_sessions
+                   WHERE session_date = ? ORDER BY updated_at DESC LIMIT 1""",
+                (session_date,),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def add_monitoring_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict,
+        instrument_key: Optional[str] = None,
+        strategy: Optional[str] = None,
+    ) -> int:
+        event = {"type": event_type, **payload}
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """INSERT INTO monitoring_events
+                   (session_id, event_type, instrument_key, strategy, payload)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, event_type, instrument_key, strategy, json.dumps(event)),
+            )
+        return int(cursor.lastrowid)
+
+    def monitoring_events(
+        self,
+        session_id: str,
+        *,
+        instrument_key: Optional[str] = None,
+        strategy: Optional[str] = None,
+        after_sequence: Optional[int] = None,
+        limit: int = 200,
+    ) -> List[dict]:
+        limit = max(1, min(int(limit), 1000))
+        clauses = ["session_id = ?"]
+        values: list = [session_id]
+        if instrument_key:
+            clauses.append("instrument_key = ?")
+            values.append(instrument_key)
+        if strategy:
+            clauses.append("strategy = ?")
+            values.append(strategy)
+        if after_sequence is not None:
+            clauses.append("sequence > ?")
+            values.append(after_sequence)
+        values.append(limit)
+        ascending = after_sequence is not None
+        query = (
+            "SELECT sequence, payload, created_at FROM monitoring_events WHERE "
+            + " AND ".join(clauses)
+            + (" ORDER BY sequence ASC LIMIT ?" if ascending else " ORDER BY sequence DESC LIMIT ?")
+        )
+        with self._lock:
+            rows = self._connection.execute(query, values).fetchall()
+        events = [
+            {"sequence": row[0], "created_at": row[2], **json.loads(row[1])}
+            for row in rows
+        ]
+        return events if ascending else list(reversed(events))
+
+    def save_monitoring_rankings(
+        self, session_id: str, ranking_version: int, candidates: List[dict]
+    ) -> None:
+        rows = [
+            (
+                session_id,
+                ranking_version,
+                candidate["instrument_key"],
+                candidate["rank"],
+                json.dumps(candidate),
+            )
+            for candidate in candidates
+        ]
+        if not rows:
+            return
+        with self._lock, self._connection:
+            self._connection.executemany(
+                """INSERT OR REPLACE INTO monitoring_rankings
+                   (session_id, ranking_version, instrument_key, rank, payload)
+                   VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+    def monitoring_rankings(
+        self, session_id: str, ranking_version: Optional[int] = None, limit: int = 100
+    ) -> List[dict]:
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            if ranking_version is None:
+                row = self._connection.execute(
+                    "SELECT MAX(ranking_version) FROM monitoring_rankings WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                ranking_version = row[0] if row else None
+            if ranking_version is None:
+                return []
+            rows = self._connection.execute(
+                """SELECT payload FROM monitoring_rankings
+                   WHERE session_id = ? AND ranking_version = ?
+                   ORDER BY rank LIMIT ?""",
+                (session_id, ranking_version, limit),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_execution_intent(self, payload: dict) -> bool:
+        """Insert/update an intent. Returns False when its id is already terminal.
+
+        ACCEPTED is deliberately treated as terminal for retry purposes. If a
+        process dies between broker submission and the final status write, a
+        restart will not create a duplicate fill.
+        """
+
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT status FROM execution_intents WHERE id = ?", (payload["id"],)
+            ).fetchone()
+            if (
+                existing
+                and payload["status"] in {"CREATED", "QUEUED"}
+                and existing[0]
+                in {"ACCEPTED", "FILLED", "PARTIAL", "REJECTED", "CANCELLED"}
+            ):
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO execution_intents
+                (id, session_id, strategy, instrument_key, side, status, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    payload["id"],
+                    payload["session_id"],
+                    payload["strategy"],
+                    payload["instrument_key"],
+                    payload["side"],
+                    payload["status"],
+                    json.dumps(payload),
+                ),
+            )
+        return True
+
+    def execution_intent(self, intent_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload FROM execution_intents WHERE id = ?", (intent_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def execution_intents(
+        self, session_id: str, status: Optional[str] = None, limit: int = 200
+    ) -> List[dict]:
+        limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            if status:
+                rows = self._connection.execute(
+                    """SELECT payload FROM execution_intents
+                       WHERE session_id = ? AND status = ?
+                       ORDER BY updated_at DESC LIMIT ?""",
+                    (session_id, status, limit),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """SELECT payload FROM execution_intents
+                       WHERE session_id = ? ORDER BY updated_at DESC LIMIT ?""",
+                    (session_id, limit),
+                ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def save_strategy(self, payload: dict) -> None:
         with self._lock, self._connection:

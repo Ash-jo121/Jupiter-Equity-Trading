@@ -70,6 +70,27 @@ class Settings:
     scheduler_account_prefix: str = field(
         default_factory=lambda: os.getenv("SCHEDULER_ACCOUNT_PREFIX", "auto")
     )
+    parallel_monitoring_v2: bool = field(
+        default_factory=lambda: _bool("PARALLEL_MONITORING_V2", False)
+    )
+    parallel_slot_count: int = field(
+        default_factory=lambda: int(_float("PARALLEL_SLOT_COUNT", 10))
+    )
+    parallel_candidate_pool_size: int = field(
+        default_factory=lambda: int(_float("PARALLEL_CANDIDATE_POOL_SIZE", 40))
+    )
+    parallel_lease_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_LEASE_SECONDS", 300)
+    )
+    parallel_cooldown_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_COOLDOWN_SECONDS", 600)
+    )
+    parallel_poll_interval_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_POLL_INTERVAL_SECONDS", 5)
+    )
+    parallel_survey_interval_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_SURVEY_INTERVAL_SECONDS", 285)
+    )
     us_scheduler_enabled: bool = field(
         default_factory=lambda: _bool("US_SCHEDULER_ENABLED", False)
     )

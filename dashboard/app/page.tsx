@@ -397,6 +397,47 @@ type MarketAutomation = {
     last_action?: { action?: string; detail?: string } | null;
   };
 };
+type ParallelSlot = {
+  slot_id: number;
+  instrument_key?: string | null;
+  symbol?: string | null;
+  candidate_rank?: number | null;
+  lease_remaining_seconds?: number | null;
+  near_signal: boolean;
+  protected: boolean;
+  strategies: Record<
+    "A" | "B" | "C",
+    { strategy: string; state: string; reason?: string | null }
+  >;
+};
+type ParallelCandidate = {
+  instrument_key: string;
+  symbol: string;
+  rank: number;
+  momentum_score: number;
+  relative_volume?: number | null;
+  recent_15m_change_pct?: number | null;
+};
+type ParallelPortfolio = {
+  strategy: "A" | "B" | "C";
+  entry_mode: string;
+  account_id: string;
+  initial_cash: number;
+  cash: number;
+  equity: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  fees_paid: number;
+  positions: Position[];
+};
+type ParallelDashboard = {
+  sessionId: string;
+  status: string;
+  slots: ParallelSlot[];
+  rankingVersion: number;
+  candidates: ParallelCandidate[];
+  portfolios: ParallelPortfolio[];
+};
 type Summary = {
   portfolio: {
     initial_cash: number;
@@ -635,7 +676,8 @@ export default function Home() {
   const [summary, setSummary] = useState<Summary | null>(null),
     [runs, setRuns] = useState<MomentumRun[]>([]);
   const [automation, setAutomation] = useState<MarketAutomation | null>(null);
-  const [tab, setTab] = useState<"home" | "runs" | "reports">("home"),
+  const [parallel, setParallel] = useState<ParallelDashboard | null>(null);
+  const [tab, setTab] = useState<"home" | "monitoring" | "runs" | "reports">("home"),
     [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MomentumRun | null>(null),
     [detailError, setDetailError] = useState("");
@@ -650,14 +692,37 @@ export default function Home() {
   const [cost, setCost] = useState<CostModel | null>(null);
   const refresh = useCallback(async () => {
     try {
-      const [nextSummary, nextRuns, nextAutomation] = await Promise.all([
+      const [nextSummary, nextRuns, nextAutomation, nextParallel] = await Promise.all([
         request<Summary>("/dashboard/summary?account_id=momentum"),
         request<MomentumRun[]>("/momentum-runners"),
         request<MarketAutomation>("/markets/automation").catch(() => null),
+        Promise.all([
+          request<{ session_id: string; status: string; slots: ParallelSlot[] }>(
+            "/monitoring/slots",
+          ),
+          request<{
+            session_id: string;
+            ranking_version: number;
+            candidates: ParallelCandidate[];
+          }>("/monitoring/candidates"),
+          request<{ session_id: string; portfolios: ParallelPortfolio[] }>(
+            "/paper-portfolios",
+          ),
+        ])
+          .then(([slots, candidates, portfolios]) => ({
+            sessionId: slots.session_id,
+            status: slots.status,
+            slots: slots.slots,
+            rankingVersion: candidates.ranking_version,
+            candidates: candidates.candidates,
+            portfolios: portfolios.portfolios,
+          }))
+          .catch(() => null),
       ]);
       setSummary(nextSummary);
       setRuns(nextRuns);
       setAutomation(nextAutomation);
+      setParallel(nextParallel);
       setNotice("Paper engine connected");
     } catch (error) {
       setNotice(
@@ -848,6 +913,15 @@ export default function Home() {
             Home
           </button>
           <button
+            className={tab === "monitoring" ? "active" : ""}
+            onClick={() => {
+              setTab("monitoring");
+              setSelectedRunId(null);
+            }}
+          >
+            Monitor <span>{parallel?.slots.filter((slot) => slot.instrument_key).length || 0}</span>
+          </button>
+          <button
             className={tab === "runs" ? "active" : ""}
             onClick={() => {
               setTab("runs");
@@ -902,6 +976,8 @@ export default function Home() {
           stopRun={stopRun}
           openRun={openRun}
         />
+      ) : tab === "monitoring" ? (
+        <ParallelMonitoringView data={parallel} enabled={!!automation?.NSE.enabled} />
       ) : selectedRunId ? (
         selectedRun ? (
           <RunDetail
@@ -1465,6 +1541,157 @@ function LatestRun({
       <button className="secondary" onClick={() => openRun(run.id)}>
         Review run
       </button>
+    </section>
+  );
+}
+
+function ParallelMonitoringView({
+  data,
+  enabled,
+}: {
+  data: ParallelDashboard | null;
+  enabled: boolean;
+}) {
+  if (!data) {
+    return (
+      <section className="monitoring-page">
+        <div className="page-title">
+          <div>
+            <p className="eyebrow">Parallel monitoring V2</p>
+            <h1>
+              Ten slots.
+              <br />
+              <em>Three strategies each.</em>
+            </h1>
+            <p>
+              {enabled
+                ? "Waiting for today’s NSE session and first ranked survey."
+                : "Enable PARALLEL_MONITORING_V2 with the NSE scheduler to use this architecture."}
+            </p>
+          </div>
+        </div>
+        <Empty text="No active parallel-monitoring session" />
+      </section>
+    );
+  }
+  const assigned = data.slots.filter((slot) => slot.instrument_key);
+  return (
+    <section className="monitoring-page">
+      <div className="page-title monitoring-title">
+        <div>
+          <p className="eyebrow">Parallel monitoring V2 · {data.status}</p>
+          <h1>
+            Ten live leases.
+            <br />
+            <em>One shared signal stream.</em>
+          </h1>
+          <p>
+            {assigned.length}/10 slots assigned · ranking snapshot {data.rankingVersion} ·
+            session {data.sessionId}
+          </p>
+        </div>
+      </div>
+
+      <section className="parallel-portfolios" aria-label="Strategy portfolios">
+        {data.portfolios.map((portfolio) => {
+          const pnl = portfolio.equity - portfolio.initial_cash;
+          return (
+            <article key={portfolio.strategy}>
+              <span className="strategy-letter">{portfolio.strategy}</span>
+              <div>
+                <small>{portfolio.entry_mode.replaceAll("_", " ")}</small>
+                <strong className={pnl >= 0 ? "positive" : "negative"}>
+                  {signedMoney(pnl)}
+                </strong>
+              </div>
+              <dl>
+                <div>
+                  <dt>Equity</dt>
+                  <dd>{money.format(portfolio.equity)}</dd>
+                </div>
+                <div>
+                  <dt>Open</dt>
+                  <dd>{portfolio.positions.filter((position) => position.quantity > 0).length}</dd>
+                </div>
+                <div>
+                  <dt>Fees</dt>
+                  <dd>{money.format(portfolio.fees_paid)}</dd>
+                </div>
+              </dl>
+            </article>
+          );
+        })}
+      </section>
+
+      <section className="panel slot-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Reusable worker pool</p>
+            <h2>Monitoring slots</h2>
+          </div>
+          <span className="mono">5-minute leases · 5-second quotes</span>
+        </div>
+        <div className="slot-grid">
+          {data.slots.map((slot) => (
+            <article className={`monitor-slot ${slot.protected ? "protected" : ""}`} key={slot.slot_id}>
+              <header>
+                <span>#{slot.slot_id}</span>
+                <b>{slot.symbol || "Waiting"}</b>
+                <small>{slot.candidate_rank ? `Rank ${slot.candidate_rank}` : "Unassigned"}</small>
+              </header>
+              <div className="strategy-state-row">
+                {(["A", "B", "C"] as const).map((strategy) => (
+                  <span
+                    key={strategy}
+                    data-state={slot.strategies[strategy]?.state || "WATCHING"}
+                    title={slot.strategies[strategy]?.reason || ""}
+                  >
+                    <b>{strategy}</b> {slot.strategies[strategy]?.state || "WATCHING"}
+                  </span>
+                ))}
+              </div>
+              <footer>
+                <span>{slot.near_signal ? "Near signal" : "Observing"}</span>
+                <span>
+                  {slot.lease_remaining_seconds == null
+                    ? "—"
+                    : `${Math.ceil(slot.lease_remaining_seconds)}s lease`}
+                </span>
+              </footer>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel candidate-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Waiting queue</p>
+            <h2>Ranked candidates</h2>
+          </div>
+          <span className="mono">Latest five-minute survey</span>
+        </div>
+        <div className="candidate-list">
+          {data.candidates.map((candidate) => {
+            const active = assigned.some(
+              (slot) => slot.instrument_key === candidate.instrument_key,
+            );
+            return (
+              <div key={candidate.instrument_key} className={active ? "active" : ""}>
+                <span>{candidate.rank}</span>
+                <strong>{candidate.symbol}</strong>
+                <small>{active ? "IN SLOT" : "QUEUED"}</small>
+                <b>{candidate.momentum_score.toFixed(2)}</b>
+                <em>
+                  {candidate.relative_volume == null
+                    ? "volume —"
+                    : `${candidate.relative_volume.toFixed(2)}× volume`}
+                </em>
+              </div>
+            );
+          })}
+        </div>
+      </section>
     </section>
   );
 }

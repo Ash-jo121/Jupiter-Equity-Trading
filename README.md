@@ -546,6 +546,40 @@ ruff check .
 The simulator deliberately remains separate from real broker order APIs. Upstox is used only
 for market data and instrument discovery.
 
+## Parallel monitoring V2
+
+The V2 architecture replaces three duplicate NIFTY 100 run loops with one ranked candidate
+queue and exactly ten reusable monitoring slots. Each assigned stock downloads and computes its
+completed one-minute feature snapshot once, then evaluates entry variants A, B, and C against
+that same immutable snapshot. Execution is still isolated: every strategy has its own persistent
+₹10,00,000 paper account, cash, positions, fees, fills, exits, and maximum-position limit.
+
+Enable it alongside the normal NSE scheduler:
+
+```dotenv
+SCHEDULER_ENABLED=true
+PARALLEL_MONITORING_V2=true
+```
+
+When the flag is false, the existing three-run scheduler remains unchanged. When true, the V2
+supervisor starts only on NSE trading days between 09:15 and 15:30 IST. A deployment during the
+session reloads the same dated monitoring session and persistent paper accounts; it rebuilds
+indicator state from provider candles and does not resubmit accepted execution intents.
+
+The dashboard's **Monitor** tab shows all ten leases, A/B/C state per stock, the waiting candidate
+queue, and the three paper portfolios. The bounded diagnostic endpoints are:
+
+- `GET /monitoring/slots` and `GET /monitoring/slots/{slot_id}`
+- `GET /monitoring/candidates`
+- `GET /monitoring/events`
+- `GET /monitoring/symbols/{instrument_key}`
+- `GET /execution/intents`
+- `GET /paper-portfolios`
+
+Stocks leave a slot when a weak lease expires, but a near-signal setup or any open strategy
+position protects the slot. After the last position closes, the stock enters the configured
+ten-minute cooldown and must appear in a later ranking snapshot before it can be assigned again.
+
 ### What the data says so far
 
 Measured on 337,500 real one-minute bars (60 NIFTY 100 names, 15 sessions), the variance ratio is

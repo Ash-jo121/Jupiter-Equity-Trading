@@ -158,3 +158,25 @@ Leave `SCHEDULER_ENABLED=false` locally unless you want the day's runs to fire o
 your machine. You can always drive one manually from the Home tab, preview a
 plan with `GET /schedule/plan`, advance the scheduler once with
 `POST /schedule/tick`, or build a report with `POST /reports/daily/{date}/build`.
+## Parallel monitoring V2
+
+To switch the NSE automation from the legacy three runner processes to the
+ranked ten-slot architecture, set these Railway variables and redeploy:
+
+```text
+SCHEDULER_ENABLED=true
+PARALLEL_MONITORING_V2=true
+PARALLEL_SLOT_COUNT=10
+PARALLEL_CANDIDATE_POOL_SIZE=40
+PARALLEL_LEASE_SECONDS=300
+PARALLEL_COOLDOWN_SECONDS=600
+PARALLEL_POLL_INTERVAL_SECONDS=5
+PARALLEL_SURVEY_INTERVAL_SECONDS=285
+```
+
+`PARALLEL_MONITORING_V2=false` is the rollback switch: it leaves the database
+records intact and returns the next NSE session to the existing A/B/C scheduler.
+The V2 service uses the same `SCHEDULER_INITIAL_CASH`, `SCHEDULER_ALLOCATION`,
+`SCHEDULER_MAX_POSITIONS`, NIFTY 100 source, NSE holiday calendar, and Upstox
+credentials. Do not enable both architectures in separate Railway replicas;
+run one application replica so there is one owner for the ten monitoring slots.
