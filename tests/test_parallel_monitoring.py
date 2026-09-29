@@ -244,3 +244,78 @@ def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monk
         "A",
         "C",
     }
+
+
+def test_websocket_quotes_are_filtered_and_processed_in_timestamp_order(tmp_path):
+    database = str(tmp_path / "stream.db")
+    accounts = PaperAccountManager(
+        SQLiteRepository(database),
+        initial_cash=1_000_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0, tax_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    store = ResearchStore(database)
+    engine = ParallelMonitoringEngine(
+        ParallelMonitoringConfig(
+            session_id="NSE:2026-09-30:parallel-v2",
+            session_date="2026-09-30",
+        ),
+        [SurveyInstrument("STOCK0", "NSE_EQ|000")],
+        object(),
+        accounts,
+        store,
+    )
+    clock = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)
+    engine.refresh_candidates(_rows(1), clock)
+    engine._status = "RUNNING"
+
+    assert engine.enqueue_stream_quote(Quote("NSE_EQ|999", 50, timestamp=clock)) is False
+    assert engine.enqueue_stream_quote(
+        Quote("NSE_EQ|000", 102, timestamp=clock + timedelta(seconds=2))
+    )
+    assert engine.enqueue_stream_quote(
+        Quote("NSE_EQ|000", 101, timestamp=clock + timedelta(seconds=1))
+    )
+
+    assert engine._drain_stream_quotes() == 1
+    assert engine._last_quotes["NSE_EQ|000"].last_price == 102
+    assert engine.snapshot()["data_transport"]["stream_quotes_processed"] == 1
+
+
+def test_rest_fallback_is_per_symbol_when_websocket_is_healthy(tmp_path):
+    database = str(tmp_path / "fallback.db")
+    clock = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)
+    accounts = PaperAccountManager(
+        SQLiteRepository(database),
+        initial_cash=1_000_000,
+        slippage_bps=0,
+        fee_schedule=FeeSchedule(brokerage_bps=0, tax_bps=0),
+        risk_limits=RiskLimits(),
+    )
+    engine = ParallelMonitoringEngine(
+        ParallelMonitoringConfig(
+            session_id="NSE:2026-09-30:parallel-v2",
+            session_date="2026-09-30",
+            stream_stale_seconds=15,
+        ),
+        [SurveyInstrument("STOCK0", "NSE_EQ|000")],
+        object(),
+        accounts,
+        ResearchStore(database),
+        stream_status=lambda: {
+            "state": "connected",
+            "last_message_at": clock.isoformat(),
+        },
+        now=lambda: clock,
+    )
+    engine.refresh_candidates(_rows(1), clock)
+    engine._status = "RUNNING"
+
+    assert engine._fallback_keys(["NSE_EQ|000"], clock) == ["NSE_EQ|000"]
+    assert engine.enqueue_stream_quote(Quote("NSE_EQ|000", 100, timestamp=clock))
+    assert engine._drain_stream_quotes() == 1
+    assert engine._fallback_keys(["NSE_EQ|000"], clock) == []
+    assert engine._fallback_keys(
+        ["NSE_EQ|000"], clock + timedelta(seconds=16)
+    ) == ["NSE_EQ|000"]

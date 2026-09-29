@@ -170,7 +170,10 @@ PARALLEL_SLOT_COUNT=10
 PARALLEL_CANDIDATE_POOL_SIZE=40
 PARALLEL_LEASE_SECONDS=300
 PARALLEL_COOLDOWN_SECONDS=600
+# Used only when the WebSocket or an individual symbol becomes stale.
 PARALLEL_POLL_INTERVAL_SECONDS=5
+PARALLEL_STREAM_STALE_SECONDS=15
+PARALLEL_FEATURE_REFRESH_SECONDS=1
 PARALLEL_SURVEY_INTERVAL_SECONDS=285
 ```
 
@@ -180,3 +183,11 @@ The V2 service uses the same `SCHEDULER_INITIAL_CASH`, `SCHEDULER_ALLOCATION`,
 `SCHEDULER_MAX_POSITIONS`, NIFTY 100 source, NSE holiday calendar, and Upstox
 credentials. Do not enable both architectures in separate Railway replicas;
 run one application replica so there is one owner for the ten monitoring slots.
+
+With V2 enabled, the backend opens one Upstox V3 `full` WebSocket subscription
+for NIFTY 100 plus NIFTY 50. Live confirmations and exits are tick-driven. The
+five-second REST setting is retained only for automatic per-symbol failover, so
+no additional Railway worker or replica is required, and
+`UPSTOX_STREAM_AUTO_START` does not need to be enabled separately. A token
+updated through the OAuth callback or token endpoint restarts the stream with
+the same subscriptions.

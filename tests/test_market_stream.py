@@ -158,3 +158,23 @@ def test_stream_rejects_missing_configuration() -> None:
 
     with pytest.raises(ValueError, match="UPSTOX_ACCESS_TOKEN"):
         stream.start(["NSE_EQ|TEST"])
+
+
+def test_replacing_token_restores_active_subscription() -> None:
+    created = []
+
+    def factory(token, keys, mode):
+        fake = FakeStreamer()
+        created.append((token, keys, mode, fake))
+        return fake
+
+    stream = UpstoxMarketStream("old-token", lambda _: [], streamer_factory=factory)
+    stream.start(["NSE_EQ|TEST"], "full")
+    assert created[0][3].connected.wait(timeout=1)
+
+    stream.replace_access_token("new-token")
+    assert len(created) == 2
+    assert created[1][:3] == ("new-token", ["NSE_EQ|TEST"], "full")
+    assert created[1][3].connected.wait(timeout=1)
+
+    stream.stop()

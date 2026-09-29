@@ -549,10 +549,20 @@ for market data and instrument discovery.
 ## Parallel monitoring V2
 
 The V2 architecture replaces three duplicate NIFTY 100 run loops with one ranked candidate
-queue and exactly ten reusable monitoring slots. Each assigned stock downloads and computes its
+queue and exactly ten reusable monitoring slots. One Upstox V3 full-feed WebSocket subscribes to
+the NIFTY 100, while V2 admits live ticks only for the ten assigned stocks and any protected open
+positions. Entry confirmation, paper execution and exits are therefore tick-driven rather than
+waiting for a five-second price poll. Each assigned stock still downloads and computes its
 completed one-minute feature snapshot once, then evaluates entry variants A, B, and C against
-that same immutable snapshot. Execution is still isolated: every strategy has its own persistent
+that same immutable snapshot. Execution is isolated: every strategy has its own persistent
 ₹10,00,000 paper account, cash, positions, fees, fills, exits, and maximum-position limit.
+
+The stream callback never mutates strategy state. It writes into a bounded queue consumed by the
+single V2 coordinator, which preserves per-stock event ordering and exact-once execution intent
+creation. If the socket disconnects, its messages become stale, or one monitored symbol receives
+no tick for `PARALLEL_STREAM_STALE_SECONDS`, only the affected symbols use the existing REST LTP
+path every `PARALLEL_POLL_INTERVAL_SECONDS`. Completed candle checks remain independent and run
+every `PARALLEL_FEATURE_REFRESH_SECONDS`.
 
 Enable it alongside the normal NSE scheduler:
 
@@ -598,12 +608,13 @@ check whether live conditions disagree.
 
 ### High-value next steps
 
-The `full` websocket feed already parses five levels of bid/ask depth in `market_stream.py`, but
-the runner never uses it - it REST-polls LTP. Order-flow imbalance is one of the few effects with
-documented short-horizon predictive power, and it is a different information source from the
-price autocorrelation that the data above rules out. Testing whether depth imbalance predicts the
-next thirty to sixty seconds is the highest-value unexplored question, and the observation store,
-cost model and replay harness are already built to score it honestly.
+The V2 live path now consumes the `full` websocket feed and preserves five levels of bid/ask
+depth on each quote, although the entry strategies do not yet use order-book imbalance as a
+signal. Order-flow imbalance is one of the few effects with documented short-horizon predictive
+power, and it is a different information source from the price autocorrelation that the data
+above rules out. Testing whether depth imbalance predicts the next thirty to sixty seconds is the
+highest-value unexplored question, and the observation store, cost model and replay harness are
+already built to score it honestly.
 
 Beyond that: walk-forward backtests across many stored sessions, exchange circuit limits,
 corporate actions, benchmark comparisons, and a more advanced queue/latency model.

@@ -88,6 +88,12 @@ class Settings:
     parallel_poll_interval_seconds: float = field(
         default_factory=lambda: _float("PARALLEL_POLL_INTERVAL_SECONDS", 5)
     )
+    parallel_stream_stale_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_STREAM_STALE_SECONDS", 15)
+    )
+    parallel_feature_refresh_seconds: float = field(
+        default_factory=lambda: _float("PARALLEL_FEATURE_REFRESH_SECONDS", 1)
+    )
     parallel_survey_interval_seconds: float = field(
         default_factory=lambda: _float("PARALLEL_SURVEY_INTERVAL_SECONDS", 285)
     )

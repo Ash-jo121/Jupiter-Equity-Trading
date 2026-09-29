@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, timezone
 from math import floor
+from queue import Empty, Full, Queue
 from threading import Event, RLock, Thread, current_thread
 from time import monotonic
 from typing import Callable, Iterable, Optional
@@ -46,6 +47,8 @@ class ParallelMonitoringConfig:
     lease_seconds: float = 300.0
     cooldown_seconds: float = 600.0
     poll_interval_seconds: float = 5.0
+    stream_stale_seconds: float = 15.0
+    feature_refresh_seconds: float = 1.0
     survey_interval_seconds: float = 285.0
     minimum_score: float = 0.15
     minimum_relative_volume: float = 1.2
@@ -64,6 +67,8 @@ class ParallelMonitoringConfig:
         if min(
             self.lease_seconds,
             self.poll_interval_seconds,
+            self.stream_stale_seconds,
+            self.feature_refresh_seconds,
             self.survey_interval_seconds,
             self.minimum_relative_volume,
             self.initial_cash,
@@ -94,6 +99,8 @@ class ParallelMonitoringEngine:
         quote_cache: Optional[SharedQuoteCache] = None,
         candle_cache: Optional[SharedCandleCache] = None,
         market_status_refresh: Optional[Callable[[], str]] = None,
+        stream_status: Optional[Callable[[], dict]] = None,
+        stream_quote_handler: Optional[Callable[[Quote], list]] = None,
         now: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.config = config
@@ -107,12 +114,17 @@ class ParallelMonitoringEngine:
         self.quote_cache = quote_cache or SharedQuoteCache()
         self.candle_cache = candle_cache or SharedCandleCache()
         self.market_status_refresh = market_status_refresh
+        self.stream_status = stream_status
+        self.stream_quote_handler = stream_quote_handler or self.accounts.on_quote
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._stop = Event()
         self._thread: Optional[Thread] = None
         self._scan_thread: Optional[Thread] = None
+        self._feature_thread: Optional[Thread] = None
+        self._fallback_thread: Optional[Thread] = None
         self._accept_scans = False
+        self._accept_market_data = False
         self._next_scan_at = 0.0
         self._next_market_status_at = 0.0
         self._market_status = "UNKNOWN"
@@ -122,6 +134,14 @@ class ParallelMonitoringEngine:
         self._errors: list[str] = []
         self._scan_count = 0
         self._poll_count = 0
+        self._stream_quote_count = 0
+        self._stream_drop_count = 0
+        self._rest_fallback_count = 0
+        self._last_stream_quote_at: Optional[datetime] = None
+        self._stream_seen_at: dict[str, datetime] = {}
+        self._stream_queue: Queue[Quote] = Queue(maxsize=5_000)
+        self._feature_results: Queue[tuple] = Queue(maxsize=100)
+        self._fallback_results: Queue[tuple] = Queue(maxsize=10)
         self._last_quotes: dict[str, Quote] = {}
         self._last_features: dict[str, dict] = {}
         self._setups: dict[str, PriceConfirmationSetup] = {}
@@ -177,6 +197,7 @@ class ParallelMonitoringEngine:
                 return self.snapshot()
             self._stop.clear()
             self._accept_scans = True
+            self._accept_market_data = True
             self._status = "RUNNING"
             self._started_at = self._started_at or self._now().isoformat()
             self._finished_at = None
@@ -192,6 +213,7 @@ class ParallelMonitoringEngine:
     def stop(self, reason: str = "STOPPED", liquidate: bool = True) -> dict:
         self._stop.set()
         self._accept_scans = False
+        self._accept_market_data = False
         thread = self._thread
         if thread and thread.is_alive() and thread is not current_thread():
             thread.join(timeout=max(10.0, self.config.poll_interval_seconds * 3))
@@ -249,27 +271,38 @@ class ParallelMonitoringEngine:
             self._process_quote_exits(quote)
             self._process_price_confirmation(quote)
 
-        feature_map = features or {}
-        for key in self.manager.assigned_keys():
-            snapshot = feature_map.get(key)
-            if snapshot is None and features is None:
-                try:
-                    snapshot = self.feature_engine.snapshot(key, now)
-                except Exception as error:  # noqa: BLE001 - isolate one provider read
-                    self._record(
-                        "DATA_UNAVAILABLE",
-                        {"message": str(error)[:300], "stage": "ONE_MINUTE_FEATURES"},
-                        instrument_key=key,
-                    )
-                    continue
-            if snapshot:
-                self._process_feature(snapshot)
+        self._refresh_features(now, features)
         self._emit_ready_entries(quotes)
-        completed = self.execution.drain()
-        for intent in completed:
-            self._apply_execution_result(intent)
+        self._drain_execution()
         self.manager.rebalance(now)
         self._persist()
+
+    def enqueue_stream_quote(self, quote: Quote) -> bool:
+        """Queue a WebSocket quote without mutating strategy state on the SDK thread."""
+
+        if self._status != "RUNNING":
+            return False
+        monitored = self.manager.assigned_keys()
+        with self._lock:
+            held = {key for _, key in self._open}
+        if quote.instrument_key not in monitored | held:
+            return False
+        try:
+            self._stream_queue.put_nowait(quote)
+        except Full:
+            # Prefer a recent tick over an old queued tick during an exceptional
+            # burst. Normal NIFTY 100 traffic stays far below this bound.
+            try:
+                self._stream_queue.get_nowait()
+            except Empty:
+                pass
+            self._stream_drop_count += 1
+            try:
+                self._stream_queue.put_nowait(quote)
+            except Full:
+                self._stream_drop_count += 1
+                return False
+        return True
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -282,6 +315,7 @@ class ParallelMonitoringEngine:
                 "finished_at": self._finished_at,
                 "scan_count": self._scan_count,
                 "poll_count": self._poll_count,
+                "data_transport": self._transport_snapshot(),
                 "market_status": self._market_status,
                 "errors": list(self._errors[-20:]),
                 "config": asdict(self.config),
@@ -358,29 +392,279 @@ class ParallelMonitoringEngine:
 
     def _run(self) -> None:
         self._next_scan_at = 0.0
+        next_feature_at = 0.0
+        next_fallback_at = 0.0
+        next_persist_at = 0.0
         while not self._stop.is_set():
             started = monotonic()
             try:
+                clock = self._now()
                 if started >= self._next_scan_at:
                     self._start_scan()
                     self._next_scan_at = started + self.config.survey_interval_seconds
                 if self.market_status_refresh and started >= self._next_market_status_at:
-                    self._refresh_market_status()
+                    if not self._refresh_market_status_from_stream(clock):
+                        self._refresh_market_status()
                     self._next_market_status_at = started + 60.0
-                keys = sorted(self.manager.assigned_keys())
-                if keys:
-                    quotes = self.quote_cache.get(
-                        self.market_data,
-                        [*keys, self.config.benchmark_instrument_key],
-                        max_age_seconds=self.config.poll_interval_seconds,
+
+                self._drain_stream_quotes()
+                self._drain_feature_results()
+                self._drain_fallback_results()
+                if started >= next_feature_at:
+                    self._start_feature_refresh()
+                    next_feature_at = started + self.config.feature_refresh_seconds
+
+                keys = sorted(
+                    self.manager.assigned_keys() | {key for _, key in self._open}
+                )
+                fallback_keys = self._fallback_keys(keys, clock)
+                if fallback_keys and started >= next_fallback_at:
+                    self._start_fallback_poll(fallback_keys, clock)
+                    next_fallback_at = started + self.config.poll_interval_seconds
+
+                if started >= next_persist_at:
+                    self.manager.rebalance(clock)
+                    self._drain_execution()
+                    self._persist()
+                    next_persist_at = started + min(
+                        5.0, self.config.poll_interval_seconds
                     )
-                    self.process_cycle(quotes)
             except Exception as error:  # noqa: BLE001 - the next poll can recover
                 self._errors.append(str(error)[:500])
                 self._record("WORKER_ERROR", {"message": str(error)[:500]})
                 self._persist()
-            delay = max(0.05, self.config.poll_interval_seconds - (monotonic() - started))
+            delay = max(
+                0.01,
+                min(0.25, self.config.feature_refresh_seconds)
+                - (monotonic() - started),
+            )
             self._stop.wait(delay)
+
+    def _drain_stream_quotes(self, limit: int = 1_000) -> int:
+        processed = 0
+        for _ in range(limit):
+            try:
+                quote = self._stream_queue.get_nowait()
+            except Empty:
+                break
+            previous = self._last_quotes.get(quote.instrument_key)
+            if previous and quote.timestamp < previous.timestamp:
+                continue
+            self._last_quotes[quote.instrument_key] = quote
+            self.stream_quote_handler(quote)
+            self._process_quote_exits(quote)
+            self._process_price_confirmation(quote)
+            self._emit_ready_entries({quote.instrument_key: quote})
+            self._drain_execution()
+            self._stream_quote_count += 1
+            self._last_stream_quote_at = self._now()
+            self._stream_seen_at[quote.instrument_key] = self._last_stream_quote_at
+            processed += 1
+        return processed
+
+    def _refresh_features(
+        self,
+        clock: datetime,
+        supplied: Optional[dict[str, FeatureSnapshot]] = None,
+    ) -> None:
+        feature_map = supplied or {}
+        for key in self.manager.assigned_keys():
+            snapshot = feature_map.get(key)
+            if snapshot is None and supplied is None:
+                try:
+                    snapshot = self.feature_engine.snapshot(key, clock)
+                except Exception as error:  # noqa: BLE001 - isolate one provider read
+                    self._record(
+                        "DATA_UNAVAILABLE",
+                        {"message": str(error)[:300], "stage": "ONE_MINUTE_FEATURES"},
+                        instrument_key=key,
+                    )
+                    continue
+            if snapshot:
+                self._process_feature(snapshot)
+
+    def _start_feature_refresh(self) -> None:
+        if self._feature_thread and self._feature_thread.is_alive():
+            return
+        keys = sorted(self.manager.assigned_keys())
+        if not keys:
+            return
+        self._feature_thread = Thread(
+            target=self._collect_features,
+            args=(keys,),
+            name=f"parallel-features-{self.config.session_date}",
+            daemon=True,
+        )
+        self._feature_thread.start()
+
+    def _collect_features(self, keys: list[str]) -> None:
+        for key in keys:
+            if not self._accept_market_data:
+                return
+            try:
+                # A refresh can span a minute boundary when the provider is
+                # slow, so each symbol receives a current admission clock.
+                snapshot = self.feature_engine.snapshot(key, self._now())
+                if snapshot:
+                    self._feature_results.put(("SNAPSHOT", snapshot), timeout=1)
+            except Exception as error:  # noqa: BLE001 - report on coordinator thread
+                try:
+                    self._feature_results.put(
+                        ("ERROR", key, str(error)[:300]), timeout=1
+                    )
+                except Full:
+                    return
+
+    def _drain_feature_results(self, limit: int = 100) -> int:
+        processed = 0
+        for _ in range(limit):
+            try:
+                result = self._feature_results.get_nowait()
+            except Empty:
+                break
+            if result[0] == "SNAPSHOT":
+                snapshot = result[1]
+                if snapshot.instrument_key in self.manager.assigned_keys():
+                    self._process_feature(snapshot)
+            else:
+                _, key, message = result
+                self._record(
+                    "DATA_UNAVAILABLE",
+                    {"message": message, "stage": "ONE_MINUTE_FEATURES"},
+                    instrument_key=key,
+                )
+            processed += 1
+        return processed
+
+    def _start_fallback_poll(self, keys: list[str], requested_at: datetime) -> None:
+        if self._fallback_thread and self._fallback_thread.is_alive():
+            return
+        self._fallback_thread = Thread(
+            target=self._collect_fallback_quotes,
+            args=(list(keys), requested_at),
+            name=f"parallel-rest-fallback-{self.config.session_date}",
+            daemon=True,
+        )
+        self._fallback_thread.start()
+
+    def _collect_fallback_quotes(
+        self, keys: list[str], requested_at: datetime
+    ) -> None:
+        try:
+            quotes = self.quote_cache.get(
+                self.market_data,
+                keys,
+                max_age_seconds=self.config.poll_interval_seconds,
+            )
+            result = ("QUOTES", quotes, requested_at)
+        except Exception as error:  # noqa: BLE001 - report on coordinator thread
+            result = ("ERROR", str(error)[:300])
+        if not self._accept_market_data:
+            return
+        try:
+            self._fallback_results.put(result, timeout=1)
+        except Full:
+            return
+
+    def _drain_fallback_results(self, limit: int = 10) -> int:
+        processed = 0
+        for _ in range(limit):
+            try:
+                result = self._fallback_results.get_nowait()
+            except Empty:
+                break
+            if result[0] == "QUOTES":
+                _, quotes, requested_at = result
+                active = self.manager.assigned_keys() | {key for _, key in self._open}
+                quotes = {
+                    key: quote
+                    for key, quote in quotes.items()
+                    if key in active
+                    and (
+                        key not in self._stream_seen_at
+                        or self._stream_seen_at[key] <= requested_at
+                    )
+                }
+                if quotes:
+                    self.process_cycle(quotes, features={}, clock=self._now())
+                self._rest_fallback_count += 1
+            else:
+                self._record(
+                    "DATA_UNAVAILABLE",
+                    {"message": result[1], "stage": "REST_QUOTE_FALLBACK"},
+                )
+            processed += 1
+        return processed
+
+    def _drain_execution(self) -> None:
+        for intent in self.execution.drain():
+            self._apply_execution_result(intent)
+
+    def _stream_is_healthy(self, clock: Optional[datetime] = None) -> bool:
+        if not self.stream_status:
+            return False
+        try:
+            status = self.stream_status()
+        except Exception:  # noqa: BLE001 - status failure activates REST fallback
+            return False
+        if status.get("state") != "connected" or not status.get("last_message_at"):
+            return False
+        try:
+            last_message = datetime.fromisoformat(status["last_message_at"])
+        except (TypeError, ValueError):
+            return False
+        if last_message.tzinfo is None:
+            last_message = last_message.replace(tzinfo=timezone.utc)
+        now = clock or self._now()
+        return (now - last_message).total_seconds() <= self.config.stream_stale_seconds
+
+    def _fallback_keys(self, keys: list[str], clock: datetime) -> list[str]:
+        if not keys:
+            return []
+        if not self._stream_is_healthy(clock):
+            return keys
+        return [
+            key
+            for key in keys
+            if key not in self._stream_seen_at
+            or (clock - self._stream_seen_at[key]).total_seconds()
+            > self.config.stream_stale_seconds
+        ]
+
+    def _transport_snapshot(self) -> dict:
+        status = None
+        if self.stream_status:
+            try:
+                status = self.stream_status()
+            except Exception as error:  # noqa: BLE001 - diagnostics must stay available
+                status = {"state": "error", "last_error": str(error)[:300]}
+        clock = self._now()
+        active_keys = sorted(
+            self.manager.assigned_keys() | {key for _, key in self._open}
+        )
+        stale_keys = self._fallback_keys(active_keys, clock)
+        stream_healthy = self._stream_is_healthy(clock)
+        return {
+            "primary": "UPSTOX_WEBSOCKET_V3",
+            "active": (
+                "REST_FALLBACK"
+                if not stream_healthy
+                else "HYBRID"
+                if stale_keys
+                else "WEBSOCKET"
+            ),
+            "stream": status,
+            "fallback_symbols": stale_keys,
+            "stream_quotes_processed": self._stream_quote_count,
+            "stream_quotes_dropped": self._stream_drop_count,
+            "stream_queue_depth": self._stream_queue.qsize(),
+            "last_stream_quote_at": (
+                self._last_stream_quote_at.isoformat()
+                if self._last_stream_quote_at
+                else None
+            ),
+            "rest_fallback_polls": self._rest_fallback_count,
+        }
 
     def _refresh_market_status(self) -> None:
         try:
@@ -395,6 +679,21 @@ class ParallelMonitoringEngine:
                 "DATA_UNAVAILABLE",
                 {"stage": "MARKET_STATUS", "message": str(error)[:300]},
             )
+
+    def _refresh_market_status_from_stream(self, clock: datetime) -> bool:
+        if not self.stream_status or not self._stream_is_healthy(clock):
+            return False
+        try:
+            statuses = self.stream_status().get("market_statuses", {})
+        except Exception:  # noqa: BLE001 - REST status remains the fallback
+            return False
+        status = statuses.get("NSE_EQ")
+        if not status:
+            return False
+        if status != self._market_status:
+            self._market_status = status
+            self._record("MARKET_STATUS", {"status": status, "source": "WEBSOCKET"})
+        return True
 
     def _start_scan(self) -> None:
         if self._scan_thread and self._scan_thread.is_alive():

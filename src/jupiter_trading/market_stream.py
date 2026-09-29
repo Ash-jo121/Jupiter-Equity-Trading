@@ -185,6 +185,24 @@ class UpstoxMarketStream:
             self._thread = None
         return self.status()
 
+    def replace_access_token(self, access_token: str) -> dict:
+        """Install a refreshed token and restore an existing subscription."""
+
+        if not access_token:
+            raise ValueError("UPSTOX_ACCESS_TOKEN is not configured")
+        with self._lock:
+            should_restart = self._state != "disconnected" and bool(self._instruments)
+            keys = sorted(self._instruments)
+            mode = self._mode
+        if should_restart:
+            self.stop()
+        with self._lock:
+            self._access_token = access_token
+            self._last_error = None
+        if should_restart:
+            return self.start(keys, mode)
+        return self.status()
+
     def status(self) -> dict:
         with self._lock:
             return {

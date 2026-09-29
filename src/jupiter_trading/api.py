@@ -290,6 +290,20 @@ def create_app(
         accounts.create("momentum", "Momentum research account", 100_000)
     strategies = StrategyService(accounts, research_store)
     coordinator = MarketCoordinator(accounts, strategies)
+    parallel_stream_target: dict[str, Optional[ParallelMonitoringService]] = {
+        "service": None
+    }
+
+    def _handle_stream_quote(quote: Quote) -> list:
+        # Active V2 symbols are handed off without touching paper state on the
+        # SDK thread. The V2 coordinator later invokes coordinator.on_quote in
+        # event order. Quotes outside the active slots keep the legacy path.
+        service = parallel_stream_target["service"]
+        engine = service.engine if service else None
+        if engine and engine.enqueue_stream_quote(quote):
+            return []
+        return coordinator.on_quote(quote)
+
     token_store = UpstoxTokenStore(
         research_store,
         api_key=settings.upstox_api_key,
@@ -300,7 +314,7 @@ def create_app(
     )
     market_stream = UpstoxMarketStream(
         token_store.current_token(),
-        coordinator.on_quote,
+        _handle_stream_quote,
         coordinator.update_market_status,
     )
     search_client = instrument_search or UpstoxInstrumentSearch(token_store.current_token())
@@ -547,6 +561,8 @@ def create_app(
                 lease_seconds=settings.parallel_lease_seconds,
                 cooldown_seconds=settings.parallel_cooldown_seconds,
                 poll_interval_seconds=settings.parallel_poll_interval_seconds,
+                stream_stale_seconds=settings.parallel_stream_stale_seconds,
+                feature_refresh_seconds=settings.parallel_feature_refresh_seconds,
                 survey_interval_seconds=settings.parallel_survey_interval_seconds,
                 minimum_relative_volume=1.2,
                 initial_cash=settings.scheduler_initial_cash,
@@ -564,6 +580,8 @@ def create_app(
             shared_quote_cache,
             shared_candle_cache,
             market_status_refresh=_refresh_nse_execution_status,
+            stream_status=market_stream.status,
+            stream_quote_handler=coordinator.on_quote,
         )
 
     parallel_monitoring = ParallelMonitoringService(
@@ -572,6 +590,7 @@ def create_app(
         trading_day_check=nse_holidays.is_trading_day,
         market_ready=_scheduler_market_ready,
     )
+    parallel_stream_target["service"] = parallel_monitoring
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -585,10 +604,28 @@ def create_app(
             for leg in strategy["legs"]
         ]
         startup_keys = list(dict.fromkeys(configured_keys + strategy_keys))
+        parallel_stream_enabled = (
+            settings.scheduler_enabled and settings.parallel_monitoring_v2
+        )
+        if parallel_stream_enabled:
+            startup_keys = list(
+                dict.fromkeys(
+                    startup_keys
+                    + [
+                        item["instrument_key"]
+                        for item in nifty100.constituents()
+                    ]
+                    + ["NSE_INDEX|Nifty 50"]
+                )
+            )
         if startup_keys:
             market_stream.start(
                 startup_keys,
-                "full" if strategy_keys else settings.upstox_stream_mode,
+                (
+                    "full"
+                    if strategy_keys or parallel_stream_enabled
+                    else settings.upstox_stream_mode
+                ),
             )
         scheduler.start()
         parallel_monitoring.start()
@@ -1245,6 +1282,7 @@ def create_app(
             return HTMLResponse(_auth_page(False, "no authorization code in redirect"), 400)
         try:
             status = token_store.exchange_code(code)
+            market_stream.replace_access_token(token_store.current_token())
         except UpstoxAuthError as problem:
             return HTMLResponse(_auth_page(False, str(problem)), status_code=502)
         expiry = status["expires_at_ist"] or "the provider-reported expiry"
@@ -1253,6 +1291,7 @@ def create_app(
     @app.put("/auth/upstox/token")
     def set_upstox_token(request: UpstoxTokenRequest) -> dict:
         token_store.set_token(request.access_token)
+        market_stream.replace_access_token(token_store.current_token())
         return token_store.status()
 
     @app.get("/schedule/status")
@@ -1273,10 +1312,12 @@ def create_app(
     @app.get("/monitoring/slots")
     def monitoring_slots() -> dict:
         engine = _parallel_engine()
+        state = engine.snapshot()
         return {
             "session_id": engine.config.session_id,
-            "status": engine.snapshot()["status"],
-            "slots": engine.slots(),
+            "status": state["status"],
+            "data_transport": state["data_transport"],
+            "slots": state["monitoring"]["slots"],
         }
 
     @app.get("/monitoring/slots/{slot_id}")

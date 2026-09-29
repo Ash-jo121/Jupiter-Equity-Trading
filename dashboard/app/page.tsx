@@ -433,6 +433,12 @@ type ParallelPortfolio = {
 type ParallelDashboard = {
   sessionId: string;
   status: string;
+  transport?: {
+    active: "WEBSOCKET" | "HYBRID" | "REST_FALLBACK";
+    stream_quotes_processed: number;
+    stream_quotes_dropped: number;
+    rest_fallback_polls: number;
+  };
   slots: ParallelSlot[];
   rankingVersion: number;
   candidates: ParallelCandidate[];
@@ -697,7 +703,12 @@ export default function Home() {
         request<MomentumRun[]>("/momentum-runners"),
         request<MarketAutomation>("/markets/automation").catch(() => null),
         Promise.all([
-          request<{ session_id: string; status: string; slots: ParallelSlot[] }>(
+          request<{
+            session_id: string;
+            status: string;
+            data_transport?: ParallelDashboard["transport"];
+            slots: ParallelSlot[];
+          }>(
             "/monitoring/slots",
           ),
           request<{
@@ -712,6 +723,7 @@ export default function Home() {
           .then(([slots, candidates, portfolios]) => ({
             sessionId: slots.session_id,
             status: slots.status,
+            transport: slots.data_transport,
             slots: slots.slots,
             rankingVersion: candidates.ranking_version,
             candidates: candidates.candidates,
@@ -1629,7 +1641,13 @@ function ParallelMonitoringView({
             <p className="eyebrow">Reusable worker pool</p>
             <h2>Monitoring slots</h2>
           </div>
-          <span className="mono">5-minute leases · 5-second quotes</span>
+          <span className="mono">
+            5-minute leases · {data.transport?.active === "WEBSOCKET"
+              ? "live ticks"
+              : data.transport?.active === "HYBRID"
+                ? "live ticks + fallback"
+                : "REST fallback"}
+          </span>
         </div>
         <div className="slot-grid">
           {data.slots.map((slot) => (
