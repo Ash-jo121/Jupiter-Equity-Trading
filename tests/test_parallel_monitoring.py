@@ -12,6 +12,7 @@ from jupiter_trading.paper_broker import FeeSchedule, RiskLimits
 from jupiter_trading.parallel_monitoring import (
     ParallelMonitoringConfig,
     ParallelMonitoringEngine,
+    build_monitoring_strategy_run,
 )
 from jupiter_trading.repository import SQLiteRepository
 from jupiter_trading.research_store import ResearchStore
@@ -133,6 +134,7 @@ def test_monitoring_state_and_events_round_trip(tmp_path):
     )
 
     assert store.monitoring_session(state["id"]) == state
+    assert store.monitoring_sessions() == [state]
     events = store.monitoring_events(state["id"], instrument_key="NSE_EQ|001")
     assert events[0]["sequence"] == sequence
     assert events[0]["type"] == "SLOT_ASSIGNED"
@@ -232,6 +234,13 @@ def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monk
     assert accounts.get(engine.account_id("C")).positions["NSE_EQ|000"].quantity > 0
     assert accounts.get(engine.account_id("B")).positions.get("NSE_EQ|000") is None
 
+    archived = {run["variant_label"]: run for run in store.momentum_runs()}
+    assert set(archived) == {"A", "B", "C"}
+    assert archived["A"]["config"]["signal_strategy"] == "MACD_EARLY"
+    assert archived["A"]["fills"][0]["symbol"] == "STOCK0"
+    assert archived["B"]["fills"] == []
+    assert archived["C"]["config"]["data_transport"] == "UPSTOX_WEBSOCKET_V3"
+
     restored = ParallelMonitoringEngine(
         engine.config,
         [SurveyInstrument("STOCK0", "NSE_EQ|000")],
@@ -244,6 +253,12 @@ def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monk
         "A",
         "C",
     }
+
+    historical = build_monitoring_strategy_run(
+        store.monitoring_session(engine.config.session_id), "A", accounts, store
+    )
+    assert historical["id"] == f"{engine.config.session_id}:A"
+    assert historical["portfolio"]["positions"][0]["symbol"] == "STOCK0"
 
 
 def test_websocket_quotes_are_filtered_and_processed_in_timestamp_order(tmp_path):

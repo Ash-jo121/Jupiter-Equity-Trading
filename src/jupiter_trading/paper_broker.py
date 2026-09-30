@@ -318,6 +318,21 @@ class PaperBroker:
                 "positions": positions,
             }
 
+    def strategy_executions(self, strategy_id: str) -> dict:
+        """Return a consistent order/fill view for one strategy run."""
+
+        with self._lock:
+            orders = [
+                order.to_dict()
+                for order in self.orders.values()
+                if order.strategy_id == strategy_id
+            ]
+            order_ids = {order["id"] for order in orders}
+            fills = [
+                fill.to_dict() for fill in self.fills if fill.order_id in order_ids
+            ]
+            return {"orders": orders, "fills": fills}
+
     def _book_from_quote(self, quote: Quote) -> Tuple[List[List[float]], List[List[float]]]:
         bids = [[level.price, float(level.quantity)] for level in quote.bids]
         asks = [[level.price, float(level.quantity)] for level in quote.asks]

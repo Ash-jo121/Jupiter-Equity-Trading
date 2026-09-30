@@ -28,13 +28,215 @@ from .market_data import SharedCandleCache, SharedQuoteCache, UpstoxMarketData
 from .monitoring_manager import STRATEGIES, MonitoringManager
 from .research_store import ResearchStore
 from .survey import SharedSurveyCache, SurveyInstrument
-from .trade_rules import ExitPolicy, RatchetExit, breakeven_pct
+from .trade_rules import ExitPolicy, RatchetExit, breakeven_pct, cost_model
 
 STRATEGY_MODES = {
     "A": MACD_EARLY,
     "B": MACD_EARLY_PRICE_CONFIRM,
     "C": MACD_FRESH_CONFIRMED,
 }
+
+
+def build_monitoring_strategy_run(
+    session: dict,
+    strategy: str,
+    accounts: PaperAccountManager,
+    store: ResearchStore,
+) -> dict:
+    """Project one V2 strategy portfolio into the existing run-report contract."""
+
+    if strategy not in STRATEGIES:
+        raise ValueError("unknown strategy")
+    session_id = session["id"]
+    config = session.get("config", {})
+    stored_portfolio = next(
+        (
+            item
+            for item in session.get("paper_portfolios", [])
+            if item.get("strategy") == strategy
+        ),
+        {},
+    )
+    account_id = stored_portfolio.get("account_id") or (
+        f"{config.get('account_prefix', 'parallel')}-"
+        f"{session.get('session_date')}-{strategy.lower()}"
+    )
+    broker = accounts.get(account_id)
+    portfolio = broker.snapshot()
+    executions = broker.strategy_executions(f"{session_id}:{strategy}")
+    intents = [
+        intent
+        for intent in store.execution_intents(session_id, limit=1000)
+        if intent.get("strategy") == strategy
+    ]
+    intents_by_order = {
+        intent.get("order", {}).get("id"): intent
+        for intent in intents
+        if intent.get("order", {}).get("id")
+    }
+    symbols = {
+        item.get("instrument_key"): item.get("symbol")
+        for item in session.get("candidate_queue", {}).get("candidates", [])
+        if item.get("instrument_key") and item.get("symbol")
+    }
+    symbols.update(
+        {
+            intent.get("instrument_key"): intent.get("symbol")
+            for intent in intents
+            if intent.get("instrument_key") and intent.get("symbol")
+        }
+    )
+    symbols.update(
+        {
+            item.get("instrument_key"): item.get("symbol")
+            for item in session.get("open_positions", [])
+            if item.get("instrument_key") and item.get("symbol")
+        }
+    )
+    fills = [
+        {
+            **fill,
+            "symbol": symbols.get(fill["instrument_key"], fill["instrument_key"]),
+        }
+        for fill in executions["fills"]
+    ]
+    enriched_positions = [
+        {
+            **position,
+            "symbol": symbols.get(
+                position["instrument_key"], position["instrument_key"]
+            ),
+        }
+        for position in portfolio["positions"]
+    ]
+    portfolio = {**portfolio, "positions": enriched_positions}
+    events = []
+    for fill in fills:
+        intent = intents_by_order.get(fill.get("order_id"), {})
+        metadata = intent.get("metadata", {})
+        event = {
+            "type": "ENTRY_FILLED" if fill["side"] == "BUY" else "EXIT_FILLED",
+            "timestamp": fill["timestamp"],
+            "instrument_key": fill["instrument_key"],
+            "symbol": fill["symbol"],
+            "reason": intent.get("reason", "PAPER_FILL"),
+            "observed_price": intent.get("observed_price", fill["price"]),
+            "entry_price": fill["price"],
+        }
+        if fill["side"] == "BUY":
+            event["entry_signal"] = {
+                "reason": intent.get("reason", "PAPER_FILL"),
+                "observed_price": intent.get("observed_price", fill["price"]),
+                "market_alignment": "RECORDED_NOT_GATED",
+                "structural_stop": metadata.get("structural_stop"),
+                "intent": metadata,
+            }
+        else:
+            event["exit_state"] = metadata.get("exit_state")
+        events.append(event)
+    events.sort(key=lambda item: item["timestamp"])
+    gross_pnl = float(portfolio["realized_pnl"]) + float(
+        portfolio["unrealized_pnl"]
+    )
+    fees = sum(fill["fees"] for fill in fills)
+    initial_cash = float(portfolio["initial_cash"])
+    exit_policy = ExitPolicy()
+    duration_seconds = 375 * 60
+    return {
+        "id": f"{session_id}:{strategy}",
+        "experiment_id": session_id,
+        "session_id": session_id,
+        "variant_label": strategy,
+        "shared_config_hash": "parallel-monitoring-v2",
+        "status": session.get("status", "DRAFT"),
+        "started_at": session.get("started_at"),
+        "finished_at": session.get("finished_at"),
+        "stop_reason": None,
+        "config": {
+            "account_id": account_id,
+            "signal_strategy": STRATEGY_MODES[strategy],
+            "duration_seconds": duration_seconds,
+            "poll_interval_seconds": config.get("poll_interval_seconds", 5),
+            "rescan_interval_seconds": config.get("survey_interval_seconds", 285),
+            "max_positions": config.get("max_positions_per_strategy", 2),
+            "allocation_per_position": config.get("allocation_per_position", 25_000),
+            "candidate_limit": config.get("slot_count", 10),
+            "minimum_score": config.get("minimum_score", 0.15),
+            "minimum_relative_volume": config.get("minimum_relative_volume", 1.2),
+            "entry_momentum_pct": 0.1,
+            "reversal_pct": 0.1,
+            "hard_stop_pct": 0.35,
+            "universe_name": "NIFTY 100",
+            "universe_size": 100,
+            "entry_mode": "THREE_BAR",
+            "exit_mode": "RATCHET",
+            "entry_bars": 3,
+            "require_nifty_confirmation": False,
+            "entry_cost_multiple": 1.0,
+            "entry_noise_multiple": 2.0,
+            "entry_timeframe_seconds": 60,
+            "survive_stop_multiple": exit_policy.survive_stop_multiple,
+            "lock_multiple": exit_policy.lock_multiple,
+            "ride_multiple": exit_policy.ride_multiple,
+            "min_gap_multiple": exit_policy.min_gap_multiple,
+            "trail_window": exit_policy.trail_window,
+            "fast_trail_window": exit_policy.fast_trail_window,
+            "volume_decay_ratio": exit_policy.volume_decay_ratio,
+            "confirmation_samples": exit_policy.confirmation_samples,
+            "time_stop_seconds": exit_policy.time_stop_seconds,
+            "market_code": "NSE",
+            "market_timezone": config.get("market_timezone", "Asia/Kolkata"),
+            "currency": "INR",
+            "broker_provider": "INTERNAL_PAPER",
+            "benchmark_instrument_key": config.get(
+                "benchmark_instrument_key", "NSE_INDEX|Nifty 50"
+            ),
+            "benchmark_symbol": "NIFTY 50",
+            "execution_segment": "NSE_EQ",
+            "data_transport": "UPSTOX_WEBSOCKET_V3",
+        },
+        "cost_model": cost_model(
+            float(config.get("allocation_per_position", 25_000)),
+            broker.fee_schedule,
+            broker.slippage_bps,
+            Product.INTRADAY,
+        ),
+        "decision_counts": [],
+        "initial_equity": initial_cash,
+        "scan_count": int(session.get("scan_count", 0)),
+        "poll_count": int(
+            session.get("data_transport", {}).get("stream_quotes_processed", 0)
+        ),
+        "candidates": list(
+            session.get("candidate_queue", {}).get("candidates", [])
+        ),
+        "open_positions": [
+            item
+            for item in session.get("open_positions", [])
+            if item.get("strategy") == strategy
+        ],
+        "completed_instruments": sorted(
+            {fill["instrument_key"] for fill in fills if fill["side"] == "SELL"}
+        ),
+        "pending_setups": [],
+        "pending_entry_intents": [],
+        "pending_signal_exits": [],
+        "ratchet_states": {},
+        "events": events,
+        "monitoring": [],
+        "monitoring_count": 0,
+        "errors": list(session.get("errors", [])),
+        "warnings": [],
+        "market_status": session.get("market_status", "UNKNOWN"),
+        "fills": fills,
+        "metrics": {
+            "gross_pnl": round(gross_pnl, 2),
+            "fees": round(fees, 2),
+            "net_pnl": round(gross_pnl - fees, 2),
+        },
+        "portfolio": portfolio,
+        "session_pnl": round(float(portfolio["equity"]) - initial_cash, 2),
+    }
 
 
 @dataclass(frozen=True)
@@ -1232,7 +1434,17 @@ class ParallelMonitoringEngine:
         )
 
     def _persist(self) -> None:
-        self.store.save_monitoring_session(self.snapshot())
+        snapshot = self.snapshot()
+        self.store.save_monitoring_session(snapshot)
+        for strategy in STRATEGIES:
+            self.store.save_momentum_run(
+                build_monitoring_strategy_run(
+                    snapshot,
+                    strategy,
+                    self.accounts,
+                    self.store,
+                )
+            )
 
     def _restore(self) -> None:
         saved = self.store.monitoring_session(self.config.session_id)

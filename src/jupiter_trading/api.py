@@ -41,6 +41,7 @@ from .parallel_monitoring import (
     ParallelMonitoringConfig,
     ParallelMonitoringEngine,
     ParallelMonitoringService,
+    build_monitoring_strategy_run,
 )
 from .repository import SQLiteRepository
 from .research_store import ResearchStore
@@ -323,6 +324,24 @@ def create_app(
     nifty50 = Nifty50Universe()
     nifty100 = Nifty100Universe()
     nasdaq100 = Nasdaq100Universe()
+    # Parallel Monitoring V2 stores its operational state separately from the
+    # report archive. Materialize both historical and current V2 sessions into
+    # the existing Runs contract so a deployment cannot make them invisible.
+    for monitoring_session in research_store.monitoring_sessions():
+        for strategy in ("A", "B", "C"):
+            try:
+                research_store.save_momentum_run(
+                    build_monitoring_strategy_run(
+                        monitoring_session,
+                        strategy,
+                        accounts,
+                        research_store,
+                    )
+                )
+            except (KeyError, ValueError):
+                # Ignore incomplete pre-release sessions whose paper accounts
+                # were never created; valid sessions are still backfilled.
+                continue
     momentum_runners = MomentumRunnerService(research_store)
     shared_survey_cache = SharedSurveyCache()
     shared_quote_cache = SharedQuoteCache()

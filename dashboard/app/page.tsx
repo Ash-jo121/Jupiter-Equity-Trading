@@ -361,6 +361,7 @@ type MomentumRun = {
     volume_decay_ratio?: number;
     confirmation_samples?: number;
     time_stop_seconds?: number;
+    data_transport?: string;
   };
   metrics?: { gross_pnl: number; fees: number; net_pnl: number };
   cost_model?: CostModel;
@@ -1902,7 +1903,10 @@ function RunDetail({ run, back }: { run: MomentumRun; back: () => void }) {
           <h1>{formatDate(run.started_at)}</h1>
           <p>
             {number.format(duration)} minutes · {run.scan_count}{" "}
-            {universeName(run)} survey cycles · {run.poll_count} price polls
+            {universeName(run)} survey cycles · {run.poll_count}{" "}
+            {run.config.data_transport === "UPSTOX_WEBSOCKET_V3"
+              ? "live ticks"
+              : "price polls"}
           </p>
         </div>
         <div className={`result-orb ${run.session_pnl >= 0 ? "gain" : "loss"}`}>

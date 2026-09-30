@@ -208,6 +208,16 @@ class ResearchStore:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def monitoring_sessions(self, limit: int = 100) -> List[dict]:
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT payload FROM monitoring_sessions
+                   ORDER BY session_date DESC, updated_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def add_monitoring_event(
         self,
         session_id: str,
