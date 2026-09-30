@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 from jupiter_trading.accounts import PaperAccountManager
 from jupiter_trading.candidate_queue import CandidateQueue
@@ -12,6 +13,7 @@ from jupiter_trading.paper_broker import FeeSchedule, RiskLimits
 from jupiter_trading.parallel_monitoring import (
     ParallelMonitoringConfig,
     ParallelMonitoringEngine,
+    ParallelMonitoringService,
     build_monitoring_strategy_run,
 )
 from jupiter_trading.repository import SQLiteRepository
@@ -334,3 +336,31 @@ def test_rest_fallback_is_per_symbol_when_websocket_is_healthy(tmp_path):
     assert engine._fallback_keys(
         ["NSE_EQ|000"], clock + timedelta(seconds=16)
     ) == ["NSE_EQ|000"]
+
+
+def test_parallel_supervisor_passes_iso_date_to_trading_calendar():
+    started = Event()
+    checked_dates = []
+
+    class Engine:
+        config = type("Config", (), {"session_date": "2026-09-30"})()
+
+        def start(self):
+            started.set()
+
+        def snapshot(self):
+            return {"status": "COMPLETED"}
+
+    service = ParallelMonitoringService(
+        enabled=True,
+        engine_factory=lambda _session_date: Engine(),
+        trading_day_check=lambda session_date: checked_dates.append(session_date)
+        or True,
+        market_ready=lambda: True,
+        now=lambda: datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc),
+    )
+    service.start()
+    assert started.wait(1)
+    service.stop()
+
+    assert checked_dates == ["2026-09-30"]

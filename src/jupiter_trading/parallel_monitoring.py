@@ -1615,7 +1615,7 @@ class ParallelMonitoringService:
         self,
         enabled: bool,
         engine_factory: Callable[[str], ParallelMonitoringEngine],
-        trading_day_check: Callable[[object], bool],
+        trading_day_check: Callable[[str], bool],
         market_ready: Callable[[], bool],
         now: Optional[Callable[[], datetime]] = None,
     ) -> None:
@@ -1667,13 +1667,20 @@ class ParallelMonitoringService:
             open_window = time(9, 15) <= now.time() < time(15, 30)
             engine = self.engine
             needs_session = engine is None or engine.config.session_date != now.date().isoformat()
-            if open_window and self.trading_day_check(now.date()) and needs_session:
+            try:
+                trading_day = self.trading_day_check(now.date().isoformat())
+            except Exception as error:  # noqa: BLE001 - keep the supervisor alive
+                self._last_error = str(error)[:500]
+                self._stop.wait(15)
+                continue
+            if open_window and trading_day and needs_session:
                 if self.market_ready():
                     try:
                         candidate = self.engine_factory(now.date().isoformat())
                         with self._lock:
                             self._engine = candidate
                         candidate.start()
+                        self._last_error = None
                     except Exception as error:  # noqa: BLE001 - retry transient startup failures
                         # Retry on the next supervisor pass; engine events cannot
                         # be recorded before a session exists.
