@@ -608,6 +608,7 @@ def create_app(
         engine_factory=_parallel_engine_factory,
         trading_day_check=nse_holidays.is_trading_day,
         market_ready=_scheduler_market_ready,
+        stream_recovery=market_stream.ensure_connected,
     )
     parallel_stream_target["service"] = parallel_monitoring
 

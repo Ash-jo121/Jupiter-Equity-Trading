@@ -191,3 +191,13 @@ no additional Railway worker or replica is required, and
 `UPSTOX_STREAM_AUTO_START` does not need to be enabled separately. A token
 updated through the OAuth callback or token endpoint restarts the stream with
 the same subscriptions.
+
+Stream recovery and candle-timing diagnostics require only the updated backend;
+no new environment variables, database migration, frontend deployment, or extra
+worker is needed. After deploying, during an NSE session check
+`GET /market/stream/status` for a connected state and an advancing
+`last_message_at`. In `GET /monitoring/events`, new `SIGNAL_EVALUATED` events
+contain a `timing` breakdown and `decision_reason` (including `STALE_SIGNAL_BAR`).
+The existing 15-second signal-age cutoff is retained. If candles still arrive
+late, use these measurements to identify provider response delays before
+changing entry rules or loosening freshness safeguards.

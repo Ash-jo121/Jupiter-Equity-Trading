@@ -129,6 +129,11 @@ class UpstoxMarketStream:
         self._market_status_handler = market_status_handler
         self._streamer_factory = streamer_factory or _official_streamer
         self._lock = RLock()
+        self._lifecycle_lock = RLock()
+        self._generation = 0
+        self._desired = False
+        self._last_started_at: Optional[datetime] = None
+        self._recovery_attempts = 0
         self._streamer = None
         self._thread: Optional[Thread] = None
         self._state = "disconnected"
@@ -142,6 +147,10 @@ class UpstoxMarketStream:
         self._last_error: Optional[str] = None
 
     def start(self, instrument_keys: Iterable[str], mode: str = "full") -> dict:
+        with self._lifecycle_lock:
+            return self._start(instrument_keys, mode)
+
+    def _start(self, instrument_keys: Iterable[str], mode: str) -> dict:
         keys = list(dict.fromkeys(key.strip() for key in instrument_keys if key.strip()))
         if not self._access_token:
             raise ValueError("UPSTOX_ACCESS_TOKEN is not configured")
@@ -156,9 +165,14 @@ class UpstoxMarketStream:
             self._instruments = set(keys)
             self._mode = mode
             self._last_error = None
+            self._desired = True
+            self._generation += 1
+            self._last_started_at = datetime.now(timezone.utc)
+            self._last_message_at = None
+            self._market_statuses = {}
             self._thread = Thread(
                 target=self._run,
-                args=(keys, mode),
+                args=(keys, mode, self._generation),
                 name="upstox-market-stream",
                 daemon=True,
             )
@@ -166,11 +180,15 @@ class UpstoxMarketStream:
         return self.status()
 
     def stop(self) -> dict:
+        with self._lifecycle_lock:
+            return self._stop()
+
+    def _stop(self) -> dict:
         with self._lock:
+            self._desired = False
+            self._generation += 1
             streamer = self._streamer
             thread = self._thread
-            if self._state == "disconnected":
-                return self.status()
             self._state = "stopping"
         if streamer:
             try:
@@ -186,12 +204,16 @@ class UpstoxMarketStream:
         return self.status()
 
     def replace_access_token(self, access_token: str) -> dict:
+        with self._lifecycle_lock:
+            return self._replace_access_token(access_token)
+
+    def _replace_access_token(self, access_token: str) -> dict:
         """Install a refreshed token and restore an existing subscription."""
 
         if not access_token:
             raise ValueError("UPSTOX_ACCESS_TOKEN is not configured")
         with self._lock:
-            should_restart = self._state != "disconnected" and bool(self._instruments)
+            should_restart = self._desired and bool(self._instruments)
             keys = sorted(self._instruments)
             mode = self._mode
         if should_restart:
@@ -202,6 +224,27 @@ class UpstoxMarketStream:
         if should_restart:
             return self.start(keys, mode)
         return self.status()
+
+    def ensure_connected(self) -> dict:
+        """Called by the NSE supervisor during trading hours, including each new day."""
+        with self._lifecycle_lock:
+            now = datetime.now(timezone.utc)
+            with self._lock:
+                if not self._desired or not self._instruments:
+                    return self.status()
+                since_start = (now - self._last_started_at).total_seconds()
+                silence = (now - (self._last_message_at or self._last_started_at)).total_seconds()
+                if self._state == "connected" and silence < 60:
+                    return self.status()
+                # Give SDK reconnects time to finish, and bound fresh connection
+                # attempts to at most one per minute during an outage.
+                backoff = 120 if self._state in {"connecting", "reconnecting"} else 60
+                if since_start < backoff:
+                    return self.status()
+                keys, mode = sorted(self._instruments), self._mode
+                self._recovery_attempts += 1
+            self.stop()
+            return self.start(keys, mode)
 
     def status(self) -> dict:
         with self._lock:
@@ -217,31 +260,53 @@ class UpstoxMarketStream:
                     self._last_message_at.isoformat() if self._last_message_at else None
                 ),
                 "last_error": self._last_error,
+                "recovery_attempts": self._recovery_attempts,
+                "last_connection_attempt_at": (
+                    self._last_started_at.isoformat() if self._last_started_at else None
+                ),
             }
 
-    def _run(self, keys: List[str], mode: str) -> None:
+    def _run(self, keys: List[str], mode: str, generation: int) -> None:
         try:
             streamer = self._streamer_factory(self._access_token, keys, mode)
             with self._lock:
+                if generation != self._generation:
+                    return
                 self._streamer = streamer
-            streamer.on("open", self._on_open)
-            streamer.on("message", self._on_message)
-            streamer.on("error", self._on_error)
-            streamer.on("close", self._on_close)
-            streamer.on("reconnecting", self._on_reconnecting)
-            streamer.on("autoReconnectStopped", self._on_reconnect_stopped)
+
+            def guarded(callback):
+                def deliver(*args):
+                    with self._lock:
+                        if generation != self._generation:
+                            return
+                    callback(*args)
+                return deliver
+
+            streamer.on("open", guarded(self._on_open))
+            streamer.on("message", guarded(self._on_message))
+            streamer.on("error", guarded(self._on_error))
+            streamer.on("close", guarded(self._on_close))
+            streamer.on("reconnecting", guarded(self._on_reconnecting))
+            streamer.on("autoReconnectStopped", guarded(self._on_reconnect_stopped))
             streamer.auto_reconnect(True, 10, 10)
             streamer.connect()
-        except Exception as error:  # noqa: BLE001 - SDK/network boundary
-            self._set_error(error)
-        finally:
+            # stop/token replacement may race with a slow connect call. Do not
+            # leave that superseded SDK socket running after connect returns.
             with self._lock:
-                if self._state not in {"error", "stopping"}:
-                    self._state = "disconnected"
+                superseded = generation != self._generation
+            if superseded:
+                streamer.disconnect()
+        except Exception as error:  # noqa: BLE001 - SDK/network boundary
+            with self._lock:
+                if generation == self._generation:
+                    self._set_error(error)
+        # The official SDK connect() returns after launching its own socket
+        # thread. Only callbacks may determine the connection state.
 
     def _on_open(self, *_) -> None:
         with self._lock:
             self._state = "connected"
+            self._last_error = None
 
     def _on_message(self, message: dict, *_) -> None:
         statuses = parse_market_statuses(message)

@@ -151,6 +151,8 @@ class _CandleCacheEntry:
     received_at: datetime
     candles: List[Candle]
     retry_after: datetime
+    requested_at: datetime
+    request_seconds: float
 
 
 class SharedCandleCache:
@@ -184,11 +186,13 @@ class SharedCandleCache:
         now = clock or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
-        generation = int(now.timestamp() // 60)
+        anchor, started = now, monotonic()
         key = (instrument_key, "minutes", 1)
-        expected_start = self._expected_latest_start(now, finalization_grace_seconds)
         with self._condition:
             while True:
+                now = anchor + timedelta(seconds=monotonic() - started)
+                generation = int(now.timestamp() // 60)
+                expected_start = self._expected_latest_start(now, finalization_grace_seconds)
                 cached = self._entries.get(key)
                 cached_latest = self._latest_start(cached.candles) if cached else None
                 cached_complete = bool(
@@ -201,6 +205,8 @@ class SharedCandleCache:
                     return {
                         "candles": list(cached.candles),
                         "received_at": cached.received_at,
+                        "requested_at": cached.requested_at,
+                        "request_seconds": cached.request_seconds,
                         "cache_hit": True,
                         "generation": generation,
                         "complete": cached_complete,
@@ -217,21 +223,37 @@ class SharedCandleCache:
                     break
                 self._condition.wait()
         try:
+            requested_at = now
+            request_started = monotonic()
             candles = market_data.intraday_candles(instrument_key, "minutes", 1)
-            received_at = datetime.now(timezone.utc)
+            request_seconds = monotonic() - request_started
+            received_at = anchor + timedelta(seconds=monotonic() - started)
+            # Never cache a forming bar and later promote that partial OHLCV to
+            # a completed candle merely because the clock has advanced. Use
+            # request time: a response crossing the boundary may still contain
+            # the provider's pre-close snapshot.
+            candles = [
+                candle for candle in candles
+                if candle.timestamp + timedelta(seconds=60 + finalization_grace_seconds)
+                <= requested_at
+            ]
             latest = self._latest_start(candles)
             complete = bool(latest is not None and latest >= expected_start)
             entry = _CandleCacheEntry(
                 generation=generation,
                 received_at=received_at,
                 candles=list(candles),
-                retry_after=now + timedelta(seconds=max(0.25, retry_after_seconds)),
+                retry_after=received_at + timedelta(seconds=max(0.25, retry_after_seconds)),
+                requested_at=requested_at,
+                request_seconds=request_seconds,
             )
             with self._condition:
                 self._entries[key] = entry
             return {
                 "candles": list(candles),
                 "received_at": received_at,
+                "requested_at": requested_at,
+                "request_seconds": request_seconds,
                 "cache_hit": False,
                 "generation": generation,
                 "complete": complete,
@@ -283,7 +305,8 @@ class SharedCandleCache:
             selected = sorted(candles, key=lambda item: item.timestamp)[-bars:]
             received_at = datetime.now(timezone.utc)
             with self._condition:
-                self._warmups[key] = (received_at, list(selected))
+                if selected:
+                    self._warmups[key] = (received_at, list(selected))
             return {
                 "candles": list(selected),
                 "received_at": received_at,

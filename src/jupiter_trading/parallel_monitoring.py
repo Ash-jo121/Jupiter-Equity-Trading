@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, timezone
 from math import floor
@@ -683,7 +684,7 @@ class ParallelMonitoringEngine:
                     )
                     continue
             if snapshot:
-                self._process_feature(snapshot)
+                self._process_feature(snapshot, clock)
 
     def _start_feature_refresh(self) -> None:
         if self._feature_thread and self._feature_thread.is_alive():
@@ -700,22 +701,25 @@ class ParallelMonitoringEngine:
         self._feature_thread.start()
 
     def _collect_features(self, keys: list[str]) -> None:
-        for key in keys:
-            if not self._accept_market_data:
-                return
+        if not keys:
+            return
+        with ThreadPoolExecutor(max_workers=min(4, len(keys))) as pool:
+            futures = [pool.submit(self._collect_symbol_feature, key) for key in keys]
+            for future in as_completed(futures):
+                future.result()
+
+    def _collect_symbol_feature(self, key: str) -> None:
+        if not self._accept_market_data:
+            return
+        try:
+            snapshot = self.feature_engine.snapshot(key, self._now())
+            if snapshot:
+                self._feature_results.put(("SNAPSHOT", snapshot), timeout=1)
+        except Exception as error:  # noqa: BLE001 - report on coordinator thread
             try:
-                # A refresh can span a minute boundary when the provider is
-                # slow, so each symbol receives a current admission clock.
-                snapshot = self.feature_engine.snapshot(key, self._now())
-                if snapshot:
-                    self._feature_results.put(("SNAPSHOT", snapshot), timeout=1)
-            except Exception as error:  # noqa: BLE001 - report on coordinator thread
-                try:
-                    self._feature_results.put(
-                        ("ERROR", key, str(error)[:300]), timeout=1
-                    )
-                except Full:
-                    return
+                self._feature_results.put(("ERROR", key, str(error)[:300]), timeout=1)
+            except Full:
+                return
 
     def _drain_feature_results(self, limit: int = 100) -> int:
         processed = 0
@@ -939,9 +943,19 @@ class ParallelMonitoringEngine:
                 "DATA_UNAVAILABLE", {"stage": "SURVEY", "message": str(error)[:500]}
             )
 
-    def _process_feature(self, snapshot: FeatureSnapshot) -> None:
+    def _process_feature(
+        self, snapshot: FeatureSnapshot, clock: Optional[datetime] = None
+    ) -> None:
+        processed_at = clock or self._now()
+        age_seconds = (processed_at - snapshot.features.bar_end).total_seconds()
+        stale = snapshot.stale or age_seconds > self.signal_config.max_signal_bar_age_seconds
         key = snapshot.instrument_key
         self._last_features[key] = snapshot.to_dict()
+        self._last_features[key].update(
+            stale=stale,
+            processed_at=processed_at.isoformat(),
+            candle_age_at_evaluation_seconds=age_seconds,
+        )
         feature_limit = self.config.candidate_pool_size + self.config.slot_count
         while len(self._last_features) > feature_limit:
             protected = self.manager.assigned_keys() | {
@@ -991,7 +1005,22 @@ class ParallelMonitoringEngine:
                     "bar_id": snapshot.bar_id,
                     "shared_feature_bar_id": snapshot.features.bar_id,
                     "signal": evaluation,
-                    "stale": snapshot.stale,
+                    "stale": stale,
+                    "decision_reason": "STALE_SIGNAL_BAR" if stale else evaluation["reason"],
+                    "timing": {
+                        "bar_end": snapshot.features.bar_end.isoformat(),
+                        "requested_at": snapshot.requested_at.isoformat() if snapshot.requested_at else None,
+                        "received_at": snapshot.received_at.isoformat(),
+                        "available_at": snapshot.available_at.isoformat(),
+                        "processed_at": processed_at.isoformat(),
+                        "request_seconds": snapshot.request_seconds,
+                        "cache_hit": snapshot.cache_hit,
+                        "warmup_seconds": snapshot.warmup_seconds,
+                        "candle_age_at_receipt_seconds": (snapshot.received_at - snapshot.features.bar_end).total_seconds(),
+                        "feature_processing_seconds": snapshot.feature_processing_seconds,
+                        "queue_seconds": max(0.0, (processed_at - snapshot.available_at).total_seconds()),
+                        "candle_age_at_evaluation_seconds": age_seconds,
+                    },
                 },
                 instrument_key=key,
                 strategy=strategy,
@@ -1003,7 +1032,7 @@ class ParallelMonitoringEngine:
                 if (
                     exit_signal["actionable"]
                     and entered_at < snapshot.features.bar_end
-                    and not snapshot.stale
+                    and not stale
                 ):
                     self._signal_exit_latches.setdefault(
                         position_key,
@@ -1039,9 +1068,11 @@ class ParallelMonitoringEngine:
                     key, strategy, "WATCHING", "NOT_IN_CURRENT_RANKING", snapshot.available_at
                 )
                 continue
-            if snapshot.stale or not evaluation["actionable"]:
+            if stale or not evaluation["actionable"]:
                 self.manager.update_strategy(
-                    key, strategy, "WATCHING", evaluation["reason"], snapshot.available_at
+                    key, strategy, "WATCHING",
+                    "STALE_SIGNAL_BAR" if stale else evaluation["reason"],
+                    processed_at,
                 )
                 continue
             if strategy == "B":
@@ -1618,11 +1649,13 @@ class ParallelMonitoringService:
         trading_day_check: Callable[[str], bool],
         market_ready: Callable[[], bool],
         now: Optional[Callable[[], datetime]] = None,
+        stream_recovery: Optional[Callable[[], dict]] = None,
     ) -> None:
         self.enabled = enabled
         self.engine_factory = engine_factory
         self.trading_day_check = trading_day_check
         self.market_ready = market_ready
+        self.stream_recovery = stream_recovery
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._stop = Event()
         self._thread: Optional[Thread] = None
@@ -1673,19 +1706,23 @@ class ParallelMonitoringService:
                 self._last_error = str(error)[:500]
                 self._stop.wait(15)
                 continue
-            if open_window and trading_day and needs_session:
-                if self.market_ready():
-                    try:
-                        candidate = self.engine_factory(now.date().isoformat())
-                        with self._lock:
-                            self._engine = candidate
-                        candidate.start()
-                        self._last_error = None
-                    except Exception as error:  # noqa: BLE001 - retry transient startup failures
-                        # Retry on the next supervisor pass; engine events cannot
-                        # be recorded before a session exists.
-                        self._last_error = str(error)[:500]
-            elif (
+            if open_window and trading_day and needs_session and self.market_ready():
+                try:
+                    candidate = self.engine_factory(now.date().isoformat())
+                    with self._lock:
+                        self._engine = candidate
+                    candidate.start()
+                    self._last_error = None
+                except Exception as error:  # noqa: BLE001 - retry transient startup failures
+                    # Retry on the next supervisor pass; engine events cannot
+                    # be recorded before a session exists.
+                    self._last_error = str(error)[:500]
+            if open_window and trading_day and self.stream_recovery:
+                try:
+                    self.stream_recovery()
+                except Exception as error:  # noqa: BLE001 - REST fallback remains active
+                    self._last_error = f"Stream recovery: {error}"[:500]
+            if (
                 engine
                 and engine.snapshot()["status"] == "RUNNING"
                 and now.time() >= time(15, 30)

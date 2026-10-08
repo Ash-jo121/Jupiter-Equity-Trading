@@ -564,6 +564,28 @@ no tick for `PARALLEL_STREAM_STALE_SECONDS`, only the affected symbols use the e
 path every `PARALLEL_POLL_INTERVAL_SECONDS`. Completed candle checks remain independent and run
 every `PARALLEL_FEATURE_REFRESH_SECONDS`.
 
+The NSE supervisor also checks stream health every 15 seconds during trading
+hours. An exhausted/disconnected or silent stream is recreated with the same
+subscription, with at least 60 seconds between new attempts (120 seconds while
+connecting/reconnecting). A healthy connection is left alone, and an explicitly
+stopped stream stays stopped. REST failover remains available during recovery.
+
+Candle reads use at most four concurrent workers under the existing shared
+Upstox rate limiter. Only candles finalized before the request are cached;
+forming bars are never promoted from an old cached response after the clock
+passes their close. Missing newly closed bars are retried after two seconds.
+Previous-session history is seeded before the live request, with a 60-second
+retry backoff on missing/failed warm-up data. Entry rules and the 15-second
+signal-age limit are unchanged; age now includes computation and coordinator
+queue time as well as provider response time.
+
+New `SIGNAL_EVALUATED` monitoring events include `decision_reason` and a `timing`
+object: bar close, request, receipt, feature availability and processing times,
+plus request duration, candle age at receipt/evaluation, processing and queue
+delays. These diagnose provider/API latency separately from local delays; older
+events are not backfilled. Stream status includes `recovery_attempts` and
+`last_connection_attempt_at`.
+
 Enable it alongside the normal NSE scheduler:
 
 ```dotenv

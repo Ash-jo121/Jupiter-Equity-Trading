@@ -73,7 +73,7 @@ def test_shared_candle_cache_fetches_once_for_all_arms_in_a_logical_minute() -> 
 
         def intraday_candles(self, instrument_key, unit, interval):
             self.calls += 1
-            return [Candle(datetime.now(timezone.utc), 99, 101, 98, 100, 10, 0)]
+            return [Candle(datetime(2026, 9, 10, 4, 59, tzinfo=timezone.utc), 99, 101, 98, 100, 10, 0)]
 
     market = CountingMarket()
     cache = SharedCandleCache()
@@ -142,3 +142,77 @@ def test_shared_candle_cache_reuses_prior_session_warmup() -> None:
     assert len(first["candles"]) == 100
     assert second["cache_hit"] is True
     assert market.calls == 1
+
+
+def test_forming_bar_is_refetched_after_close_not_promoted_from_cache():
+    minute = datetime(2026, 9, 10, 5, 0, tzinfo=timezone.utc)
+
+    class Market:
+        calls = 0
+
+        def intraday_candles(self, *_):
+            self.calls += 1
+            return [
+                Candle(minute - timedelta(minutes=2), 99, 101, 98, 100, 10, 0),
+                Candle(minute - timedelta(minutes=1), 99, 101 + self.calls, 98, 100, self.calls * 100, 0),
+                Candle(minute, 100, 101, 99, 100, 1, 0),
+            ]
+
+    market, cache = Market(), SharedCandleCache()
+    early = cache.get(market, "TEST", minute + timedelta(seconds=1))
+    assert len(early["candles"]) == 1
+    final = cache.get(market, "TEST", minute + timedelta(seconds=4))
+    assert len(final["candles"]) == 2
+    assert final["candles"][-1].volume == 200
+    assert final["candles"][-1].high == 103
+    assert cache.get(market, "TEST", minute + timedelta(seconds=10))["cache_hit"]
+    assert market.calls == 2
+
+
+def test_late_provider_bar_is_retried_but_not_on_every_poll():
+    minute = datetime(2026, 9, 10, 5, 0, tzinfo=timezone.utc)
+
+    class Market:
+        calls = 0
+
+        def intraday_candles(self, *_):
+            self.calls += 1
+            offset = 2 if self.calls == 1 else 1
+            return [Candle(minute - timedelta(minutes=offset), 99, 101, 98, 100, 10, 0)]
+
+    market, cache = Market(), SharedCandleCache()
+    assert not cache.get(market, "TEST", minute + timedelta(seconds=3))["complete"]
+    assert cache.get(market, "TEST", minute + timedelta(seconds=4))["cache_hit"]
+    result = cache.get(market, "TEST", minute + timedelta(seconds=6))
+    assert result["complete"]
+    assert market.calls == 2
+
+
+def test_request_crossing_close_does_not_admit_preclose_snapshot(monkeypatch):
+    minute = datetime(2026, 9, 10, 5, 0, tzinfo=timezone.utc)
+    elapsed = [0.0]
+    monkeypatch.setattr("jupiter_trading.market_data.monotonic", lambda: elapsed[0])
+
+    class Market:
+        def intraday_candles(self, *_):
+            elapsed[0] += 5
+            return [Candle(minute - timedelta(minutes=1), 99, 101, 98, 100, 10, 0)]
+
+    result = SharedCandleCache().get(Market(), "TEST", minute + timedelta(seconds=1))
+    assert result["candles"] == []
+    assert result["request_seconds"] == 5
+    assert result["received_at"] == minute + timedelta(seconds=6)
+
+
+def test_empty_warmup_is_not_cached_forever():
+    class Market:
+        calls = 0
+
+        def historical_candles(self, *_):
+            self.calls += 1
+            return []
+
+    market, cache = Market(), SharedCandleCache()
+    for _ in range(2):
+        cache.warmup(market, "TEST", date(2026, 9, 10), 100)
+    assert market.calls == 2

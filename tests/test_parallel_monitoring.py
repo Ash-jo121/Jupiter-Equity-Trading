@@ -1,5 +1,9 @@
 from datetime import datetime, timedelta, timezone
-from threading import Event
+from queue import Queue
+from threading import Event, Thread
+from types import SimpleNamespace
+
+import pytest
 
 from jupiter_trading.accounts import PaperAccountManager
 from jupiter_trading.candidate_queue import CandidateQueue
@@ -142,7 +146,8 @@ def test_monitoring_state_and_events_round_trip(tmp_path):
     assert events[0]["type"] == "SLOT_ASSIGNED"
 
 
-def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monkeypatch):
+@pytest.mark.parametrize("queue_delay", [0, 20])
+def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monkeypatch, queue_delay):
     database = str(tmp_path / "paper.db")
     accounts = PaperAccountManager(
         SQLiteRepository(database),
@@ -228,10 +233,23 @@ def test_one_feature_object_fans_out_to_three_isolated_portfolios(tmp_path, monk
 
     monkeypatch.setattr("jupiter_trading.parallel_monitoring.evaluate_entry", qualify)
     quote = Quote("NSE_EQ|000", 103, timestamp=available_at + timedelta(seconds=1))
-    engine.process_cycle({"NSE_EQ|000": quote}, {"NSE_EQ|000": snapshot}, quote.timestamp)
+    engine.process_cycle(
+        {"NSE_EQ|000": quote}, {"NSE_EQ|000": snapshot},
+        quote.timestamp + timedelta(seconds=queue_delay),
+    )
 
     assert len(feature_ids) == 3
     assert len(set(feature_ids)) == 1
+    events = [
+        event for event in store.monitoring_events(engine.config.session_id)
+        if event["type"] == "SIGNAL_EVALUATED"
+    ]
+    assert len(events) == 3
+    assert events[0]["timing"]["queue_seconds"] == 1 + queue_delay
+    if queue_delay:
+        assert all(event["decision_reason"] == "STALE_SIGNAL_BAR" for event in events)
+        assert not engine.snapshot()["open_positions"]
+        return
     assert accounts.get(engine.account_id("A")).positions["NSE_EQ|000"].quantity > 0
     assert accounts.get(engine.account_id("C")).positions["NSE_EQ|000"].quantity > 0
     assert accounts.get(engine.account_id("B")).positions.get("NSE_EQ|000") is None
@@ -364,3 +382,45 @@ def test_parallel_supervisor_passes_iso_date_to_trading_calendar():
     service.stop()
 
     assert checked_dates == ["2026-09-30"]
+
+
+@pytest.mark.parametrize("hour, trading_day, expected", [(4, True, 1), (12, True, 0), (4, False, 0)])
+def test_stream_recovery_is_supervised_only_during_nse_session(hour, trading_day, expected):
+    recovered = []
+    service = ParallelMonitoringService(
+        enabled=True,
+        engine_factory=lambda _: None,
+        trading_day_check=lambda _: trading_day,
+        market_ready=lambda: False,
+        now=lambda: datetime(2026, 9, 30, hour, 0, tzinfo=timezone.utc),
+        stream_recovery=lambda: recovered.append(True),
+    )
+    service._stop.wait = lambda _: service._stop.set()
+    service._run()
+    assert len(recovered) == expected
+
+
+def test_slow_candle_fetch_does_not_block_other_symbols():
+    blocked, release = Event(), Event()
+
+    def snapshot(key, _clock):
+        if key == "SLOW":
+            blocked.set()
+            assert release.wait(2)
+        return key
+
+    engine = object.__new__(ParallelMonitoringEngine)
+    engine._accept_market_data = True
+    engine._now = lambda: datetime.now(timezone.utc)
+    engine.feature_engine = SimpleNamespace(snapshot=snapshot)
+    engine._feature_results = Queue()
+    worker = Thread(target=engine._collect_features, args=(["SLOW", "FAST"],))
+    worker.start()
+    try:
+        assert blocked.wait(1)
+        assert engine._feature_results.get(timeout=1) == ("SNAPSHOT", "FAST")
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert engine._feature_results.get(timeout=1) == ("SNAPSHOT", "SLOW")

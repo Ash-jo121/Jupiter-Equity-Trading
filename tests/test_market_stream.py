@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from threading import Event
 
 import pytest
@@ -178,3 +179,90 @@ def test_replacing_token_restores_active_subscription() -> None:
     assert created[1][3].connected.wait(timeout=1)
 
     stream.stop()
+
+
+class AsyncStreamer(FakeStreamer):
+    """Like the real SDK, connect returns while the socket stays connected."""
+
+    def connect(self):
+        self.callbacks["open"]()
+        self.connected.set()
+
+
+@pytest.mark.parametrize("failure", ["exhausted", "silent", "next_day", "closed"])
+def test_watchdog_restores_dead_stream_and_ignores_old_callbacks(monkeypatch, failure):
+    clock = [datetime(2026, 10, 7, 4, 0, tzinfo=timezone.utc)]
+
+    class Clock:
+        @staticmethod
+        def now(_tz):
+            return clock[0]
+
+    monkeypatch.setattr("jupiter_trading.market_stream.datetime", Clock)
+    created, quotes = [], []
+
+    def factory(*_):
+        fake = AsyncStreamer()
+        created.append(fake)
+        return fake
+
+    stream = UpstoxMarketStream("token", lambda q: quotes.append(q), streamer_factory=factory)
+    try:
+        stream.start(["TEST"])
+        assert created[0].connected.wait(1)
+        stream._thread.join(1)
+        assert stream.status()["state"] == "connected"
+        old = created[0]
+        old.emit_quote()
+        if failure == "exhausted":
+            old.callbacks["autoReconnectStopped"]("retryCount of 10 exhausted")
+        elif failure == "closed":
+            old.callbacks["close"]()
+        clock[0] += timedelta(days=1) if failure == "next_day" else timedelta(seconds=61)
+        stream.ensure_connected()
+        assert len(created) == 2
+        assert created[1].connected.wait(1)
+        assert old.stopped.is_set()
+        old.callbacks["error"]("old socket error")
+        old.emit_quote()
+        assert len(quotes) == 1
+        assert stream.status()["state"] == "connected"
+        assert stream.status()["last_error"] is None
+        assert stream.status()["recovery_attempts"] == 1
+        stream.ensure_connected()
+        assert len(created) == 2
+        stream.stop()
+        clock[0] += timedelta(days=1)
+        stream.ensure_connected()
+        assert len(created) == 2  # Explicitly stopped streams stay stopped.
+    finally:
+        stream.stop()
+
+
+def test_watchdog_preserves_healthy_stream_and_rate_limits_failed_attempts(monkeypatch):
+    clock = [datetime(2026, 10, 7, 4, 0, tzinfo=timezone.utc)]
+
+    class Clock:
+        @staticmethod
+        def now(_tz):
+            return clock[0]
+
+    monkeypatch.setattr("jupiter_trading.market_stream.datetime", Clock)
+    fake = AsyncStreamer()
+    stream = UpstoxMarketStream("token", lambda _: [], streamer_factory=lambda *_: fake)
+    try:
+        stream.start(["TEST"])
+        assert fake.connected.wait(1)
+        clock[0] += timedelta(minutes=10)
+        fake.emit_quote()
+        stream.ensure_connected()
+        assert stream.status()["recovery_attempts"] == 0
+        fake.callbacks["autoReconnectStopped"]("exhausted")
+        stream.ensure_connected()
+        stream._thread.join(1)
+        assert stream.status()["recovery_attempts"] == 1
+        fake.callbacks["autoReconnectStopped"]("exhausted again")
+        stream.ensure_connected()
+        assert stream.status()["recovery_attempts"] == 1
+    finally:
+        stream.stop()
